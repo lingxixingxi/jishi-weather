@@ -47,6 +47,20 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+
+            // ⚠️ 必须关闭代码混淆/资源压缩。
+            // 高德地图的 native 引擎（libAMapOpenMap.so）在 onSurfaceCreated
+            // 阶段用 JNI GetStaticMethodID 反射查找 Java 类；R8 一旦改动这些类，
+            // JNI 查找失败会直接 art::Runtime::Abort → 进程 abort 闪退
+            // （实测 tombstone: #05 GetStaticMethodID -> #06 libAMapOpenMap.so
+            //  -> #20 oh.onSurfaceCreated）。
+            isMinifyEnabled = false
+            isShrinkResources = false
+            // 即便将来开启混淆，也用下面这份 keep 规则兜底
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }
