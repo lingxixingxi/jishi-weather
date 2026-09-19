@@ -1,0 +1,10 @@
+# ===== 高德地图 Android SDK Key =====
+# 复制本文件为 key.properties 并填入你自己的 Key
+# 申请地址：https://lbs.amap.com/ （控制台 → 应用管理 → 创建应用 → 添加 Key → 选「Android 平台」）
+#
+# 申请时需要的两项（用 keytool 获取，见项目 README）：
+#   发布版安全码 SHA1
+#   调试版安全码 SHA1
+#   PackageName: com.lingxi.jishiweather
+
+AMAP_KEY=你的高德Android平台Key
