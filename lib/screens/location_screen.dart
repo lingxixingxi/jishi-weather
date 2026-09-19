@@ -101,7 +101,13 @@ class _LocationScreenState extends State<LocationScreen> {
     }
   }
 
-  /// 系统定位（geolocator）：网络定位优先，失败退回「最后已知位置」
+  /// 系统定位（geolocator）
+  ///
+  /// ⚠️ 关键：必须 `forceLocationManager: true`
+  /// geolocator 默认走 Google FusedLocationProvider（fused provider），
+  /// 但小米等国内设备的 fused provider 常为空 → 定位永远失败。
+  /// 强制走系统原生 LocationManager 后，可直接使用 network provider
+  /// （实测由高德提供，精度 ~30 米，室内可用）。
   Future<GeoPoint?> _locateBySystem({required Duration timeout}) async {
     try {
       var perm = await Geolocator.checkPermission();
@@ -111,13 +117,15 @@ class _LocationScreenState extends State<LocationScreen> {
       if (perm != LocationPermission.whileInUse && perm != LocationPermission.always) {
         return null;
       }
+
+      final settings = AndroidSettings(
+        accuracy: LocationAccuracy.low, // 网络定位，不强制 GPS
+        forceLocationManager: true, // ← 绕开 fused，用系统 LocationManager
+        timeLimit: timeout,
+      );
+
       try {
-        final pos = await Geolocator.getCurrentPosition(
-          locationSettings: LocationSettings(
-            accuracy: LocationAccuracy.low, // 低精度=网络定位，不强制 GPS
-            timeLimit: timeout,
-          ),
-        );
+        final pos = await Geolocator.getCurrentPosition(locationSettings: settings);
         return GeoPoint(lat: pos.latitude, lon: pos.longitude, name: '当前位置');
       } catch (_) {
         final last = await Geolocator.getLastKnownPosition();
