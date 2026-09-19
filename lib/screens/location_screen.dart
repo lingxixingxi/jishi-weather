@@ -966,6 +966,26 @@ class _LocationScreenState extends State<LocationScreen> {
                           ),
                         ),
                       ),
+                    // 卫星云图覆盖整个东亚（约 95°×58°，11km/像素），
+                    // 在 5km 视野下只能看到极小一块，需提示缩小
+                    if (_layerMode == _LayerMode.satellite && _currentZoom > 8)
+                      Positioned(
+                        left: 8,
+                        right: 8,
+                        bottom: 46,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                          decoration: BoxDecoration(
+                            color: const Color(0xE6141A24),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: AppTheme.cyan.withValues(alpha: 0.7)),
+                          ),
+                          child: const Text(
+                            '卫星云图覆盖整个东亚（约 11km/像素），建议缩小到 200km 以上才能看出云系',
+                            style: TextStyle(fontSize: 11, color: AppTheme.cyan, height: 1.35),
+                          ),
+                        ),
+                      ),
                     if (_layerMode == _LayerMode.radar && _radarLoading)
                       const Positioned(
                         left: 0,
