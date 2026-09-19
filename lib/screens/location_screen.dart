@@ -10,7 +10,10 @@ import 'package:x_amap_base/x_amap_base.dart';
 
 import '../models/hourly_weather.dart';
 import '../services/amap_location_service.dart';
+import '../engine/radar_verdict.dart';
+import '../models/hourly_weather.dart';
 import '../services/amap_service.dart';
+import '../services/multi_source_service.dart';
 import '../services/nmc_city_repository.dart';
 import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
@@ -74,6 +77,24 @@ class _LocationScreenState extends State<LocationScreen> {
   final _meteo = OpenMeteoService();
   final _nmc = NmcService();
   late final NmcCityRepository _cityRepo = NmcCityRepository(_nmc, _amap);
+  late final MultiSourceService _multi = MultiSourceService(
+    meteo: _meteo,
+    nmc: _nmc,
+    cityRepo: _cityRepo,
+  );
+
+  /// 中心点的多源集合（5 源比对 + 雷达定调用）
+  MultiModelHourly? _centerMulti;
+
+  /// 雷达定调结果
+  RadarVerdict? _verdict;
+  bool _verdictLoading = false;
+
+  /// 未来逐小时预测（取中心点）
+  List<MultiModelHourly> _hourlyForecast = const [];
+
+  /// 未来逐日预测
+  List<DailyWeather> _dailyForecast = const [];
 
   bool _loading = false;
   String? _error;
@@ -323,19 +344,68 @@ class _LocationScreenState extends State<LocationScreen> {
       (label: '西 5km', point: GeoPoint(lat: center.lat, lon: center.lon - dLon)),
     ];
 
-    final forecasts = await _meteo.fetchMany(
-      points.map((p) => (lat: p.point.lat, lon: p.point.lon, place: p.label)).toList(),
-      forecastDays: 1, // 只取当天，减小响应体积
-    );
+    // 中心点走**多源融合**（5 源交叉验证 + 雷达定调），保留完整多源集合
+    List<MultiModelHourly> centerMulti = const [];
+    try {
+      centerMulti = await _multi.fetch(
+        lat: center.lat,
+        lon: center.lon,
+        place: center.name.isEmpty ? '中心' : center.name,
+        forecastDays: 3, // 未来预测需要更多天数
+      );
+      debugPrint('[多源] 中心点 ${centerMulti.length} 个时刻，'
+          '${centerMulti.isEmpty ? 0 : centerMulti.first.sources.length} 源');
+    } catch (e) {
+      debugPrint('[多源] 中心点失败: $e');
+    }
+
+    // 四方位点用单模型（省流量，只做方位差异对比）
+    final others = points.where((p) => p.label != '中心').toList();
+    var otherForecasts = <List<HourlyWeather>>[];
+    try {
+      otherForecasts = await _meteo.fetchMany(
+        others.map((p) => (lat: p.point.lat, lon: p.point.lon, place: p.label)).toList(),
+        forecastDays: 1,
+      );
+    } catch (e) {
+      debugPrint('[单模型] 方位点失败: $e');
+    }
+
+    // 未来逐日预测（7 天）
+    var daily = <DailyWeather>[];
+    try {
+      daily = await _meteo.fetchDaily(
+        lat: center.lat,
+        lon: center.lon,
+        forecastDays: 7,
+      );
+    } catch (e) {
+      debugPrint('[逐日] 失败: $e');
+    }
 
     final now = DateTime.now();
     final samples = <({String label, GeoPoint point, HourlyWeather? weather})>[];
     final temps = <double>[];
     int? maxPop;
 
-    for (var i = 0; i < points.length; i++) {
-      final w = _nearest(forecasts[i], now);
-      samples.add((label: points[i].label, point: points[i].point, weather: w));
+    // 中心点：用多源融合值
+    final centerW = centerMulti.isEmpty
+        ? _nearest(const [], now)
+        : _nearest(
+            centerMulti.map((m) => m.toHourlyWeather()).toList(),
+            now,
+          );
+    samples.add((label: '中心', point: center, weather: centerW));
+    if (centerW?.temperature != null) temps.add(centerW!.temperature!);
+    if (centerW?.precipitationProbability != null) {
+      maxPop = centerW!.precipitationProbability;
+    }
+
+    // 方位点：用单模型值
+    for (var i = 0; i < others.length; i++) {
+      final list = i < otherForecasts.length ? otherForecasts[i] : const <HourlyWeather>[];
+      final w = _nearest(list, now);
+      samples.add((label: others[i].label, point: others[i].point, weather: w));
       final t = w?.temperature;
       if (t != null) temps.add(t);
       final pop = w?.precipitationProbability;
@@ -401,6 +471,11 @@ class _LocationScreenState extends State<LocationScreen> {
       _animTimer?.cancel();
       _loading = false;
       _overlayPng = null; // 换地点先清掉旧叠加
+      // 多源与未来预测
+      _centerMulti = centerMulti.isEmpty ? null : _nearestMulti(centerMulti, now);
+      _hourlyForecast = centerMulti;
+      _dailyForecast = daily;
+      _verdict = null;
       _result = _AreaResult(
         placeName: center.name.isEmpty ? '所选位置' : center.name,
         center: center,
@@ -412,9 +487,52 @@ class _LocationScreenState extends State<LocationScreen> {
       );
     });
 
+    // 雷达定调（异步，不阻塞）
+    _runLocationVerdict(center, centerMulti);
+
     // 生成叠加位图（异步，不阻塞 UI）
     if (_layerMode != _LayerMode.none && grid.isNotEmpty) {
       _regenerateOverlay();
+    }
+  }
+
+  /// 取最接近当前时刻的多源集合
+  MultiModelHourly? _nearestMulti(List<MultiModelHourly> list, DateTime t) {
+    if (list.isEmpty) return null;
+    MultiModelHourly? best;
+    var bestDiff = const Duration(days: 999).inMinutes;
+    for (final m in list) {
+      final d = m.time.difference(t).inMinutes.abs();
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = m;
+      }
+    }
+    return best;
+  }
+
+  /// 跑雷达定调（用中心点的实况与各源预测比对）
+  Future<void> _runLocationVerdict(GeoPoint center, List<MultiModelHourly> multi) async {
+    final path = _multi.lastRadarPath;
+    final nowMulti = _nearestMulti(multi, DateTime.now());
+    if (path == null || nowMulti == null) return;
+
+    setState(() => _verdictLoading = true);
+    try {
+      final v = await RadarVerdictEngine.judge(
+        lat: center.lat,
+        lon: center.lon,
+        models: [nowMulti],
+        radarPath: path,
+      );
+      if (!mounted) return;
+      setState(() {
+        _verdict = v;
+        _verdictLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _verdictLoading = false);
     }
   }
 
@@ -487,6 +605,13 @@ class _LocationScreenState extends State<LocationScreen> {
           ),
         ),
         if (_result != null) ..._resultWidgets(_result!),
+
+        // ===== 多源交叉验证 + 雷达定调（与出行路线页同款逻辑）=====
+        if (_centerMulti != null) _multiSourceCard(),
+        if (_verdictLoading || _verdict != null) _radarVerdictCard(),
+
+        // ===== 未来预测（逐小时 + 逐日）=====
+        if (_hourlyForecast.isNotEmpty || _dailyForecast.isNotEmpty) _forecastCard(),
       ],
     );
   }
@@ -494,8 +619,7 @@ class _LocationScreenState extends State<LocationScreen> {
   List<Widget> _resultWidgets(_AreaResult r) {
     return [
       PanelCard(
-        heading: '区域概览',
-        child: Column(
+        heading: '区域概览',        child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(r.placeName,
@@ -692,6 +816,300 @@ class _LocationScreenState extends State<LocationScreen> {
         ),
       ),
     ];
+  }
+
+  /// 多源交叉验证面板（5 源并列 + 一致性评分）
+  Widget _multiSourceCard() {
+    final mm = _centerMulti!;
+    return PanelCard(
+      heading: '多源研判 · ${mm.sources.length} 源交叉验证',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _metric('一致性', '${mm.agreementScore} 分'),
+              _metric('结论', mm.agreementText),
+              _metric('时刻', '${mm.time.hour.toString().padLeft(2, '0')}:00'),
+            ],
+          ),
+          const Divider(height: 22, color: AppTheme.borderSoft),
+          _kvRow('温度', mm.spreadText((s) => s.temperature, digits: 1, unit: '℃')),
+          _kvRow('降水概率',
+              mm.spreadText((s) => s.precipitationProbability?.toDouble(), digits: 0, unit: '%')),
+          _kvRow('降水', mm.spreadText((s) => s.precipitation, digits: 1, unit: ' mm/h')),
+          _kvRow('阵风', mm.spreadText((s) => s.windGust, digits: 0, unit: '')),
+          _kvRow('能见度', mm.spreadText((s) => s.visibility, digits: 1, unit: 'km')),
+          _kvRow('云量', mm.spreadText((s) => s.cloudCover, digits: 0, unit: '%')),
+        ],
+      ),
+    );
+  }
+
+  /// 雷达定调面板（用真实回波裁决各模型分歧）
+  Widget _radarVerdictCard() {
+    if (_verdictLoading && _verdict == null) {
+      return const PanelCard(
+        heading: '雷达定调 · 真实回波校验',
+        child: Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.accent),
+            ),
+            SizedBox(width: 10),
+            Text('正在分析雷达回波…', style: TextStyle(fontSize: 12.5, color: AppTheme.textDim)),
+          ],
+        ),
+      );
+    }
+    final v = _verdict!;
+    final r = v.radar;
+    return PanelCard(
+      heading: '雷达定调 · 真实回波校验',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (v.arbitrationUsed)
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+              decoration: BoxDecoration(
+                color: AppTheme.accentDim,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.accent),
+              ),
+              child: const Text('模型分歧较大 → 以雷达实况定调',
+                  style: TextStyle(fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
+            ),
+          if (r != null) ...[
+            Row(
+              children: [
+                _metric('雷达回波', r.echoText),
+                _metric('全图覆盖', '${r.coverage.toStringAsFixed(1)}%'),
+                _metric('区域最强', '${r.maxDbz} dBZ'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (r.rainNow != null && r.rainNow! >= 0.1)
+              _kvRow('反演降水', '${r.rainNow!.toStringAsFixed(1)} mm/h（Z-R 关系）'),
+            if (r.motionSpeedKmh != null && r.motionSpeedKmh! > 1)
+              _kvRow('回波移动',
+                  '向${r.motionDirection} ${r.motionSpeedKmh!.toStringAsFixed(0)} km/h（${r.framesUsed} 帧追踪）'),
+            const Divider(height: 20, color: AppTheme.borderSoft),
+          ],
+          if (v.scores.isNotEmpty) ...[
+            const Text('各源与雷达吻合度',
+                style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            for (final s in v.scores)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2.5),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 62,
+                      child: Text(
+                        s.modelName,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: s.modelName == v.bestModel ? FontWeight.w700 : FontWeight.w500,
+                          color: s.modelName == v.bestModel ? AppTheme.accent : AppTheme.textDim,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(3),
+                        child: LinearProgressIndicator(
+                          value: s.score / 100,
+                          minHeight: 6,
+                          backgroundColor: AppTheme.bgInset,
+                          valueColor: AlwaysStoppedAnimation(
+                            s.score >= 70 ? AppTheme.green : (s.score >= 45 ? AppTheme.accent : AppTheme.red),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 30,
+                      child: Text('${s.score}',
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim)),
+                    ),
+                  ],
+                ),
+              ),
+            const SizedBox(height: 10),
+          ],
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppTheme.bgInset,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: AppTheme.borderSoft),
+            ),
+            child: Text(v.summary,
+                style: const TextStyle(fontSize: 12, color: AppTheme.textDim, height: 1.5)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 未来预测面板（逐小时 24h + 逐日 7 天）
+  Widget _forecastCard() {
+    final now = DateTime.now();
+    // 只取当前时刻之后的逐小时
+    final hours = _hourlyForecast.where((h) => h.time.isAfter(now.subtract(const Duration(hours: 1)))).toList();
+    final next24 = hours.take(24).toList();
+
+    return PanelCard(
+      heading: '未来预测 · 逐小时 24h / 逐日 7 天',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ===== 逐小时（横向滚动）=====
+          if (next24.isNotEmpty) ...[
+            const Text('逐小时',
+                style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 108,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: next24.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 6),
+                itemBuilder: (_, i) {
+                  final h = next24[i];
+                  final t = h.temperature;
+                  final pop = h.precipitationProbability;
+                  final rain = h.precipitation ?? 0;
+                  final isNow = i == 0;
+                  return Container(
+                    width: 58,
+                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                    decoration: BoxDecoration(
+                      color: isNow ? AppTheme.accentDim : AppTheme.bgInset,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: isNow ? AppTheme.accent : AppTheme.borderSoft),
+                    ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('${h.time.hour.toString().padLeft(2, '0')}时',
+                            style: TextStyle(
+                                fontSize: 10.5,
+                                color: isNow ? AppTheme.accent : AppTheme.textFaint,
+                                fontWeight: FontWeight.w600)),
+                        Icon(
+                          rain >= 8
+                              ? Icons.thunderstorm
+                              : (rain >= 2.5
+                                  ? Icons.grain
+                                  : (rain >= 0.1 ? Icons.water_drop_outlined : Icons.cloud_outlined)),
+                          size: 16,
+                          color: rain >= 0.1 ? AppTheme.cyan : AppTheme.textDim,
+                        ),
+                        Text(t == null ? '--' : '${t.round()}°',
+                            style: const TextStyle(
+                                fontSize: 13, color: AppTheme.text, fontWeight: FontWeight.w700)),
+                        Text(pop == null ? '--' : '$pop%',
+                            style: TextStyle(
+                                fontSize: 10,
+                                color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint)),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+
+          // ===== 逐日 =====
+          if (_dailyForecast.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            const Text('逐日',
+                style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            for (var i = 0; i < _dailyForecast.length; i++) ...[
+              if (i > 0) const Divider(height: 1, color: AppTheme.borderSoft),
+              _dailyRow(_dailyForecast[i], isToday: i == 0),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _dailyRow(DailyWeather d, {bool isToday = false}) {
+    final dateText = '${d.date.month}/${d.date.day}';
+    final range = '${d.tempMin?.round() ?? '--'}° ~ ${d.tempMax?.round() ?? '--'}°';
+    final pop = d.precipProbabilityMax;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 66,
+            child: Row(
+              children: [
+                Text(isToday ? '今天' : d.weekday,
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: isToday ? FontWeight.w700 : FontWeight.w500,
+                        color: isToday ? AppTheme.accent : AppTheme.text)),
+                const SizedBox(width: 4),
+                Text(dateText, style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Text(d.weatherText ?? '—',
+                style: const TextStyle(fontSize: 12, color: AppTheme.textDim),
+                overflow: TextOverflow.ellipsis),
+          ),
+          SizedBox(
+            width: 40,
+            child: Text(pop == null ? '--' : '$pop%',
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                    fontSize: 11.5,
+                    color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint,
+                    fontWeight: FontWeight.w600)),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 78,
+            child: Text(range,
+                textAlign: TextAlign.right,
+                style: const TextStyle(fontSize: 12, color: AppTheme.text, fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 键值行（多源比对用）
+  Widget _kvRow(String k, String v) {
+    if (v.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 62,
+            child: Text(k, style: const TextStyle(fontSize: 11.5, color: AppTheme.textFaint)),
+          ),
+          Expanded(
+            child: Text(v, style: const TextStyle(fontSize: 12, color: AppTheme.textDim, height: 1.4)),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _layerChip(String label, _LayerMode mode) {

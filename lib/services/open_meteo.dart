@@ -385,7 +385,120 @@ class OpenMeteoService {
     }
   }
 
+  /// 逐日预报（未来 N 天）
+  ///
+  /// 用 Open-Meteo 的 `daily` 参数一次拿到日最高/最低温、天气码、
+  /// 降水总量、降水概率、最大风速与紫外线，供「未来预测」展示。
+  Future<List<DailyWeather>> fetchDaily({
+    required double lat,
+    required double lon,
+    int forecastDays = 7,
+  }) async {
+    final uri = Uri.parse(_forecastUrl).replace(queryParameters: {
+      'latitude': lat.toString(),
+      'longitude': lon.toString(),
+      'daily': [
+        'weather_code',
+        'temperature_2m_max',
+        'temperature_2m_min',
+        'precipitation_sum',
+        'precipitation_probability_max',
+        'wind_speed_10m_max',
+        'wind_gusts_10m_max',
+        'uv_index_max',
+        'sunrise',
+        'sunset',
+      ].join(','),
+      'forecast_days': forecastDays.toString(),
+      'timezone': 'Asia/Shanghai',
+    });
+
+    final resp = await _client.get(uri).timeout(const Duration(seconds: 35));
+    if (resp.statusCode != 200) {
+      throw Exception('Open-Meteo 逐日请求失败 ${resp.statusCode}');
+    }
+    final decoded = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
+    final daily = decoded['daily'] as Map<String, dynamic>?;
+    if (daily == null) return const [];
+
+    final dates = ((daily['time'] as List?) ?? const []).cast<String>();
+    double? at(String k, int i) {
+      final arr = daily[k] as List?;
+      if (arr == null || i >= arr.length) return null;
+      return (arr[i] as num?)?.toDouble();
+    }
+
+    final out = <DailyWeather>[];
+    for (var i = 0; i < dates.length; i++) {
+      final code = at('weather_code', i)?.round();
+      final sunrise = (daily['sunrise'] as List?)?.elementAtOrNull(i) as String?;
+      final sunset = (daily['sunset'] as List?)?.elementAtOrNull(i) as String?;
+      out.add(DailyWeather(
+        date: DateTime.parse(dates[i]),
+        weatherCode: code,
+        weatherText: code == null ? null : wmoCodeText[code],
+        tempMax: at('temperature_2m_max', i),
+        tempMin: at('temperature_2m_min', i),
+        precipitationSum: at('precipitation_sum', i),
+        precipProbabilityMax: at('precipitation_probability_max', i)?.round(),
+        windSpeedMax: at('wind_speed_10m_max', i),
+        windGustMax: at('wind_gusts_10m_max', i),
+        uvIndexMax: at('uv_index_max', i),
+        sunrise: sunrise == null ? null : DateTime.tryParse(sunrise),
+        sunset: sunset == null ? null : DateTime.tryParse(sunset),
+      ));
+    }
+    return out;
+  }
+
   void dispose() => _client.close();
+}
+
+/// 逐日预报
+class DailyWeather {
+  final DateTime date;
+  final int? weatherCode;
+  final String? weatherText;
+  final double? tempMax;
+  final double? tempMin;
+  final double? precipitationSum; // mm
+  final int? precipProbabilityMax; // %
+  final double? windSpeedMax; // km/h
+  final double? windGustMax; // km/h
+  final double? uvIndexMax;
+  final DateTime? sunrise;
+  final DateTime? sunset;
+
+  const DailyWeather({
+    required this.date,
+    this.weatherCode,
+    this.weatherText,
+    this.tempMax,
+    this.tempMin,
+    this.precipitationSum,
+    this.precipProbabilityMax,
+    this.windSpeedMax,
+    this.windGustMax,
+    this.uvIndexMax,
+    this.sunrise,
+    this.sunset,
+  });
+
+  /// 降水强度描述（按日累计量粗分）
+  String get precipLevel {
+    final p = precipitationSum ?? 0;
+    if (p < 0.1) return '无雨';
+    if (p < 10) return '小雨';
+    if (p < 25) return '中雨';
+    if (p < 50) return '大雨';
+    return '暴雨';
+  }
+
+  /// 星期几
+  String get weekday {
+    const names = ['一', '二', '三', '四', '五', '六', '日'];
+    return '周${names[date.weekday - 1]}';
+  }
 }
 
 /// 网格点：带完整逐小时序列（云量 / 雨量 / 降水概率）
