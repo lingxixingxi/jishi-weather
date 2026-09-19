@@ -39,54 +39,79 @@ class _RouteScreenState extends State<RouteScreen> {
   int _selectedIndex = 0;
   RouteAnalysis? _analysis;
 
-  /// 地图控制器：选中路线后用它自动缩放到该路线范围
-  AMapController? _mapController;
+  /// 当前展开的分段（横向路线条点击切换）
+  int _selectedSegment = 0;
 
-  /// 选中某条候选路线 → 高亮 + 地图自动缩放到该路线
+  /// 选中某条候选路线（地图会因 fitPoints 变化自动缩放到该路线）
   void _selectRoute(int index) {
     setState(() => _selectedIndex = index);
-    _fitToRoute(_options[index]);
   }
 
-  /// 把地图镜头调整到刚好框住整条路线
-  void _fitToRoute(RouteOption opt) {
-    final c = _mapController;
-    final pts = opt.polyline;
-    if (c == null || pts.isEmpty) return;
-
-    if (pts.length == 1) {
-      c.moveCamera(CameraUpdate.newLatLngZoom(LatLng(pts.first.lat, pts.first.lon), 13));
-      return;
+  /// 交给 AmapView 自动框选的点集
+  ///
+  /// 高德 polyline 偶有孤立异常点，用起终点过滤离群点，避免镜头跑到几百公里外。
+  List<LatLng> _fitPointsOf(RouteOption opt) {
+    var usable = opt.polyline;
+    final a = _from;
+    final b = _to;
+    if (a != null && b != null) {
+      final span = AmapService.distanceKm(a.lat, a.lon, b.lat, b.lon);
+      final limit = (span * 1.6).clamp(5.0, 2000.0);
+      final filtered = opt.polyline
+          .where((p) =>
+              AmapService.distanceKm(p.lat, p.lon, a.lat, a.lon) <= limit &&
+              AmapService.distanceKm(p.lat, p.lon, b.lat, b.lon) <= limit)
+          .toList();
+      if (filtered.isNotEmpty) usable = filtered;
     }
-    var minLat = pts.first.lat, maxLat = pts.first.lat;
-    var minLon = pts.first.lon, maxLon = pts.first.lon;
-    for (final p in pts) {
-      minLat = minLat < p.lat ? minLat : p.lat;
-      maxLat = maxLat > p.lat ? maxLat : p.lat;
-      minLon = minLon < p.lon ? minLon : p.lon;
-      maxLon = maxLon > p.lon ? maxLon : p.lon;
-    }
-    c.moveCamera(CameraUpdate.newLatLngBounds(
-      LatLngBounds(
-        southwest: LatLng(minLat, minLon),
-        northeast: LatLng(maxLat, maxLon),
-      ),
-      56, // padding：留出边距，别让路线贴边
-    ));
+    return usable.map((p) => LatLng(p.lat, p.lon)).toList();
   }
 
-  /// 候选路线折线：选中的用琥珀色加粗，其余灰色
+  /// 候选路线折线
+  ///
+  /// · 已研判：**按分段画**，选中的那一段琥珀加粗（点击分段即高亮该段）
+  /// · 未研判：画整条候选路线（选中候选琥珀色）
   List<Polyline> _routePolylines() {
     final lines = <Polyline>[];
-    for (final opt in _options) {
-      final selected = opt.index == _selectedIndex;
+    final a = _analysis;
+
+    if (a != null && a.segments.isNotEmpty) {
+      for (var i = 0; i < a.segments.length; i++) {
+        final seg = a.segments[i];
+        if (seg.points.isEmpty) continue;
+        final selected = i == _selectedSegment;
+        lines.add(Polyline(
+          points: seg.points.map((p) => LatLng(p.lat, p.lon)).toList(),
+          width: selected ? 12 : 7,
+          color: selected ? AppTheme.accent : const Color(0x668493A6),
+        ));
+      }
+      return lines;
+    }
+
+    if (_options.isNotEmpty) {
+      final opt = _options[_selectedIndex];
       lines.add(Polyline(
         points: opt.fullPolyline.map((p) => LatLng(p.lat, p.lon)).toList(),
-        width: selected ? 11 : 7,
-        color: selected ? AppTheme.accent : const Color(0x888493A6),
+        width: 10,
+        color: AppTheme.accent,
       ));
     }
     return lines;
+  }
+
+  /// 地图当前要框住的点：**优先当前选中分段**，其次整条路线
+  List<LatLng> _currentFitPoints() {
+    final a = _analysis;
+    if (a != null && a.segments.isNotEmpty) {
+      final idx = _selectedSegment.clamp(0, a.segments.length - 1);
+      final seg = a.segments[idx];
+      if (seg.points.isNotEmpty) {
+        return seg.points.map((p) => LatLng(p.lat, p.lon)).toList();
+      }
+    }
+    if (_options.isNotEmpty) return _fitPointsOf(_options[_selectedIndex]);
+    return const [];
   }
 
   /// 起终点标注
@@ -193,10 +218,24 @@ class _RouteScreenState extends State<RouteScreen> {
         totalKm: opt.distanceKm,
         originName: _origin.text.trim(),
         destinationName: _dest.text.trim(),
+        fullPolyline: opt.fullPolyline, // 用于截取每段的真实路径
       );
+
+      // 调试：确认按里程截取的路段点是否正确
+      debugPrint('[分段调试] 高德报距离=${opt.distanceKm.toStringAsFixed(1)}km '
+          'fullPolyline累计=${RouteAnalyzer.totalKmOf(opt.fullPolyline).toStringAsFixed(1)}km '
+          'full点数=${opt.fullPolyline.length}');
+      for (final s in segments) {
+        final pts = s.points;
+        debugPrint('[分段调试] SEG${s.index} ${s.startKm.toStringAsFixed(0)}-'
+            '${s.endKm.toStringAsFixed(0)}km 点数=${pts.length} '
+            '${pts.isEmpty ? '' : '首(${pts.first.lat.toStringAsFixed(3)},${pts.first.lon.toStringAsFixed(3)}) '
+                '尾(${pts.last.lat.toStringAsFixed(3)},${pts.last.lon.toStringAsFixed(3)})'}');
+      }
 
       setState(() {
         _analyzing = false;
+        _selectedSegment = 0; // 新研判回到第一段
         _analysis = RouteAnalysis(
           segments: segments,
           totalKm: opt.distanceKm,
@@ -321,8 +360,8 @@ class _RouteScreenState extends State<RouteScreen> {
             ),
           ),
 
-        // ===== 路线地图：显示候选路线，点候选自动切换+缩放 =====
-        if (_options.isNotEmpty)
+        // ===== 未研判时：路线地图（显示候选路线）=====
+        if (_options.isNotEmpty && _analysis == null)
           PanelCard(
             heading: '路线地图 · 点候选路线自动缩放',
             padding: const EdgeInsets.all(12),
@@ -336,12 +375,8 @@ class _RouteScreenState extends State<RouteScreen> {
                   zoom: 10,
                   markers: _routeMarkers(),
                   polylines: _routePolylines(),
+                  fitPoints: _currentFitPoints(),
                   interactive: true, // 可缩放拖动
-                  onMapCreated: (c) {
-                    _mapController = c;
-                    // 首次出图即框住当前选中路线
-                    _fitToRoute(_options[_selectedIndex]);
-                  },
                 ),
               ),
             ),
@@ -400,26 +435,38 @@ class _RouteScreenState extends State<RouteScreen> {
   }
 
   List<Widget> _analysisWidgets(RouteAnalysis a) {
+    // 默认展开第 1 段；点击横向路线条可切换
+    final segIdx = _selectedSegment.clamp(0, a.segments.length - 1);
+    final seg = a.segments[segIdx];
+
     return [
+      // ===== 简报头（对应 demo 的 brief-head）=====
       PanelCard(
-        heading: '全程总览',
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _gradeChip(a.overallGrade),
-                const SizedBox(width: 10),
                 Expanded(
-                  child: Text(
-                    '${a.originName} → ${a.destinationName}',
-                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.text),
-                    overflow: TextOverflow.ellipsis,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('出行天气简报',
+                          style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AppTheme.text)),
+                      const SizedBox(height: 3),
+                      Text(
+                        '${a.originName} → ${a.destinationName} · 驾车 '
+                        '${a.totalKm.toStringAsFixed(0)}km · 预计 ${_dur(a.totalMinutes)}',
+                        style: const TextStyle(fontSize: 12.5, color: AppTheme.textDim),
+                      ),
+                    ],
                   ),
                 ),
+                _gradeChip(a.overallGrade),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
             Row(
               children: [
                 _metric('总里程', '${a.totalKm.toStringAsFixed(0)} km'),
@@ -430,56 +477,222 @@ class _RouteScreenState extends State<RouteScreen> {
           ],
         ),
       ),
-      for (final seg in a.segments) _segmentCard(seg),
+
+      // ===== 路线地图：显示当前选中分段的路线（放在分段卡片上方，便于对照）=====
+      PanelCard(
+        heading: '路线地图 · SEG ${seg.index.toString().padLeft(2, '0')} '
+            '（${seg.startKm.toStringAsFixed(0)}-${seg.endKm.toStringAsFixed(0)}km）',
+        padding: const EdgeInsets.all(12),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            height: 300,
+            child: AmapView(
+              lat: _mapAnchorLat(seg, a),
+              lon: _mapAnchorLon(seg, a),
+              zoom: 12,
+              markers: _routeMarkers(),
+              polylines: _routePolylines(),
+              fitPoints: _currentFitPoints(),
+              interactive: true,
+            ),
+          ),
+        ),
+      ),
+
+      // ===== 横向路线条（站点 — SEG — 站点，点击切换分段）=====
+      PanelCard(
+        heading: '路线分段 · 点击查看该段路线',
+        child: _horizontalRouteLine(a),
+      ),
+
+      // ===== 当前选中段的详情（对应 demo 的 seg-detail）=====
+      _segmentDetailCard(seg),
     ];
   }
 
-  Widget _segmentCard(RouteSegment seg) {
+  /// 地图锚点纬度（分段点为空时退回起终点/整条路线）
+  double _mapAnchorLat(RouteSegment seg, RouteAnalysis a) {
+    if (seg.points.isNotEmpty) return seg.points.first.lat;
+    if (_from != null) return _from!.lat;
+    for (final s in a.segments) {
+      if (s.points.isNotEmpty) return s.points.first.lat;
+    }
+    return 31.2;
+  }
+
+  double _mapAnchorLon(RouteSegment seg, RouteAnalysis a) {
+    if (seg.points.isNotEmpty) return seg.points.first.lon;
+    if (_from != null) return _from!.lon;
+    for (final s in a.segments) {
+      if (s.points.isNotEmpty) return s.points.first.lon;
+    }
+    return 121.5;
+  }
+
+  /// 横向「站点—分段」线路（严格复刻 demo 的 .route-line）
+  Widget _horizontalRouteLine(RouteAnalysis a) {
+    final segs = a.segments;
+    final rows = <Widget>[];
+
+    for (var i = 0; i < segs.length; i++) {
+      final seg = segs[i];
+      final isFirst = i == 0;
+      final isLast = i == segs.length - 1;
+
+      // 站点圆点 + 名称
+      rows.add(_stationDot(
+        name: isFirst ? _shortName(a.originName) : _shortName(seg.fromName),
+        kind: isFirst ? _StationKind.start : _StationKind.mid,
+      ));
+
+      // 分段线（可点击，固定宽度避免被挤压换行）
+      rows.add(InkWell(
+        onTap: () => setState(() => _selectedSegment = i),
+        child: SizedBox(
+          width: 76,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  height: 3,
+                  decoration: BoxDecoration(
+                    color: i == _selectedSegment ? AppTheme.accent : AppTheme.border,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  'SEG ${seg.index.toString().padLeft(2, '0')}',
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w700,
+                    color: i == _selectedSegment ? AppTheme.accent : AppTheme.textDim,
+                  ),
+                ),
+                Text(
+                  '${seg.startKm.toStringAsFixed(0)}-${seg.endKm.toStringAsFixed(0)}km',
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
+                  style: const TextStyle(fontSize: 9.5, color: AppTheme.textFaint),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ));
+
+      if (isLast) {
+        rows.add(_stationDot(
+          name: _shortName(a.destinationName),
+          kind: _StationKind.end,
+        ));
+      }
+    }
+
+    // 横向可滚动：分段多时也不会挤压换行
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: rows),
+    );
+  }
+
+  Widget _stationDot({required String name, required _StationKind kind}) {
+    final color = switch (kind) {
+      _StationKind.start => AppTheme.accent,
+      _StationKind.end => AppTheme.green,
+      _StationKind.mid => AppTheme.textDim,
+    };
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(height: 5),
+        SizedBox(
+          width: 58,
+          child: Text(
+            name,
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            softWrap: true,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: AppTheme.text, height: 1.2),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 站点简称（横向条空间有限）：优先取常见后缀前的地名
+  String _shortName(String s) {
+    var t = s.trim();
+    for (final suffix in ['站', '工业园区', '园区', '机场', '火车站', '高铁站', '国际机场']) {
+      if (t.endsWith(suffix) && t.length > suffix.length) {
+        t = t.substring(0, t.length - suffix.length);
+        break;
+      }
+    }
+    if (t.length <= 4) return t;
+    return '${t.substring(0, 4)}…';
+  }
+
+  /// 选中段的详情卡（对应 demo 的 seg-detail pane）
+  Widget _segmentDetailCard(RouteSegment seg) {
+    final w = seg.weatherText ?? '';
+    final tempText = seg.temperature == null ? '--' : '${seg.temperature!.toStringAsFixed(0)}℃';
     return PanelCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // 段标题行：SEG 番号 · 起终点    温度 · 天气
           Row(
             children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: AppTheme.bgInset,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: AppTheme.borderSoft),
-                ),
-                child: Text(
-                  'SEG ${seg.index.toString().padLeft(2, '0')}',
-                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.textDim, letterSpacing: .5),
-                ),
-              ),
-              const SizedBox(width: 10),
+              Icon(_weatherIcon(seg), size: 20, color: AppTheme.accent),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  '${seg.fromName} → ${seg.toName}',
-                  style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppTheme.text),
+                  'SEG ${seg.index.toString().padLeft(2, '0')} · ${seg.fromName} → ${seg.toName}',
+                  style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: AppTheme.text),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+              Text(
+                w.isEmpty ? tempText : '$tempText · $w',
+                style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: AppTheme.textDim),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              _metric('降水', seg.precipitationLevel),
+              _metric('降水概率',
+                  seg.precipitationProbability == null ? '--' : '${seg.precipitationProbability}%'),
+              _metric('风速', seg.windSpeed == null ? '--' : seg.windSpeed!.toStringAsFixed(0)),
               _gradeChip(seg.grade),
             ],
           ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              _metric('温度', seg.temperature == null ? '—' : '${seg.temperature!.toStringAsFixed(1)}°'),
-              _metric('降水', seg.precipitationLevel),
-              _metric('降水概率', seg.precipitationProbability == null ? '—' : '${seg.precipitationProbability}%'),
-              _metric('风速', seg.windSpeed == null ? '—' : seg.windSpeed!.toStringAsFixed(0)),
-            ],
-          ),
-          const Divider(height: 22, color: AppTheme.borderSoft),
+          const Divider(height: 24, color: AppTheme.borderSoft),
+          const Text('研判依据',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.textDim, letterSpacing: .6)),
+          const SizedBox(height: 8),
           ...seg.basis.map((b) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 3),
+                padding: const EdgeInsets.symmetric(vertical: 3.5),
                 child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     SizedBox(
-                      width: 66,
+                      width: 70,
                       child: Text(b.label,
                           style: const TextStyle(fontSize: 11.5, color: AppTheme.textFaint)),
                     ),
@@ -490,9 +703,53 @@ class _RouteScreenState extends State<RouteScreen> {
                   ],
                 ),
               )),
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppTheme.bgInset,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: AppTheme.borderSoft),
+            ),
+            child: RichText(
+              text: TextSpan(
+                style: const TextStyle(fontSize: 12.5, color: AppTheme.textDim, height: 1.5),
+                children: [
+                  const TextSpan(text: '结论：'),
+                  TextSpan(
+                    text: _conclusion(seg),
+                    style: const TextStyle(color: AppTheme.text, fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  IconData _weatherIcon(RouteSegment seg) {
+    final p = seg.precipitation ?? 0;
+    if (p >= 8) return Icons.thunderstorm;
+    if (p >= 2.5) return Icons.grain;
+    if (p >= 0.1) return Icons.water_drop_outlined;
+    final t = seg.temperature ?? 20;
+    if (t >= 30) return Icons.wb_sunny_outlined;
+    return Icons.cloud_outlined;
+  }
+
+  String _conclusion(RouteSegment seg) {
+    switch (seg.grade) {
+      case '红':
+        return '天气较差（${seg.precipitationLevel}），建议改期或改道。';
+      case '黄':
+        return seg.precipitationLevel == '无雨'
+            ? '基本可行，注意${seg.weatherText ?? '天气变化'}，谨慎驾驶。'
+            : '该段有${seg.precipitationLevel}，建议携带雨具、减速慢行。';
+      default:
+        return '天气良好（${seg.precipitationLevel}），可正常行驶，无需雨具。';
+    }
   }
 
   Widget _gradeChip(String grade) {
@@ -540,3 +797,6 @@ class _RouteScreenState extends State<RouteScreen> {
     return '${m ~/ 60}h${(m % 60).toString().padLeft(2, '0')}m';
   }
 }
+
+/// 横向路线条上的站点类型（决定圆点颜色）
+enum _StationKind { start, mid, end }

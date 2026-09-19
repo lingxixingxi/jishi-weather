@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:math' as math;
+
 import 'package:http/http.dart' as http;
 
 import '../models/hourly_weather.dart';
@@ -121,6 +123,61 @@ class OpenMeteoService {
         weatherCode: wc,
         weatherText: wc == null ? null : wmoCodeText[wc],
       ));
+    }
+    return out;
+  }
+
+  /// 批量拉取网格点的云量（用于「云量分布」热力叠加）
+  ///
+  /// Open-Meteo 支持一次请求多个坐标（逗号分隔），所以 5×5 网格只需 1 次请求。
+  /// 返回按行优先排列的网格：index = row * n + col，row 由南到北、col 由西到东。
+  Future<List<({double lat, double lon, double? cloud})>> fetchCloudGrid({
+    required double centerLat,
+    required double centerLon,
+    double spanKm = 24, // 覆盖范围（公里）
+    int n = 5, // 每边格点数
+  }) async {
+    final half = spanKm / 2 / 111.0;
+    final dLat = spanKm / 111.0 / (n - 1);
+    final dLon = dLat / math.cos(centerLat * math.pi / 180.0).abs().clamp(0.2, 1.0);
+
+    final lats = <double>[];
+    final lons = <double>[];
+    for (var r = 0; r < n; r++) {
+      for (var c = 0; c < n; c++) {
+        lats.add(centerLat - half + r * dLat);
+        lons.add(centerLon - half / math.cos(centerLat * math.pi / 180.0).abs().clamp(0.2, 1.0) + c * dLon);
+      }
+    }
+
+    final uri = Uri.parse(_forecastUrl).replace(queryParameters: {
+      'latitude': lats.map((e) => e.toStringAsFixed(4)).join(','),
+      'longitude': lons.map((e) => e.toStringAsFixed(4)).join(','),
+      'hourly': 'cloud_cover',
+      'forecast_days': '1',
+      'timezone': 'Asia/Shanghai',
+    });
+
+    final resp = await _client.get(uri).timeout(const Duration(seconds: 30));
+    if (resp.statusCode != 200) {
+      throw Exception('云量网格请求失败 ${resp.statusCode}');
+    }
+    final decoded = jsonDecode(utf8.decode(resp.bodyBytes));
+    final list = (decoded is List ? decoded : [decoded]).cast<Map<String, dynamic>>();
+
+    final nowHour = DateTime.now().hour;
+    final out = <({double lat, double lon, double? cloud})>[];
+    for (var i = 0; i < lats.length; i++) {
+      double? cloud;
+      if (i < list.length) {
+        final hourly = list[i]['hourly'] as Map<String, dynamic>?;
+        final arr = (hourly?['cloud_cover'] as List?);
+        if (arr != null && arr.isNotEmpty) {
+          final idx = nowHour.clamp(0, arr.length - 1);
+          cloud = (arr[idx] as num?)?.toDouble();
+        }
+      }
+      out.add((lat: lats[i], lon: lons[i], cloud: cloud));
     }
     return out;
   }

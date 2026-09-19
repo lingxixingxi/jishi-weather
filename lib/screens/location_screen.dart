@@ -25,11 +25,21 @@ class _AreaResult {
   /// 预生成的地图标注（带文字，Marker 不支持常驻文字故自绘）
   final List<Marker> markers;
 
+  /// 云量分布热力格（Polygon 叠加层）
+  final List<Polygon> cloudPolygons;
+
+  /// 网格最高/最低云量（展示用）
+  final double? cloudMax;
+  final double? cloudMin;
+
   const _AreaResult({
     required this.placeName,
     required this.center,
     required this.samples,
     required this.markers,
+    this.cloudPolygons = const [],
+    this.cloudMax,
+    this.cloudMin,
     this.minTemp,
     this.maxTemp,
     this.maxPop,
@@ -219,6 +229,28 @@ class _LocationScreenState extends State<LocationScreen> {
       ));
     }
 
+    // 云量分布热力格（Open-Meteo 批量网格，1 次请求）
+    var cloudPolys = <Polygon>[];
+    double? cloudMax;
+    double? cloudMin;
+    try {
+      const n = 5;
+      final grid = await _meteo.fetchCloudGrid(
+        centerLat: center.lat,
+        centerLon: center.lon,
+        spanKm: 24,
+        n: n,
+      );
+      cloudPolys = _buildCloudPolygons(grid, n);
+      final vals = grid.map((e) => e.cloud).whereType<double>().toList();
+      if (vals.isNotEmpty) {
+        cloudMax = vals.reduce((a, b) => a > b ? a : b);
+        cloudMin = vals.reduce((a, b) => a < b ? a : b);
+      }
+    } catch (_) {
+      // 云量叠加失败不影响主流程
+    }
+
     setState(() {
       _loading = false;
       _result = _AreaResult(
@@ -226,6 +258,9 @@ class _LocationScreenState extends State<LocationScreen> {
         center: center,
         samples: samples,
         markers: markers,
+        cloudPolygons: cloudPolys,
+        cloudMax: cloudMax,
+        cloudMin: cloudMin,
         minTemp: temps.isEmpty ? null : temps.reduce((a, b) => a < b ? a : b),
         maxTemp: temps.isEmpty ? null : temps.reduce((a, b) => a > b ? a : b),
         maxPop: maxPop,
@@ -336,23 +371,87 @@ class _LocationScreenState extends State<LocationScreen> {
         ),
       ),
       PanelCard(
-        heading: '地图',
+        heading: '地图 · 云量分布',
         padding: const EdgeInsets.all(12),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(10),
-          child: SizedBox(
-            height: 300,
-            child: AmapView(
-              lat: r.center.lat,
-              lon: r.center.lon,
-              zoom: 12,
-              markers: r.markers, // 预生成的带文字标注
-              interactive: true, // 独占手势：可缩放/拖动
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: SizedBox(
+                height: 300,
+                child: AmapView(
+                  lat: r.center.lat,
+                  lon: r.center.lon,
+                  zoom: 11.5,
+                  markers: r.markers, // 带文字标注
+                  polygons: r.cloudPolygons, // 云量热力格叠加
+                  interactive: true, // 独占手势：可缩放/拖动
+                ),
+              ),
             ),
-          ),
+            if (r.cloudMax != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Text('云量', style: TextStyle(fontSize: 11, color: AppTheme.textFaint)),
+                  const SizedBox(width: 8),
+                  Text(
+                    '${r.cloudMin?.round() ?? 0}% – ${r.cloudMax?.round() ?? 0}%',
+                    style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim, fontWeight: FontWeight.w600),
+                  ),
+                  const Spacer(),
+                  // 色阶图例
+                  Container(width: 16, height: 9, color: _cloudColor(10)),
+                  Container(width: 16, height: 9, color: _cloudColor(50)),
+                  Container(width: 16, height: 9, color: _cloudColor(100)),
+                  const SizedBox(width: 6),
+                  const Text('薄 → 厚', style: TextStyle(fontSize: 10.5, color: AppTheme.textFaint)),
+                ],
+              ),
+            ],
+          ],
         ),
       ),
     ];
+  }
+
+  /// 由网格点生成云量热力格（Polygon 面）
+  ///
+  /// 注意：云量是格点值，这里用「每格左上角」的值代表整格，做成离散热力格。
+  List<Polygon> _buildCloudPolygons(
+    List<({double lat, double lon, double? cloud})> grid,
+    int n,
+  ) {
+    final polys = <Polygon>[];
+    for (var r = 0; r < n - 1; r++) {
+      for (var c = 0; c < n - 1; c++) {
+        final p00 = grid[r * n + c];
+        final p01 = grid[r * n + c + 1];
+        final p11 = grid[(r + 1) * n + c + 1];
+        final p10 = grid[(r + 1) * n + c];
+        final cloud = p00.cloud;
+        if (cloud == null) continue;
+        polys.add(Polygon(
+          points: [
+            LatLng(p00.lat, p00.lon),
+            LatLng(p01.lat, p01.lon),
+            LatLng(p11.lat, p11.lon),
+            LatLng(p10.lat, p10.lon),
+          ],
+          strokeWidth: 0.1,
+          strokeColor: Colors.transparent,
+          fillColor: _cloudColor(cloud),
+        ));
+      }
+    }
+    return polys;
+  }
+
+  /// 云量(0-100) → 颜色：云越厚越白、越不透明
+  Color _cloudColor(double cloud) {
+    final a = (cloud / 100.0 * 0.62).clamp(0.0, 0.62);
+    return Color.fromRGBO(226, 233, 248, a);
   }
 
   Widget _metric(String k, String v) {

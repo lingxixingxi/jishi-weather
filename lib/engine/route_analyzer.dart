@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import '../models/hourly_weather.dart';
 import '../services/amap_service.dart';
 
@@ -30,6 +32,9 @@ class RouteSegment {
   /// 研判依据（展示用）
   final List<({String label, String value})> basis;
 
+  /// **该分段对应的路线点**（用于点击分段时地图缩放到这一段）
+  final List<({double lat, double lon})> points;
+
   const RouteSegment({
     required this.index,
     required this.fromName,
@@ -40,6 +45,7 @@ class RouteSegment {
     required this.endTime,
     required this.grade,
     required this.basis,
+    this.points = const [],
     this.temperature,
     this.precipitation,
     this.precipitationLevel = '未知',
@@ -128,6 +134,8 @@ class RouteAnalyzer {
     required double totalKm,
     required String originName,
     required String destinationName,
+    /// 完整路线点（用于截取每个分段对应的真实路径，供地图按段缩放）
+    List<GeoPoint> fullPolyline = const [],
   }) {
     if (samples.isEmpty) return const [];
 
@@ -179,9 +187,69 @@ class RouteAnalyzer {
         startTime: startTime,
         endTime: endTime,
         w: w,
+        points: _sliceByKm(fullPolyline, startKm, endKm),
       ));
     }
     return segments;
+  }
+
+  /// 按里程区间从完整路线中截取点（用于「点击分段→地图缩放到该段」）
+  ///
+  /// 若区间内点太少，会向两端各扩展一个点，保证能看出走向。
+  static List<({double lat, double lon})> _sliceByKm(
+    List<GeoPoint> full,
+    double startKm,
+    double endKm,
+  ) {
+    if (full.isEmpty) return const [];
+    if (full.length == 1) return [(lat: full.first.lat, lon: full.first.lon)];
+
+    final out = <({double lat, double lon})>[];
+    var acc = 0.0;
+    for (var i = 1; i < full.length; i++) {
+      final a = full[i - 1];
+      final b = full[i];
+      final d = _haversineKm(a.lat, a.lon, b.lat, b.lon);
+      final segStart = acc;
+      final segEnd = acc + d;
+      // 该小段与目标里程区间有交集
+      if (segEnd >= startKm && segStart <= endKm) {
+        if (out.isEmpty) out.add((lat: a.lat, lon: a.lon));
+        out.add((lat: b.lat, lon: b.lon));
+      }
+      acc = segEnd;
+      if (acc > endKm + 1) break;
+    }
+    if (out.isEmpty) {
+      // 兜底：整条路线的首尾
+      return [
+        (lat: full.first.lat, lon: full.first.lon),
+        (lat: full.last.lat, lon: full.last.lon),
+      ];
+    }
+    return out;
+  }
+
+  /// 计算完整路线的总里程（用于校验截取是否正确）
+  static double totalKmOf(List<GeoPoint> full) {
+    var acc = 0.0;
+    for (var i = 1; i < full.length; i++) {
+      acc += _haversineKm(full[i - 1].lat, full[i - 1].lon, full[i].lat, full[i].lon);
+    }
+    return acc;
+  }
+
+  /// 两点球面距离（km）
+  static double _haversineKm(double lat1, double lon1, double lat2, double lon2) {
+    const r = 6371.0;
+    final dLat = (lat2 - lat1) * math.pi / 180.0;
+    final dLon = (lon2 - lon1) * math.pi / 180.0;
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(lat1 * math.pi / 180.0) *
+            math.cos(lat2 * math.pi / 180.0) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
   }
 
   static String _label(GeoPoint p, String origin, String dest, double km, double totalKm) {
@@ -199,6 +267,7 @@ class RouteAnalyzer {
     required DateTime startTime,
     required DateTime endTime,
     required HourlyWeather? w,
+    List<({double lat, double lon})> points = const [],
   }) {
     final grade = gradeOf(w);
     final basis = <({String label, String value})>[
@@ -228,6 +297,7 @@ class RouteAnalyzer {
       weatherText: w?.weatherText,
       grade: grade,
       basis: basis,
+      points: points,
     );
   }
 
