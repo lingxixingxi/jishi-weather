@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 /// 卫星云图的经纬度标定（风云四号 FY-4B · ACHN 中国区域）
@@ -83,23 +85,88 @@ class SatelliteService {
 
   static String _p(int v) => v.toString().padLeft(2, '0');
 
-  /// 拉取最近一帧（自动向前回退，最多试 [maxBack] 次半小时）
+  /// 从卫星云图**页面**抓取最新的可用帧
+  ///
+  /// ⚠️ 不能按当前时间推算帧号！实测产品生成有延迟
+  /// （某天页面最新帧只到 10:00，而当前时间是 18:45），
+  /// 按时间推算会一路 404。页面上的帧列表才是权威来源。
+  Future<({DateTime time, String url})?> latestFromPage() async {
+    // 可见光页面的 HTML 里直接带图片路径（红外页是 SPA 空壳，抓不到）
+    const page = 'http://www.nmc.cn/publish/satellite/fy4b-visible.htm';
+    try {
+      final resp = await _client.get(
+        Uri.parse(page),
+        headers: {'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.nmc.cn/'},
+      ).timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return null;
+      final html = utf8.decode(resp.bodyBytes, allowMalformed: true);
+
+      final re = RegExp(r'//image\.nmc\.cn(/product/[\w/\.\-]*WXBL[\w/\.\-]*\.JPG)');
+      String? bestPath;
+      DateTime? bestTime;
+      for (final m in re.allMatches(html)) {
+        final path = m.group(1)!;
+        final ts = RegExp(r'PY_(\d{14})').firstMatch(path)?.group(1);
+        if (ts == null || ts.length < 14) continue;
+        final t = DateTime(
+          int.parse(ts.substring(0, 4)),
+          int.parse(ts.substring(4, 6)),
+          int.parse(ts.substring(6, 8)),
+          int.parse(ts.substring(8, 10)),
+          int.parse(ts.substring(10, 12)),
+          int.parse(ts.substring(12, 14)),
+        );
+        if (bestTime == null || t.isAfter(bestTime)) {
+          bestTime = t;
+          bestPath = path;
+        }
+      }
+      if (bestPath == null || bestTime == null) {
+        debugPrint('[卫星云图] 页面未解析到帧');
+        return null;
+      }
+      debugPrint('[卫星云图] 页面最新帧: $bestTime');
+      return (time: bestTime, url: '$_host$bestPath');
+    } catch (e) {
+      debugPrint('[卫星云图] 抓页面失败: $e');
+      return null;
+    }
+  }
+
+  /// 拉取最近一帧
+  ///
+  /// 优先**从页面抓最新帧**（权威）；失败时退回按当前时间推算。
   Future<({DateTime time, Uint8List bytes})?> fetchLatest({int maxBack = 4}) async {
+    // ① 先试页面（拿到的一定是存在的帧）
+    final fromPage = await latestFromPage();
+    if (fromPage != null) {
+      final got = await _download(fromPage.url);
+      if (got != null) return (time: fromPage.time, bytes: got);
+    }
+
+    // ② 退回：按当前时间向前回退尝试
     final now = DateTime.now().toUtc().add(const Duration(hours: 8)); // 北京时间
     for (var i = 0; i < maxBack; i++) {
       final t = now.subtract(Duration(minutes: 30 * i));
       final url = urlFor(t);
-      try {
-        final resp = await _client.get(
-          Uri.parse(url),
-          headers: {'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.nmc.cn/'},
-        ).timeout(const Duration(seconds: 25));
-        if (resp.statusCode == 200 && resp.bodyBytes.length > 20000) {
-          return (time: t, bytes: resp.bodyBytes);
-        }
-      } catch (_) {
-        // 试下一帧
+      final got = await _download(url);
+      if (got != null) return (time: t, bytes: got);
+    }
+    return null;
+  }
+
+  Future<Uint8List?> _download(String url) async {
+    try {
+      final resp = await _client.get(
+        Uri.parse(url),
+        headers: {'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.nmc.cn/'},
+      ).timeout(const Duration(seconds: 25));
+      debugPrint('[卫星云图] GET -> HTTP ${resp.statusCode} ${resp.bodyBytes.length}B');
+      if (resp.statusCode == 200 && resp.bodyBytes.length > 20000) {
+        return resp.bodyBytes;
       }
+    } catch (e) {
+      debugPrint('[卫星云图] GET 异常: $e');
     }
     return null;
   }

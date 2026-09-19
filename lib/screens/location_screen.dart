@@ -192,10 +192,11 @@ class _LocationScreenState extends State<LocationScreen> {
 
   /// 加载风云四号卫星云图（看云系，与雷达互补）
   Future<void> _loadSatellite() async {
-    if (_satelliteLoading) return;
+    debugPrint('[卫星云图] 开始加载…（loading=$_satelliteLoading）');
     setState(() => _satelliteLoading = true);
     try {
       final r = await _satellite.fetchLatest();
+      debugPrint('[卫星云图] fetchLatest -> ${r == null ? 'null' : '${r.bytes.length} 字节 @ ${r.time}'}');
       if (!mounted) return;
       if (r == null) {
         setState(() {
@@ -205,6 +206,7 @@ class _LocationScreenState extends State<LocationScreen> {
         return;
       }
       final png = await SatelliteService.normalize(r.bytes);
+      debugPrint('[卫星云图] normalize -> ${png?.length ?? 0} 字节');
       if (!mounted) return;
       setState(() {
         _satellitePng = png;
@@ -212,9 +214,9 @@ class _LocationScreenState extends State<LocationScreen> {
             '${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')} · FY-4B 真彩色';
         _satelliteLoading = false;
       });
-      debugPrint('[卫星云图] 已加载 ${png?.length ?? 0} 字节');
+      debugPrint('[卫星云图] 已设置叠加层 ${png?.length ?? 0} 字节');
     } catch (e) {
-      debugPrint('[卫星云图] 失败: $e');
+      debugPrint('[卫星云图] 异常: $e');
       if (mounted) setState(() => _satelliteLoading = false);
     }
   }
