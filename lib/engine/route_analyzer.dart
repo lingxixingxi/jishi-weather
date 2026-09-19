@@ -29,6 +29,15 @@ class RouteSegment {
   /// 建议等级：绿 / 黄 / 红
   final String grade;
 
+  /// 多源一致性评分（0~100，100 = 各源完全一致）
+  final int? agreementScore;
+
+  /// 多源一致性文字：多源一致 / 略有分歧 / 分歧较大
+  final String? agreementText;
+
+  /// 参与比对的源数
+  final int? sourceCount;
+
   /// 研判依据（展示用）
   final List<({String label, String value})> basis;
 
@@ -46,6 +55,9 @@ class RouteSegment {
     required this.grade,
     required this.basis,
     this.points = const [],
+    this.agreementScore,
+    this.agreementText,
+    this.sourceCount,
     this.temperature,
     this.precipitation,
     this.precipitationLevel = '未知',
@@ -136,6 +148,9 @@ class RouteAnalyzer {
     required String destinationName,
     /// 完整路线点（用于截取每个分段对应的真实路径，供地图按段缩放）
     List<GeoPoint> fullPolyline = const [],
+
+    /// **多源交叉验证数据**（与 samples 一一对应，元素可为 null）
+    List<MultiModelHourly?> multiModels = const [],
   }) {
     if (samples.isEmpty) return const [];
 
@@ -188,6 +203,7 @@ class RouteAnalyzer {
         endTime: endTime,
         w: w,
         points: _sliceByKm(fullPolyline, startKm, endKm),
+        mm: startIdx < multiModels.length ? multiModels[startIdx] : null,
       ));
     }
     return segments;
@@ -268,6 +284,7 @@ class RouteAnalyzer {
     required DateTime endTime,
     required HourlyWeather? w,
     List<({double lat, double lon})> points = const [],
+    MultiModelHourly? mm,
   }) {
     final grade = gradeOf(w);
     final basis = <({String label, String value})>[
@@ -280,6 +297,26 @@ class RouteAnalyzer {
       (label: '能见度', value: w?.visibility == null ? '—' : '${w!.visibility!.toStringAsFixed(1)} km'),
       (label: '风速', value: w?.windSpeed == null ? '—' : '${w!.windSpeed!.toStringAsFixed(1)} km/h'),
     ];
+
+    // ===== 多源交叉验证：并列展示各源数值，便于判断可信度 =====
+    if (mm != null && mm.sources.length >= 2) {
+      final t = mm.spreadText((s) => s.temperature, digits: 1, unit: '℃');
+      if (t.isNotEmpty) basis.add((label: '多源温度', value: t));
+
+      final pp = mm.spreadText((s) => s.precipitationProbability?.toDouble(), digits: 0, unit: '%');
+      if (pp.isNotEmpty) basis.add((label: '多源降水概率', value: pp));
+
+      final pr = mm.spreadText((s) => s.precipitation, digits: 1, unit: '');
+      if (pr.isNotEmpty) basis.add((label: '多源降水', value: pr));
+
+      final gs = mm.spreadText((s) => s.windGust, digits: 0, unit: '');
+      if (gs.isNotEmpty) basis.add((label: '多源阵风', value: gs));
+
+      basis.add((
+        label: '一致性',
+        value: '${mm.agreementScore} 分 · ${mm.agreementText}（${mm.sources.length} 源）',
+      ));
+    }
 
     return RouteSegment(
       index: index,
@@ -298,6 +335,9 @@ class RouteAnalyzer {
       grade: grade,
       basis: basis,
       points: points,
+      agreementScore: mm?.agreementScore,
+      agreementText: mm?.agreementText,
+      sourceCount: mm?.sources.length,
     );
   }
 

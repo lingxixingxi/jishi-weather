@@ -15,6 +15,7 @@ class OpenMeteoService {
   /// 默认变量集（覆盖出行研判 + 赛道/摄影所需的免费变量）
   static const List<String> defaultVariables = [
     'temperature_2m',
+    'relative_humidity_2m', // 能见度/云量推算所需
     'precipitation',
     'precipitation_probability',
     'weather_code',
@@ -199,6 +200,125 @@ class OpenMeteoService {
       ));
     }
     return out;
+  }
+
+  /// 默认参与交叉验证的数值模型（三个独立来源，互不依赖）
+  static const List<String> defaultModels = [
+    'ecmwf_ifs025', // 欧洲中期天气预报中心
+    'gfs_seamless', // 美国 NCEP GFS
+    'icon_seamless', // 德国气象局 ICON
+  ];
+
+  /// 模型 → 展示名
+  static String modelDisplayName(String model) {
+    switch (model) {
+      case 'ecmwf_ifs025':
+      case 'ecmwf_ifs04':
+      case 'ecmwf_aifs025':
+        return 'ECMWF';
+      case 'gfs_seamless':
+      case 'gfs_global':
+        return 'GFS';
+      case 'icon_seamless':
+      case 'icon_global':
+        return 'ICON';
+      case 'best_match':
+        return '综合';
+      case 'qweather':
+        return '和风';
+      case 'nmc':
+        return '中央气象台';
+      default:
+        return model;
+    }
+  }
+
+  /// **多模型交叉验证**：一次请求拿到 ECMWF / GFS / ICON 三源预报
+  ///
+  /// Open-Meteo 在多模型模式下字段会带模型后缀
+  /// （如 `temperature_2m_ecmwf_ifs025`），据此拆成「每时刻的多源集合」。
+  /// 注意：能见度只有 GFS 提供（ECMWF/ICON 无此变量），缺失时不参与比对。
+  Future<List<MultiModelHourly>> fetchMultiModel({
+    required double lat,
+    required double lon,
+    String place = '',
+    List<String> models = defaultModels,
+    int forecastDays = 2,
+    List<String>? variables,
+  }) async {
+    final vars = (variables ?? defaultVariables).join(',');
+    final uri = Uri.parse(_forecastUrl).replace(queryParameters: {
+      'latitude': lat.toString(),
+      'longitude': lon.toString(),
+      'hourly': vars,
+      'models': models.join(','),
+      'forecast_days': forecastDays.toString(),
+      'timezone': 'Asia/Shanghai',
+    });
+
+    final resp = await _client.get(uri).timeout(const Duration(seconds: 35));
+    if (resp.statusCode != 200) {
+      throw Exception('Open-Meteo 多模型请求失败 ${resp.statusCode}');
+    }
+    final decoded = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
+    final hourly = decoded['hourly'] as Map<String, dynamic>?;
+    if (hourly == null) return const [];
+
+    final times = ((hourly['time'] as List?) ?? const []).cast<String>();
+    final out = <MultiModelHourly>[];
+
+    double? at(String key, int i) {
+      final arr = hourly[key] as List?;
+      if (arr == null || i >= arr.length) return null;
+      return (arr[i] as num?)?.toDouble();
+    }
+
+    for (var i = 0; i < times.length; i++) {
+      final sources = <ModelForecast>[];
+      for (final m in models) {
+        final wc = at('weather_code_$m', i);
+        sources.add(ModelForecast(
+          model: m,
+          displayName: modelDisplayName(m),
+          temperature: at('temperature_2m_$m', i),
+          humidity: at('relative_humidity_2m_$m', i),
+          precipitationProbability: at('precipitation_probability_$m', i)?.round(),
+          precipitation: at('precipitation_$m', i),
+          windSpeed: at('wind_speed_10m_$m', i),
+          windDirection: at('wind_direction_10m_$m', i)?.round(),
+          windGust: at('wind_gusts_10m_$m', i),
+          visibility: at('visibility_$m', i),
+          cloudCover: at('cloud_cover_$m', i),
+          weatherCode: wc?.round(),
+          weatherText: wc == null ? null : wmoCodeText[wc.round()],
+        ));
+      }
+      out.add(MultiModelHourly(
+        place: place,
+        lat: lat,
+        lon: lon,
+        time: DateTime.parse(times[i]),
+        sources: sources,
+      ));
+    }
+    return out;
+  }
+
+  /// 多地点 × 多模型（路线沿途采样点用）
+  Future<List<List<MultiModelHourly>>> fetchMultiModelMany(
+    List<({double lat, double lon, String place})> points, {
+    List<String> models = defaultModels,
+    int forecastDays = 2,
+    List<String>? variables,
+  }) {
+    return Future.wait(points.map((p) => fetchMultiModel(
+          lat: p.lat,
+          lon: p.lon,
+          place: p.place,
+          models: models,
+          forecastDays: forecastDays,
+          variables: variables,
+        )));
   }
 
   void dispose() => _client.close();

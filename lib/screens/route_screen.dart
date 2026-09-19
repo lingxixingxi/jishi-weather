@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:x_amap_base/x_amap_base.dart';
 
 import '../engine/route_analyzer.dart';
+import '../models/hourly_weather.dart';
 import '../services/amap_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
@@ -177,6 +178,21 @@ class _RouteScreenState extends State<RouteScreen> {
     }
   }
 
+  /// 按到达时刻挑出最接近的多源集合
+  MultiModelHourly? _nearestMulti(List<MultiModelHourly> list, DateTime target) {
+    if (list.isEmpty) return null;
+    MultiModelHourly? best;
+    var bestDiff = const Duration(days: 999).inMinutes;
+    for (final m in list) {
+      final d = m.time.difference(target).inMinutes.abs();
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = m;
+      }
+    }
+    return best;
+  }
+
   /// 第二步：对选定路线做天气研判
   Future<void> _analyze(RouteOption opt) async {
     final from = _from;
@@ -191,7 +207,9 @@ class _RouteScreenState extends State<RouteScreen> {
     try {
       // 沿途每 10km 采样
       final samples = AmapService.sampleAlong(opt.polyline, intervalKm: 10);
-      final forecasts = await _meteo.fetchMany(
+
+      // **多源交叉验证**：一次请求拿到 ECMWF / GFS / ICON 三个独立数值模型
+      final multiAll = await _meteo.fetchMultiModelMany(
         samples
             .map((s) => (
                   lat: s.point.lat,
@@ -202,6 +220,11 @@ class _RouteScreenState extends State<RouteScreen> {
         forecastDays: 3,
       );
 
+      // 用融合值走原有研判流程
+      final forecasts = multiAll
+          .map((list) => list.map((m) => m.toHourlyWeather()).toList())
+          .toList();
+
       final weathers = RouteAnalyzer.pickAtArrival(
         samples: samples,
         pointForecasts: forecasts,
@@ -209,6 +232,16 @@ class _RouteScreenState extends State<RouteScreen> {
         totalMinutes: opt.durationMinutes,
         totalKm: opt.distanceKm,
       );
+
+      // 按到达时刻挑出对应的「多源集合」，供研判依据并列展示
+      final multiAtArrival = <MultiModelHourly?>[];
+      for (var i = 0; i < samples.length; i++) {
+        final km = samples[i].kmFromStart;
+        final frac = opt.distanceKm <= 0 ? 0.0 : (km / opt.distanceKm).clamp(0.0, 1.0);
+        final arriveAt = _departAt.add(Duration(minutes: (opt.durationMinutes * frac).round()));
+        final list = i < multiAll.length ? multiAll[i] : const <MultiModelHourly>[];
+        multiAtArrival.add(_nearestMulti(list, arriveAt));
+      }
 
       final segments = RouteAnalyzer.buildSegments(
         samples: samples,
@@ -219,6 +252,7 @@ class _RouteScreenState extends State<RouteScreen> {
         originName: _origin.text.trim(),
         destinationName: _dest.text.trim(),
         fullPolyline: opt.fullPolyline, // 用于截取每段的真实路径
+        multiModels: multiAtArrival, // 多源比对数据
       );
 
       // 调试：确认按里程截取的路段点是否正确
