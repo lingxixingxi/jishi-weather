@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 
 import '../models/hourly_weather.dart';
+import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
@@ -52,42 +53,49 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 用当前位置
+  ///
+  /// 四级定位策略（天气查询只需公里级精度，一路降级保证可用）：
+  /// 1. **高德定位**：WiFi + 基站 + GPS 混合，国内精度最高（微信/QQ 同款原理）
+  /// 2. geolocator 网络定位（WiFi/基站）
+  /// 3. 系统「最后已知位置」
+  /// 4. **IP 定位兜底**（免 GPS、免权限，城市级）
   Future<void> _useCurrent() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
+      // 1) 首选：高德定位（不依赖 GMS，室内可用）
+      final amapPoint = await AmapLocationService.locate();
+      if (amapPoint != null) {
+        await _analyze(amapPoint);
+        return;
+      }
+
+      // 2) geolocator 网络定位
       var perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied) {
         perm = await Geolocator.requestPermission();
       }
-      if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
-        throw Exception('未授予定位权限，请在系统设置中开启');
-      }
-
-      // 定位策略（天气查询只需公里级精度，不强求 GPS）：
-      // 1) 低精度系统定位（WiFi/基站网络定位）
-      // 2) 退回「最后已知位置」
-      // 3) 仍失败 → **IP 定位兜底**（免 GPS、免权限，只要有网就能拿城市级位置）
       Position? pos;
-      try {
-        pos = await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.low, // 网络定位，不强制 GPS
-            timeLimit: Duration(seconds: 10),
-          ),
-        );
-      } catch (_) {
-        pos = await Geolocator.getLastKnownPosition();
+      if (perm == LocationPermission.whileInUse || perm == LocationPermission.always) {
+        try {
+          pos = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.low, // 网络定位，不强制 GPS
+              timeLimit: Duration(seconds: 10),
+            ),
+          );
+        } catch (_) {
+          pos = await Geolocator.getLastKnownPosition();
+        }
       }
-
       if (pos != null) {
         await _analyze(GeoPoint(lat: pos.latitude, lon: pos.longitude, name: '当前位置'));
         return;
       }
 
-      // 系统定位全失败 → IP 定位兜底
+      // 3) IP 定位兜底
       final ipPoint = await _amap.ipLocation();
       if (ipPoint != null) {
         await _analyze(ipPoint);

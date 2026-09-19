@@ -212,6 +212,10 @@ class _RouteScreenState extends State<RouteScreen> {
                         child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF14100A)))
                     : const Icon(Icons.alt_route, size: 19),
                 label: Text(_planning ? '规划中…' : '规划路线'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 50),
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                ),
               ),
               if (_error != null) ...[
                 const SizedBox(height: 10),
@@ -237,6 +241,10 @@ class _RouteScreenState extends State<RouteScreen> {
                           child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF14100A)))
                       : const Icon(Icons.insights, size: 19),
                   label: Text(_analyzing ? '研判中…' : '按此路线生成研判'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size(double.infinity, 50),
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                  ),
                 ),
               ],
             ),

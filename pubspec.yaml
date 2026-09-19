@@ -39,6 +39,7 @@ dependencies:
   geolocator: ^14.0.3
   intl: ^0.20.3
   shared_preferences: ^2.5.5
+  amap_flutter_location: ^3.0.0
 
 dev_dependencies:
   flutter_test:
