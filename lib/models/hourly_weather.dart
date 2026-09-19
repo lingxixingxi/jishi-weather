@@ -191,6 +191,33 @@ class MultiModelHourly {
     required this.sources,
   });
 
+  /// 追加一个数据源（如中央气象台、和风天气），返回新实例
+  MultiModelHourly withExtraSource(ModelForecast source) => MultiModelHourly(
+        place: place,
+        lat: lat,
+        lon: lon,
+        time: time,
+        sources: [...sources, source],
+      );
+
+  /// 追加多个源
+  MultiModelHourly withExtraSources(List<ModelForecast> extra) => MultiModelHourly(
+        place: place,
+        lat: lat,
+        lon: lon,
+        time: time,
+        sources: [...sources, ...extra],
+      );
+
+  /// 仅保留指定模型（用于剔除某个源后重新计算分歧度）
+  MultiModelHourly onlyModels(Set<String> keep) => MultiModelHourly(
+        place: place,
+        lat: lat,
+        lon: lon,
+        time: time,
+        sources: sources.where((s) => keep.contains(s.model)).toList(),
+      );
+
   /// 取某字段的全部有效值
   List<double> _values(double? Function(ModelForecast) pick) =>
       sources.map(pick).whereType<double>().toList();

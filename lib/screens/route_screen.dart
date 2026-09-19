@@ -5,6 +5,9 @@ import 'package:x_amap_base/x_amap_base.dart';
 import '../engine/route_analyzer.dart';
 import '../models/hourly_weather.dart';
 import '../services/amap_service.dart';
+import '../services/multi_source_service.dart';
+import '../services/nmc_city_repository.dart';
+import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
@@ -27,6 +30,13 @@ class _RouteScreenState extends State<RouteScreen> {
 
   final _amap = AmapService();
   final _meteo = OpenMeteoService();
+  final _nmc = NmcService();
+  late final NmcCityRepository _cityRepo = NmcCityRepository(_nmc, _amap);
+  late final MultiSourceService _multi = MultiSourceService(
+    meteo: _meteo,
+    nmc: _nmc,
+    cityRepo: _cityRepo,
+  );
 
   DateTime _departAt = DateTime.now().add(const Duration(hours: 1));
 
@@ -139,6 +149,7 @@ class _RouteScreenState extends State<RouteScreen> {
     _dest.dispose();
     _amap.dispose();
     _meteo.dispose();
+    _nmc.dispose();
     super.dispose();
   }
 
@@ -208,8 +219,8 @@ class _RouteScreenState extends State<RouteScreen> {
       // 沿途每 10km 采样
       final samples = AmapService.sampleAlong(opt.polyline, intervalKm: 10);
 
-      // **多源交叉验证**：一次请求拿到 ECMWF / GFS / ICON 三个独立数值模型
-      final multiAll = await _meteo.fetchMultiModelMany(
+      // **多源交叉验证**：Open-Meteo 三模型（ECMWF/GFS/ICON）+ 中央气象台
+      final multiAll = await _multi.fetchMany(
         samples
             .map((s) => (
                   lat: s.point.lat,
