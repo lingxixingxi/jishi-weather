@@ -13,6 +13,10 @@ analyzer:
   exclude:
     - build/**
     - android/**
+    # 本地 fork 的插件：只分析其 lib/，示例工程不计入
+    - plugins/amap_map/example/**
+    - plugins/amap_map/test/**
+    - plugins/amap_map/showcase/**
 
 linter:
   # The lint rules applied to this project can be customized in the

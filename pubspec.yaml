@@ -34,7 +34,9 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  amap_map: ^1.0.15
+  # 本地 fork：在原插件基础上增加了 GroundOverlay（天气云图/雷达图叠加）
+  amap_map:
+    path: plugins/amap_map
   http: ^1.6.0
   geolocator: ^14.0.3
   intl: ^0.20.3

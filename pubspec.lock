@@ -12,10 +12,9 @@ packages:
   amap_map:
     dependency: "direct main"
     description:
-      name: amap_map
-      sha256: ee106071450bb109e36d7ae600ef44976ed4d70ea94b1849690535f8337fc7a6
-      url: "https://pub.flutter-io.cn"
-    source: hosted
+      path: "plugins/amap_map"
+      relative: true
+    source: path
     version: "1.0.15"
   args:
     dependency: transitive

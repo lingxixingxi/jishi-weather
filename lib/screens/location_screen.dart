@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:amap_map/amap_map.dart';
 import 'package:flutter/material.dart';
@@ -64,6 +66,20 @@ class _LocationScreenState extends State<LocationScreen> {
   int _timeIndex = 0;
   bool _playing = false;
   Timer? _animTimer;
+
+  /// 已渲染好的叠加位图（PNG）—— 交给 GroundOverlay 贴图，仅 1 个图层
+  Uint8List? _overlayPng;
+
+  /// 重新渲染叠加位图（网格数据 → 平滑 PNG）
+  Future<void> _regenerateOverlay() async {
+    try {
+      final png = await _renderOverlayPng();
+      if (!mounted) return;
+      setState(() => _overlayPng = png);
+    } catch (e) {
+      debugPrint('[叠加] 渲染失败: $e');
+    }
+  }
 
   @override
   void dispose() {
@@ -267,6 +283,7 @@ class _LocationScreenState extends State<LocationScreen> {
       _playing = false;
       _animTimer?.cancel();
       _loading = false;
+      _overlayPng = null; // 换地点先清掉旧叠加
       _result = _AreaResult(
         placeName: center.name.isEmpty ? '所选位置' : center.name,
         center: center,
@@ -277,6 +294,11 @@ class _LocationScreenState extends State<LocationScreen> {
         maxPop: maxPop,
       );
     });
+
+    // 生成叠加位图（异步，不阻塞 UI）
+    if (_layerMode != _LayerMode.none && grid.isNotEmpty) {
+      _regenerateOverlay();
+    }
   }
 
   HourlyWeather? _nearest(List<HourlyWeather> list, DateTime t) {
@@ -412,7 +434,10 @@ class _LocationScreenState extends State<LocationScreen> {
                   lon: r.center.lon,
                   zoom: 11.5,
                   markers: r.markers, // 带文字标注
-                  polygons: _layerPolygons(), // 云量/雨量热力格
+                  // 天气叠加：用 GroundOverlay 贴一张平滑位图（仅 1 个图层）
+                  overlayImage: _overlayPng,
+                  overlaySouthwest: _overlayBounds()?.sw,
+                  overlayNortheast: _overlayBounds()?.ne,
                   interactive: true,
                 ),
               ),
@@ -458,6 +483,7 @@ class _LocationScreenState extends State<LocationScreen> {
                             _timeIndex = v.round();
                             _playing = false;
                           });
+                          _regenerateOverlay();
                         },
                       ),
                     ),
@@ -481,6 +507,7 @@ class _LocationScreenState extends State<LocationScreen> {
           _layerMode = mode;
           _playing = false;
         });
+        _regenerateOverlay();
       },
       borderRadius: BorderRadius.circular(8),
       child: Container(
@@ -539,24 +566,23 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
-  /// 当前图层模式 + 当前时刻对应的热力格
+  /// 生成天气叠加位图（PNG 字节）
   ///
-  /// 为做出「卫星云图」般的连续效果（而非马赛克方块），
-  /// 这里对 n×n 原始格点做**双线性插值上采样**到 [sub]×[sub] 细格，
-  /// 每个细格取插值后的颜色 —— 格子足够小即视觉连续。
-  List<Polygon> _layerPolygons({int sub = 24}) {
-    if (_layerMode == _LayerMode.none || _grid.isEmpty) return const [];
+  /// 直接构造 RGBA 像素数组并编码成 PNG —— 逐像素双线性插值，
+  /// 得到真正连续平滑的云图/雨量图（而非马赛克格子）。
+  /// 用 GroundOverlay 贴到地图上，**只占 1 个图层**，性能极好。
+  Future<Uint8List?> _renderOverlayPng({int size = 160}) async {
+    if (_grid.isEmpty || _layerMode == _LayerMode.none) return null;
     final n = _gridN;
     final t = _timeIndex.clamp(0, math.max(0, _timeCount - 1)).toInt();
 
-    // 取值函数
     double? valueAt(int r, int c) {
       if (r < 0 || c < 0 || r >= n || c >= n) return null;
       final p = _grid[r * n + c];
       return _layerMode == _LayerMode.cloud ? p.cloudAt(t) : p.rainAt(t);
     }
 
-    // 双线性插值：把 [0, n-1] 的浮点坐标映射为数值
+    // 双线性插值（网格坐标 → 值）
     double? sample(double gr, double gc) {
       final r0 = gr.floor().clamp(0, n - 1);
       final c0 = gc.floor().clamp(0, n - 1);
@@ -564,57 +590,70 @@ class _LocationScreenState extends State<LocationScreen> {
       final c1 = (c0 + 1).clamp(0, n - 1);
       final fr = gr - r0;
       final fc = gc - c0;
-      final v00 = valueAt(r0, c0);
-      final v01 = valueAt(r0, c1);
-      final v10 = valueAt(r1, c0);
-      final v11 = valueAt(r1, c1);
+      final v00 = valueAt(r0, c0), v01 = valueAt(r0, c1);
+      final v10 = valueAt(r1, c0), v11 = valueAt(r1, c1);
       if (v00 == null && v01 == null && v10 == null && v11 == null) return null;
       final a = v00 ?? v01 ?? v10 ?? v11!;
-      final b = v01 ?? a;
-      final c = v10 ?? a;
-      final d = v11 ?? b;
+      final b = v01 ?? a, c = v10 ?? a, d = v11 ?? b;
       final top = a + (b - a) * fc;
       final bottom = c + (d - c) * fc;
       return top + (bottom - top) * fr;
     }
 
-    final polys = <Polygon>[];
-    final steps = sub - 1; // 细格数 = steps × steps
-
-    for (var i = 0; i < steps; i++) {
-      for (var j = 0; j < steps; j++) {
-        // 细格四角在「原始网格坐标系」中的浮点位置
-        final gr0 = i * (n - 1) / steps;
-        final gr1 = (i + 1) * (n - 1) / steps;
-        final gc0 = j * (n - 1) / steps;
-        final gc1 = (j + 1) * (n - 1) / steps;
-
-        final v = sample((gr0 + gr1) / 2, (gc0 + gc1) / 2);
-        if (v == null) continue;
-        final color = _layerMode == _LayerMode.cloud ? _cloudColor(v) : _rainColor(v);
-        if (color.a < 0.02) continue;
-
-        // 经纬度：把网格坐标线性映射回经纬度
-        LatLng toLatLng(double gr_, double gc_) {
-          final lat = _grid[0].lat + gr_ * (_grid[(n - 1) * n].lat - _grid[0].lat) / (n - 1);
-          final lon = _grid[0].lon + gc_ * (_grid[n - 1].lon - _grid[0].lon) / (n - 1);
-          return LatLng(lat, lon);
+    final pixels = Uint8List(size * size * 4);
+    for (var py = 0; py < size; py++) {
+      // 注意：图像 y 向下，而纬度向上 → 这里把 y 翻转
+      final gr = (size - 1 - py) * (n - 1) / (size - 1);
+      for (var px = 0; px < size; px++) {
+        final gc = px * (n - 1) / (size - 1);
+        final v = sample(gr, gc);
+        final i = (py * size + px) * 4;
+        if (v == null) {
+          pixels[i + 3] = 0; // 透明
+          continue;
         }
-
-        polys.add(Polygon(
-          points: [
-            toLatLng(gr0, gc0),
-            toLatLng(gr0, gc1),
-            toLatLng(gr1, gc1),
-            toLatLng(gr1, gc0),
-          ],
-          strokeWidth: 0, // 不描边，避免网格线
-          strokeColor: Colors.transparent,
-          fillColor: color,
-        ));
+        final color = _layerMode == _LayerMode.cloud ? _cloudColor(v) : _rainColor(v);
+        // Color 分量在新版 Flutter 里为浮点（0~1）
+        pixels[i] = (color.r * 255).round().clamp(0, 255);
+        pixels[i + 1] = (color.g * 255).round().clamp(0, 255);
+        pixels[i + 2] = (color.b * 255).round().clamp(0, 255);
+        pixels[i + 3] = (color.a * 255).round().clamp(0, 255);
       }
     }
-    return polys;
+
+    // decodeImageFromPixels 为回调式 API，这里包成 Future
+    var opaque = 0;
+    var maxAlpha = 0;
+    for (var i = 3; i < pixels.length; i += 4) {
+      if (pixels[i] > 0) opaque++;
+      if (pixels[i] > maxAlpha) maxAlpha = pixels[i];
+    }
+    debugPrint('[叠加] 像素统计 总=${size * size} 不透明=$opaque 最大alpha=$maxAlpha '
+        '模式=$_layerMode 时刻=$t/$_timeCount');
+
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      pixels,
+      size,
+      size,
+      ui.PixelFormat.rgba8888,
+      completer.complete,
+    );
+    final img = await completer.future;
+    final data = await img.toByteData(format: ui.ImageByteFormat.png);
+    return data?.buffer.asUint8List();
+  }
+
+  /// 叠加层覆盖范围（西南 / 东北角）
+  ({LatLng sw, LatLng ne})? _overlayBounds() {
+    if (_grid.isEmpty) return null;
+    final n = _gridN;
+    final sw = _grid[0]; // row0,col0 = 最南最西
+    final ne = _grid[(n - 1) * n + (n - 1)]; // 最北最东
+    return (
+      sw: LatLng(sw.lat, sw.lon),
+      ne: LatLng(ne.lat, ne.lon),
+    );
   }
 
   /// 云量(0-100) → 颜色：灰蓝渐变（少云淡、厚云深灰蓝），在浅色地图上对比明显
@@ -659,6 +698,7 @@ class _LocationScreenState extends State<LocationScreen> {
       setState(() {
         _timeIndex = (_timeIndex + 1) % _timeCount;
       });
+      _regenerateOverlay();
     });
   }
 

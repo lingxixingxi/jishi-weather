@@ -38,6 +38,13 @@ class AmapView extends StatefulWidget {
   /// 需要自动框住的点集合（非空时，地图就绪/内容变化后自动缩放到该范围）
   final List<LatLng> fitPoints;
 
+  /// 天气叠加图片（PNG 字节）—— 用 GroundOverlay 贴到地图上，
+  /// **只占 1 个图层**，性能远好于成百上千个 Polygon，且是真正的位图平滑效果。
+  final Uint8List? overlayImage;
+  final LatLng? overlaySouthwest;
+  final LatLng? overlayNortheast;
+  final double overlayTransparency;
+
   const AmapView({
     super.key,
     required this.lat,
@@ -47,6 +54,10 @@ class AmapView extends StatefulWidget {
     this.polylines = const [],
     this.polygons = const [],
     this.fitPoints = const [],
+    this.overlayImage,
+    this.overlaySouthwest,
+    this.overlayNortheast,
+    this.overlayTransparency = 0.0,
     this.interactive = true,
     this.tapToActivate = true,
     this.onMapCreated,
@@ -90,6 +101,11 @@ class _AmapViewState extends State<AmapView> {
   @override
   void didUpdateWidget(AmapView oldWidget) {
     super.didUpdateWidget(oldWidget);
+
+    // 叠加图片变化（切换图层 / 拖动时间轴）→ 重新贴图
+    if (!identical(oldWidget.overlayImage, widget.overlayImage)) {
+      _applyOverlay();
+    }
 
     // fitPoints 变化（如切换候选路线）→ 自动缩放到新范围
     if (!_samePoints(oldWidget.fitPoints, widget.fitPoints)) {
@@ -144,9 +160,32 @@ class _AmapViewState extends State<AmapView> {
     return CameraPosition(target: center, zoom: z.clamp(4.0, 17.0).toDouble());
   }
 
+  /// 应用/更新天气叠加图片（GroundOverlay，仅占 1 个图层）
+  Future<void> _applyOverlay() async {
+    final c = _controller;
+    if (c == null || !mounted) return;
+    final img = widget.overlayImage;
+    final sw = widget.overlaySouthwest;
+    final ne = widget.overlayNortheast;
+    try {
+      if (img == null || sw == null || ne == null) {
+        await c.removeGroundOverlay();
+        return;
+      }
+      await c.setGroundOverlay(
+        img,
+        southwest: sw,
+        northeast: ne,
+        transparency: widget.overlayTransparency,
+      );
+      debugPrint('[AmapView] 叠加层已设置 (${img.length} 字节)');
+    } catch (e) {
+      debugPrint('[AmapView] 叠加层设置失败: $e');
+    }
+  }
+
   /// 延迟执行 fitBounds：地图刚创建时立即调用常不生效，多试几次
-  void _scheduleFit() {
-    WidgetsBinding.instance.addPostFrameCallback((_) => _applyFit());
+  void _scheduleFit() {    WidgetsBinding.instance.addPostFrameCallback((_) => _applyFit());
     for (final ms in [600, 1500, 3000]) {
       Future.delayed(Duration(milliseconds: ms), _applyFit);
     }
@@ -236,6 +275,7 @@ class _AmapViewState extends State<AmapView> {
       onMapCreated: (c) {
         _controller = c;
         _scheduleFit(); // 地图就绪后自动框住 fitPoints
+        _applyOverlay(); // 应用天气叠加图片
         widget.onMapCreated?.call(c);
       },
       onCameraMoveEnd: (pos) => widget.onCameraMoveEnd?.call(pos.target, pos.zoom),
