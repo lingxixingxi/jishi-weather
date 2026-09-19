@@ -325,7 +325,7 @@ Future<BitmapDescriptor> buildLabelIcon({
   required String text,
   Color color = const Color(0xFFF0A928),
   Color textColor = const Color(0xFF14100A),
-  double fontSize = 12,
+  double fontSize = 16,
 }) async {
   final tp = TextPainter(
     text: TextSpan(
@@ -339,8 +339,8 @@ Future<BitmapDescriptor> buildLabelIcon({
     textDirection: TextDirection.ltr,
   )..layout();
 
-  const padH = 7.0;
-  const padV = 4.0;
+  const padH = 9.0;
+  const padV = 5.0;
   final w = tp.width + padH * 2;
   final h = tp.height + padV * 2;
 

@@ -127,60 +127,102 @@ class OpenMeteoService {
     return out;
   }
 
-  /// 批量拉取网格点的云量（用于「云量分布」热力叠加）
+  /// 批量拉取网格点的「云量 + 雨量」逐小时序列
   ///
-  /// Open-Meteo 支持一次请求多个坐标（逗号分隔），所以 5×5 网格只需 1 次请求。
-  /// 返回按行优先排列的网格：index = row * n + col，row 由南到北、col 由西到东。
-  Future<List<({double lat, double lon, double? cloud})>> fetchCloudGrid({
+  /// Open-Meteo 支持一次请求多个坐标（逗号分隔），5×5 网格只需 1 次请求。
+  /// 返回按行优先排列：index = row * n + col，row 由南到北、col 由西到东。
+  /// 每个点带完整逐小时序列，便于做时间轴动画。
+  Future<List<GridPoint>> fetchGrid({
     required double centerLat,
     required double centerLon,
     double spanKm = 24, // 覆盖范围（公里）
     int n = 5, // 每边格点数
+    int forecastDays = 1,
   }) async {
     final half = spanKm / 2 / 111.0;
     final dLat = spanKm / 111.0 / (n - 1);
-    final dLon = dLat / math.cos(centerLat * math.pi / 180.0).abs().clamp(0.2, 1.0);
+    final cosLat = math.cos(centerLat * math.pi / 180.0).abs().clamp(0.2, 1.0);
+    final dLon = dLat / cosLat;
 
     final lats = <double>[];
     final lons = <double>[];
     for (var r = 0; r < n; r++) {
       for (var c = 0; c < n; c++) {
         lats.add(centerLat - half + r * dLat);
-        lons.add(centerLon - half / math.cos(centerLat * math.pi / 180.0).abs().clamp(0.2, 1.0) + c * dLon);
+        lons.add(centerLon - half / cosLat + c * dLon);
       }
     }
 
     final uri = Uri.parse(_forecastUrl).replace(queryParameters: {
       'latitude': lats.map((e) => e.toStringAsFixed(4)).join(','),
       'longitude': lons.map((e) => e.toStringAsFixed(4)).join(','),
-      'hourly': 'cloud_cover',
-      'forecast_days': '1',
+      'hourly': 'cloud_cover,precipitation,precipitation_probability',
+      'forecast_days': '$forecastDays',
       'timezone': 'Asia/Shanghai',
     });
 
     final resp = await _client.get(uri).timeout(const Duration(seconds: 30));
     if (resp.statusCode != 200) {
-      throw Exception('云量网格请求失败 ${resp.statusCode}');
+      throw Exception('网格数据请求失败 ${resp.statusCode}');
     }
     final decoded = jsonDecode(utf8.decode(resp.bodyBytes));
     final list = (decoded is List ? decoded : [decoded]).cast<Map<String, dynamic>>();
 
-    final nowHour = DateTime.now().hour;
-    final out = <({double lat, double lon, double? cloud})>[];
+    List<double?> toList(dynamic hourly, String key) {
+      final arr = (hourly as Map<String, dynamic>?)?[key] as List?;
+      if (arr == null) return const [];
+      return arr.map((e) => (e as num?)?.toDouble()).toList();
+    }
+
+    final out = <GridPoint>[];
     for (var i = 0; i < lats.length; i++) {
-      double? cloud;
+      var times = <String>[];
+      var cloud = <double?>[];
+      var rain = <double?>[];
+      var pop = <double?>[];
       if (i < list.length) {
         final hourly = list[i]['hourly'] as Map<String, dynamic>?;
-        final arr = (hourly?['cloud_cover'] as List?);
-        if (arr != null && arr.isNotEmpty) {
-          final idx = nowHour.clamp(0, arr.length - 1);
-          cloud = (arr[idx] as num?)?.toDouble();
-        }
+        times = ((hourly?['time'] as List?) ?? const []).cast<String>();
+        cloud = toList(hourly, 'cloud_cover');
+        rain = toList(hourly, 'precipitation');
+        pop = toList(hourly, 'precipitation_probability');
       }
-      out.add((lat: lats[i], lon: lons[i], cloud: cloud));
+      out.add(GridPoint(
+        lat: lats[i],
+        lon: lons[i],
+        times: times,
+        cloud: cloud,
+        rain: rain,
+        pop: pop,
+      ));
     }
     return out;
   }
 
   void dispose() => _client.close();
+}
+
+/// 网格点：带完整逐小时序列（云量 / 雨量 / 降水概率）
+class GridPoint {
+  final double lat;
+  final double lon;
+  final List<String> times;
+  final List<double?> cloud;
+  final List<double?> rain;
+  final List<double?> pop;
+
+  const GridPoint({
+    required this.lat,
+    required this.lon,
+    required this.times,
+    required this.cloud,
+    required this.rain,
+    required this.pop,
+  });
+
+  int get length => times.length;
+
+  double? cloudAt(int i) => (i >= 0 && i < cloud.length) ? cloud[i] : null;
+  double? rainAt(int i) => (i >= 0 && i < rain.length) ? rain[i] : null;
+  double? popAt(int i) => (i >= 0 && i < pop.length) ? pop[i] : null;
 }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:amap_map/amap_map.dart';
@@ -25,26 +26,19 @@ class _AreaResult {
   /// 预生成的地图标注（带文字，Marker 不支持常驻文字故自绘）
   final List<Marker> markers;
 
-  /// 云量分布热力格（Polygon 叠加层）
-  final List<Polygon> cloudPolygons;
-
-  /// 网格最高/最低云量（展示用）
-  final double? cloudMax;
-  final double? cloudMin;
-
   const _AreaResult({
     required this.placeName,
     required this.center,
     required this.samples,
     required this.markers,
-    this.cloudPolygons = const [],
-    this.cloudMax,
-    this.cloudMin,
     this.minTemp,
     this.maxTemp,
     this.maxPop,
   });
 }
+
+/// 地图叠加图层模式
+enum _LayerMode { none, cloud, rain }
 
 /// 地点查询页 —— 方圆 10km 区域天气
 class LocationScreen extends StatefulWidget {
@@ -63,13 +57,25 @@ class _LocationScreenState extends State<LocationScreen> {
   String? _error;
   _AreaResult? _result;
 
+  // ===== 叠加图层：网格数据 + 模式 + 时间轴 =====
+  List<GridPoint> _grid = const [];
+  final int _gridN = 5;
+  _LayerMode _layerMode = _LayerMode.cloud;
+  int _timeIndex = 0;
+  bool _playing = false;
+  Timer? _animTimer;
+
   @override
   void dispose() {
+    _animTimer?.cancel();
     _input.dispose();
     _amap.dispose();
     _meteo.dispose();
     super.dispose();
   }
+
+  /// 网格各时刻的数量（用于时间轴范围）
+  int get _timeCount => _grid.isEmpty ? 0 : _grid.first.length;
 
   /// 用当前位置
   ///
@@ -218,6 +224,7 @@ class _LocationScreenState extends State<LocationScreen> {
           text: '${s.label} $tempText',
           color: isCenter ? AppTheme.accent : AppTheme.cyan,
           textColor: isCenter ? const Color(0xFF14100A) : Colors.white,
+          fontSize: 17, // 放大地图标签（原来 12 太小看不清）
         ),
         infoWindow: InfoWindow(
           title: s.label,
@@ -229,38 +236,36 @@ class _LocationScreenState extends State<LocationScreen> {
       ));
     }
 
-    // 云量分布热力格（Open-Meteo 批量网格，1 次请求）
-    var cloudPolys = <Polygon>[];
-    double? cloudMax;
-    double? cloudMin;
+    // 网格数据（云量+雨量逐小时，用于叠加图层与时间轴动画）
+    var grid = const <GridPoint>[];
     try {
-      const n = 5;
-      final grid = await _meteo.fetchCloudGrid(
+      grid = await _meteo.fetchGrid(
         centerLat: center.lat,
         centerLon: center.lon,
         spanKm: 24,
-        n: n,
+        n: _gridN,
       );
-      cloudPolys = _buildCloudPolygons(grid, n);
-      final vals = grid.map((e) => e.cloud).whereType<double>().toList();
-      if (vals.isNotEmpty) {
-        cloudMax = vals.reduce((a, b) => a > b ? a : b);
-        cloudMin = vals.reduce((a, b) => a < b ? a : b);
-      }
-    } catch (_) {
-      // 云量叠加失败不影响主流程
+      debugPrint('[网格] 点数=${grid.length} 时刻数=${grid.isEmpty ? 0 : grid.first.length}');
+    } catch (e) {
+      debugPrint('[网格] 失败: $e');
     }
 
+    // 时间轴默认定位到「当前小时」
+    final nowHour = DateTime.now().hour;
+    final tCount = grid.isEmpty ? 0 : grid.first.length;
+    final startIdx = tCount == 0 ? 0 : nowHour.clamp(0, tCount - 1);
+
     setState(() {
+      _grid = grid;
+      _timeIndex = startIdx;
+      _playing = false;
+      _animTimer?.cancel();
       _loading = false;
       _result = _AreaResult(
         placeName: center.name.isEmpty ? '所选位置' : center.name,
         center: center,
         samples: samples,
         markers: markers,
-        cloudPolygons: cloudPolys,
-        cloudMax: cloudMax,
-        cloudMin: cloudMin,
         minTemp: temps.isEmpty ? null : temps.reduce((a, b) => a < b ? a : b),
         maxTemp: temps.isEmpty ? null : temps.reduce((a, b) => a > b ? a : b),
         maxPop: maxPop,
@@ -371,11 +376,27 @@ class _LocationScreenState extends State<LocationScreen> {
         ),
       ),
       PanelCard(
-        heading: '地图 · 云量分布',
+        heading: '地图 · 天气叠加',
         padding: const EdgeInsets.all(12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ===== 图层切换 =====
+            Row(
+              children: [
+                _layerChip('关闭', _LayerMode.none),
+                const SizedBox(width: 6),
+                _layerChip('云量', _LayerMode.cloud),
+                const SizedBox(width: 6),
+                _layerChip('雨量', _LayerMode.rain),
+                const Spacer(),
+                if (_layerMode != _LayerMode.none && _timeCount > 0)
+                  Text(_timeLabel,
+                      style: const TextStyle(
+                          fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
+              ],
+            ),
+            const SizedBox(height: 8),
             ClipRRect(
               borderRadius: BorderRadius.circular(10),
               child: SizedBox(
@@ -385,30 +406,59 @@ class _LocationScreenState extends State<LocationScreen> {
                   lon: r.center.lon,
                   zoom: 11.5,
                   markers: r.markers, // 带文字标注
-                  polygons: r.cloudPolygons, // 云量热力格叠加
-                  interactive: true, // 独占手势：可缩放/拖动
+                  polygons: _layerPolygons(), // 云量/雨量热力格
+                  interactive: true,
                 ),
               ),
             ),
-            if (r.cloudMax != null) ...[
-              const SizedBox(height: 8),
+            // ===== 时间轴（看云/雨往哪飘）=====
+            if (_layerMode != _LayerMode.none && _timeCount > 0) ...[
+              const SizedBox(height: 4),
               Row(
                 children: [
-                  const Text('云量', style: TextStyle(fontSize: 11, color: AppTheme.textFaint)),
-                  const SizedBox(width: 8),
-                  Text(
-                    '${r.cloudMin?.round() ?? 0}% – ${r.cloudMax?.round() ?? 0}%',
-                    style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim, fontWeight: FontWeight.w600),
+                  InkWell(
+                    onTap: _togglePlay,
+                    borderRadius: BorderRadius.circular(20),
+                    child: Container(
+                      padding: const EdgeInsets.all(7),
+                      decoration: BoxDecoration(
+                        color: AppTheme.accentDim,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: AppTheme.accent),
+                      ),
+                      child: Icon(_playing ? Icons.pause : Icons.play_arrow,
+                          size: 18, color: AppTheme.accent),
+                    ),
                   ),
-                  const Spacer(),
-                  // 色阶图例
-                  Container(width: 16, height: 9, color: _cloudColor(10)),
-                  Container(width: 16, height: 9, color: _cloudColor(50)),
-                  Container(width: 16, height: 9, color: _cloudColor(100)),
-                  const SizedBox(width: 6),
-                  const Text('薄 → 厚', style: TextStyle(fontSize: 10.5, color: AppTheme.textFaint)),
+                  Expanded(
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 3,
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                        overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+                        activeTrackColor: AppTheme.accent,
+                        inactiveTrackColor: AppTheme.border,
+                        thumbColor: AppTheme.accent,
+                      ),
+                      child: Slider(
+                        value: _timeIndex.toDouble().clamp(
+                            0, math.max(0, _timeCount - 1).toDouble()),
+                        min: 0,
+                        max: math.max(1, _timeCount - 1).toDouble(),
+                        divisions: _timeCount > 1 ? _timeCount - 1 : null,
+                        onChanged: (v) {
+                          _animTimer?.cancel();
+                          setState(() {
+                            _timeIndex = v.round();
+                            _playing = false;
+                          });
+                        },
+                      ),
+                    ),
+                  ),
                 ],
               ),
+              _layerLegend(),
             ],
           ],
         ),
@@ -416,22 +466,92 @@ class _LocationScreenState extends State<LocationScreen> {
     ];
   }
 
-  /// 由网格点生成云量热力格（Polygon 面）
-  ///
-  /// 注意：云量是格点值，这里用「每格左上角」的值代表整格，做成离散热力格。
-  List<Polygon> _buildCloudPolygons(
-    List<({double lat, double lon, double? cloud})> grid,
-    int n,
-  ) {
+  Widget _layerChip(String label, _LayerMode mode) {
+    final on = _layerMode == mode;
+    return InkWell(
+      onTap: () {
+        _animTimer?.cancel();
+        setState(() {
+          _layerMode = mode;
+          _playing = false;
+        });
+      },
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+        decoration: BoxDecoration(
+          color: on ? AppTheme.accentDim : AppTheme.bgInset,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: on ? AppTheme.accent : AppTheme.border),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: on ? AppTheme.accent : AppTheme.textDim,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 图层图例（色阶说明）
+  Widget _layerLegend() {
+    final items = _layerMode == _LayerMode.cloud
+        ? [
+            (const Color(0x2EECF1FC), '少云'),
+            (const Color(0x80ECF1FC), '多云'),
+            (const Color(0xCCECF1FC), '阴'),
+          ]
+        : [
+            (const Color(0x994FC3F7), '小雨'),
+            (const Color(0xBB2979FF), '中雨'),
+            (const Color(0xDD7C4DFF), '大雨'),
+            (const Color(0xEEB388FF), '暴雨'),
+          ];
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, left: 4),
+      child: Row(
+        children: [
+          for (final it in items) ...[
+            Container(
+              width: 16,
+              height: 9,
+              decoration: BoxDecoration(
+                color: it.$1,
+                border: Border.all(color: AppTheme.borderSoft),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Text(it.$2, style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+            const SizedBox(width: 10),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 当前图层模式 + 当前时刻对应的热力格
+  List<Polygon> _layerPolygons() {
+    if (_layerMode == _LayerMode.none || _grid.isEmpty) return const [];
+    final n = _gridN;
+    final t = _timeIndex.clamp(0, math.max(0, _timeCount - 1)).toInt();
     final polys = <Polygon>[];
+
     for (var r = 0; r < n - 1; r++) {
       for (var c = 0; c < n - 1; c++) {
-        final p00 = grid[r * n + c];
-        final p01 = grid[r * n + c + 1];
-        final p11 = grid[(r + 1) * n + c + 1];
-        final p10 = grid[(r + 1) * n + c];
-        final cloud = p00.cloud;
-        if (cloud == null) continue;
+        final p00 = _grid[r * n + c];
+        final p01 = _grid[r * n + c + 1];
+        final p11 = _grid[(r + 1) * n + c + 1];
+        final p10 = _grid[(r + 1) * n + c];
+
+        final value = _layerMode == _LayerMode.cloud ? p00.cloudAt(t) : p00.rainAt(t);
+        if (value == null) continue;
+        final color = _layerMode == _LayerMode.cloud ? _cloudColor(value) : _rainColor(value);
+        if (color.a == 0) continue;
+
         polys.add(Polygon(
           points: [
             LatLng(p00.lat, p00.lon),
@@ -441,17 +561,51 @@ class _LocationScreenState extends State<LocationScreen> {
           ],
           strokeWidth: 0.1,
           strokeColor: Colors.transparent,
-          fillColor: _cloudColor(cloud),
+          fillColor: color,
         ));
       }
     }
     return polys;
   }
 
-  /// 云量(0-100) → 颜色：云越厚越白、越不透明
+  /// 云量(0-100) → 颜色：云越厚越白越不透明（已加强可见度）
   Color _cloudColor(double cloud) {
-    final a = (cloud / 100.0 * 0.62).clamp(0.0, 0.62);
-    return Color.fromRGBO(226, 233, 248, a);
+    final a = (0.18 + cloud / 100.0 * 0.62).clamp(0.0, 0.8);
+    return Color.fromRGBO(236, 241, 252, a);
+  }
+
+  /// 雨量(mm/h) → 颜色：小雨蓝 → 中雨深蓝 → 大雨紫 → 暴雨亮紫
+  Color _rainColor(double rain) {
+    if (rain < 0.1) return const Color(0x00000000);
+    if (rain < 2.5) return const Color(0x994FC3F7);
+    if (rain < 8.0) return const Color(0xBB2979FF);
+    if (rain < 16.0) return const Color(0xDD7C4DFF);
+    return const Color(0xEEB388FF);
+  }
+
+  /// 当前时刻标签（时间轴显示用）
+  String get _timeLabel {
+    if (_grid.isEmpty || _timeCount == 0) return '';
+    final t = _timeIndex.clamp(0, _timeCount - 1);
+    final raw = _grid.first.times;
+    if (t < raw.length && raw[t].length >= 13) {
+      return raw[t].substring(5, 16).replaceFirst('T', ' '); // MM-DD HH:mm
+    }
+    return '第 $t 小时';
+  }
+
+  /// 播放/暂停时间轴动画（看云/雨往哪飘）
+  void _togglePlay() {
+    if (_timeCount == 0) return;
+    setState(() => _playing = !_playing);
+    _animTimer?.cancel();
+    if (!_playing) return;
+    _animTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
+      if (!mounted) return;
+      setState(() {
+        _timeIndex = (_timeIndex + 1) % _timeCount;
+      });
+    });
   }
 
   Widget _metric(String k, String v) {
