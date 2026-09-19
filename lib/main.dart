@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'screens/home_screen.dart';
 import 'theme/app_theme.dart';
@@ -19,6 +20,20 @@ class JishiWeatherApp extends StatelessWidget {
       title: '迹时天气',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.dark(),
+
+      // ⚠️ 必须显式声明中文，否则 showDatePicker/showTimePicker 里的
+      // 「SELECT DATE」「Cancel」「OK」等按钮全是英文（用户反馈）
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: const [
+        Locale('zh', 'CN'),
+        Locale('en', 'US'),
+      ],
+      locale: const Locale('zh', 'CN'),
+
       home: const HomeScreen(),
     );
   }

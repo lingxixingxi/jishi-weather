@@ -116,6 +116,10 @@ class _PlaceSearchFieldState extends State<PlaceSearchField> {
 
   @override
   Widget build(BuildContext context) {
+    // 无障碍：系统开启「减少动画」时降级为无位移的淡入（不是完全不动）
+    final reduce = MediaQuery.maybeOf(context)?.disableAnimations ?? false;
+    const dur = Duration(milliseconds: 180); // 0.18s，落在 150~250ms 区间
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -174,72 +178,99 @@ class _PlaceSearchFieldState extends State<PlaceSearchField> {
         ),
 
         // ===== 候选列表 =====
-        if (_open) ...[
-          const SizedBox(height: 6),
-          Container(
-            constraints: const BoxConstraints(maxHeight: 260),
-            decoration: BoxDecoration(
-              color: AppTheme.bgCard,
-              borderRadius: BorderRadius.circular(9),
-              border: Border.all(color: AppTheme.accent.withValues(alpha: 0.55)),
-            ),
-            child: ListView.separated(
-              shrinkWrap: true,
-              padding: EdgeInsets.zero,
-              itemCount: _tips.length,
-              separatorBuilder: (_, __) => const Divider(height: 1, color: AppTheme.borderSoft),
-              itemBuilder: (_, i) {
-                final t = _tips[i];
-                return InkWell(
-                  onTap: () => _pick(t),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-                    child: Row(
+        //
+        // 动效决策（频率：偶尔 / 目的：空间一致性 + 防止下方内容被顶得跳变）
+        // · 工具: AnimatedSize（高度）+ 一次性 fade/scale 进入
+        // · 属性: opacity + transform（不动 width/height 的动画，只让 AnimatedSize 控高）
+        // · 曲线: easeOutCubic ≈ cubic-bezier(0.23, 1, 0.32, 1)
+        // · 时长: 180ms
+        // · 起始: scale 0.97（**绝不 scale(0)**），原点在顶部（从输入框下方展开）
+        AnimatedSize(
+          duration: reduce ? Duration.zero : dur,
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.topCenter,
+          child: _open
+              ? TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0.0, end: 1.0),
+                  duration: reduce ? Duration.zero : dur,
+                  curve: Curves.easeOutCubic,
+                  builder: (ctx, t, child) => Opacity(
+                    opacity: t,
+                    child: Transform.scale(
+                      scale: 0.97 + 0.03 * t,
+                      alignment: Alignment.topCenter,
+                      child: child,
+                    ),
+                  ),
+                  child: _tipsBody(),
+                )
+              : const SizedBox(width: double.infinity, height: 0),
+        ),
+      ],
+    );
+  }
+
+  Widget _tipsBody() {
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      constraints: const BoxConstraints(maxHeight: 260),
+      decoration: BoxDecoration(
+        color: AppTheme.bgCard,
+        borderRadius: BorderRadius.circular(9),
+        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.55)),
+      ),
+      child: ListView.separated(
+        shrinkWrap: true,
+        padding: EdgeInsets.zero,
+        itemCount: _tips.length,
+        separatorBuilder: (_, __) => const Divider(height: 1, color: AppTheme.borderSoft),
+        itemBuilder: (_, i) {
+          final t = _tips[i];
+          return InkWell(
+            onTap: () => _pick(t),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+              child: Row(
+                children: [
+                  Icon(
+                    t.hasLocation ? Icons.place_outlined : Icons.map_outlined,
+                    size: 15,
+                    color: t.hasLocation ? AppTheme.cyan : AppTheme.textFaint,
+                  ),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Icon(
-                          t.hasLocation ? Icons.place_outlined : Icons.map_outlined,
-                          size: 15,
-                          color: t.hasLocation ? AppTheme.cyan : AppTheme.textFaint,
+                        Text(
+                          t.name,
+                          style: const TextStyle(
+                              fontSize: 13.5,
+                              color: AppTheme.text,
+                              fontWeight: FontWeight.w600),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        const SizedBox(width: 9),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                t.name,
-                                style: const TextStyle(
-                                    fontSize: 13.5,
-                                    color: AppTheme.text,
-                                    fontWeight: FontWeight.w600),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              if (t.subtitle.isNotEmpty)
-                                Text(
-                                  t.subtitle,
-                                  style: const TextStyle(fontSize: 11, color: AppTheme.textFaint),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                            ],
+                        if (t.subtitle.isNotEmpty)
+                          Text(
+                            t.subtitle,
+                            style: const TextStyle(fontSize: 11, color: AppTheme.textFaint),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                           ),
-                        ),
-                        if (t.hasLocation)
-                          const Text('选择',
-                              style: TextStyle(
-                                  fontSize: 11,
-                                  color: AppTheme.accent,
-                                  fontWeight: FontWeight.w600)),
                       ],
                     ),
                   ),
-                );
-              },
+                  if (t.hasLocation)
+                    const Text('选择',
+                        style: TextStyle(
+                            fontSize: 11, color: AppTheme.accent, fontWeight: FontWeight.w600)),
+                ],
+              ),
             ),
-          ),
-        ],
-      ],
+          );
+        },
+      ),
     );
   }
 }

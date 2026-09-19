@@ -186,22 +186,24 @@ class SatelliteService {
     return bd?.buffer.asUint8List();
   }
 
-  /// 把可见光真彩色云图处理成「**只保留云**」的透明 PNG
+  /// 把可见光真彩色云图处理成「**只保留云、且按云量配色**」的 PNG
   ///
-  /// ⚠️ 为什么需要：
-  /// 可见光图里**陆地/海洋是暗褐色**，直接整图叠加会让地图发暗发脏
-  /// （用户反馈「感觉外面全是云」）。云是唯一有信息量的部分。
+  /// ⚠️ 为什么不能直接用原图：
+  /// 1. 可见光图里**陆地/海洋是暗褐色**，整图叠加会让地图发暗发脏
+  /// 2. 云是**白色**，而高德底图偏米白 → **白色云几乎看不见**
+  ///    （用户反馈「卫星云图是白色的话就很难看出云来了」）
   ///
-  /// 处理规则（按像素亮度）：
-  /// · 亮度 < [lowCut]（≈105）  → 完全透明（陆地/海洋/晴空）
-  /// · 亮度 > [highCut]（≈205） → 白色，alpha 0.55~1.0（厚云）
-  /// · 中间                     → 白色，alpha 0~0.5（薄云）
+  /// 解法（采纳用户建议「参考云量」）：
+  /// · 亮度 ≤ [lowCut]  → 完全透明（陆地/海洋/晴空）
+  /// · 亮度越高 → 视作云越厚 → **套用与「云量」图层完全一致的配色**
+  ///   浅灰蓝 `(176,190,210)` → 深灰蓝 `(74,92,120)`
+  /// · 同时整体加重一档（最低按云量 35% 起），保证在浅色底图上可辨
   ///
-  /// 结果：地图底图保持清晰，只有云被叠加，且越白越厚。
+  /// 结果：蓝灰色云系 + 清晰底图，且与「云量」图层视觉语言统一。
   static Future<Uint8List?> cloudOnly(
     Uint8List jpgBytes, {
-    double lowCut = 105,
-    double highCut = 205,
+    double lowCut = 100,
+    double highCut = 200,
   }) async {
     try {
       final codec = await ui.instantiateImageCodec(jpgBytes);
@@ -216,16 +218,22 @@ class SatelliteService {
       for (var i = 0; i < px.length; i += 4) {
         final r = px[i], g = px[i + 1], b = px[i + 2];
         final lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
         if (lum <= lowCut) {
           px[i + 3] = 0; // 透明：无云
-        } else {
-          // 云：统一成白色，alpha 随亮度递增
-          final t = ((lum - lowCut) / (highCut - lowCut)).clamp(0.0, 1.0);
-          px[i] = 255;
-          px[i + 1] = 255;
-          px[i + 2] = 255;
-          px[i + 3] = (255 * (0.15 + 0.85 * t)).clamp(0, 255).toInt();
+          continue;
         }
+
+        // 亮度 → 「等效云量」0~1
+        final t = ((lum - lowCut) / (highCut - lowCut)).clamp(0.0, 1.0);
+        // 整体加重：可见光里的薄云也应看得见（最低按 0.38 起）
+        final c = 0.38 + 0.62 * t;
+
+        // 与 location_screen._cloudColor 完全一致：浅灰蓝 → 深灰蓝
+        px[i] = (176 - 102 * c).round();
+        px[i + 1] = (190 - 98 * c).round();
+        px[i + 2] = (210 - 90 * c).round();
+        px[i + 3] = (255 * (0.30 + c * 0.52).clamp(0.0, 0.85)).round();
       }
 
       // 用处理后的像素重编码为 PNG（decodeImageFromPixels 是回调式 API）

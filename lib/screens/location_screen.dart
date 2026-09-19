@@ -22,6 +22,7 @@ import '../services/rainviewer_service.dart';
 import '../services/satellite_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
+import '../widgets/fade_slide_in.dart';
 import '../widgets/place_search_field.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
 
@@ -768,14 +769,21 @@ class _LocationScreenState extends State<LocationScreen> {
             ],
           ),
         ),
-        if (_result != null) ..._resultWidgets(_result!),
+        // 结果面板按 35ms 递增错峰淡入（区域概览 → 采样明细 → 地图）
+        if (_result != null)
+          ..._resultWidgets(_result!).asMap().entries.map(
+                (e) => FadeSlideIn(delayMs: e.key * 35, child: e.value),
+              ),
 
         // ===== 未来预测（紧跟地图，便于对着地图看趋势）=====
-        if (_hourlyForecast.isNotEmpty || _dailyForecast.isNotEmpty) _forecastCard(),
+        // 面板按 40ms 递增错峰淡入（避免整屏内容同时冒出来）
+        if (_hourlyForecast.isNotEmpty || _dailyForecast.isNotEmpty)
+          FadeSlideIn(delayMs: 40, child: _forecastCard()),
 
         // ===== 多源交叉验证 + 雷达定调（与出行路线页同款逻辑）=====
-        if (_centerMulti != null) _multiSourceCard(),
-        if (_verdictLoading || _verdict != null) _radarVerdictCard(),
+        if (_centerMulti != null) FadeSlideIn(delayMs: 80, child: _multiSourceCard()),
+        if (_verdictLoading || _verdict != null)
+          FadeSlideIn(delayMs: 120, child: _radarVerdictCard()),
       ],
     );
   }
@@ -1373,7 +1381,12 @@ class _LocationScreenState extends State<LocationScreen> {
         }
       },
       borderRadius: BorderRadius.circular(8),
-      child: Container(
+      // 动效决策（频率：偶尔 / 目的：状态指示）
+      // · 120ms easeOut（按钮反馈类，100~160ms 区间）
+      // · 只过渡颜色与边框色（不涉及尺寸/位移）
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
         padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
         decoration: BoxDecoration(
           color: on ? AppTheme.accentDim : AppTheme.bgInset,
