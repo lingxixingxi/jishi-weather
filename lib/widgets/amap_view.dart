@@ -113,8 +113,10 @@ class _AmapViewState extends State<AmapView> {
       return;
     }
 
-    // 中心点变化（例如从「查询天气」切到「当前位置」）时，镜头自动跟过去
-    final moved = (oldWidget.lat != widget.lat) || (oldWidget.lon != widget.lon);
+    // 中心点或缩放级别变化时，镜头自动跟过去
+    final moved = (oldWidget.lat != widget.lat) ||
+        (oldWidget.lon != widget.lon) ||
+        (oldWidget.zoom != widget.zoom);
     if (moved) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _controller?.moveCamera(CameraUpdate.newLatLngZoom(

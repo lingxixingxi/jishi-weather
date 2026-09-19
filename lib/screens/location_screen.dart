@@ -11,7 +11,10 @@ import 'package:x_amap_base/x_amap_base.dart';
 import '../models/hourly_weather.dart';
 import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
+import '../services/nmc_city_repository.dart';
+import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
+import '../services/radar_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
@@ -40,7 +43,7 @@ class _AreaResult {
 }
 
 /// 地图叠加图层模式
-enum _LayerMode { none, cloud, rain }
+enum _LayerMode { none, cloud, rain, radar }
 
 /// 地点查询页 —— 方圆 10km 区域天气
 class LocationScreen extends StatefulWidget {
@@ -54,6 +57,8 @@ class _LocationScreenState extends State<LocationScreen> {
   final _input = TextEditingController(text: '上海虹桥站');
   final _amap = AmapService();
   final _meteo = OpenMeteoService();
+  final _nmc = NmcService();
+  late final NmcCityRepository _cityRepo = NmcCityRepository(_nmc, _amap);
 
   bool _loading = false;
   String? _error;
@@ -70,6 +75,19 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 已渲染好的叠加位图（PNG）—— 交给 GroundOverlay 贴图，仅 1 个图层
   Uint8List? _overlayPng;
 
+  /// 雷达图层：真实雷达拼图（裁剪后的地图区 PNG）+ 其覆盖范围
+  Uint8List? _radarPng;
+  LatLng? _radarSw;
+  LatLng? _radarNe;
+  bool _radarLoading = false;
+  String? _radarInfo;
+
+  /// 地图缩放级别
+  ///
+  /// ⚠️ 雷达拼图源分辨率有限（774px 覆盖约 2000km，1px≈2.6km），
+  /// 地图放大到 zoom 11 以上会严重模糊，所以切到雷达图层时自动缩小。
+  double _mapZoom = 11.5;
+
   /// 重新渲染叠加位图（网格数据 → 平滑 PNG）
   Future<void> _regenerateOverlay() async {
     try {
@@ -81,12 +99,56 @@ class _LocationScreenState extends State<LocationScreen> {
     }
   }
 
+  /// 加载真实雷达拼图（中央气象台华东拼图）
+  ///
+  /// 流程：高德逆地理编码定位城市 → 取该市天气里的雷达图路径
+  /// → 拉最新一帧 → 裁掉底部色标 → 用 RadarGeo 标定范围叠加。
+  Future<void> _loadRadar(double lat, double lon) async {
+    if (_radarLoading) return;
+    setState(() => _radarLoading = true);
+    try {
+      final city = await _cityRepo.locate(lat, lon);
+      if (city == null) {
+        if (mounted) setState(() => _radarLoading = false);
+        return;
+      }
+      final wx = await _nmc.weather(city.code, cityName: city.city);
+      final path = wx.radarImagePath;
+      if (path == null) {
+        if (mounted) setState(() => _radarLoading = false);
+        return;
+      }
+      final frames = await RadarService.fetchRecentFrames(radarPath: path, count: 1);
+      if (frames.isEmpty) {
+        if (mounted) setState(() => _radarLoading = false);
+        return;
+      }
+      final cropped = await RadarService.cropToMapArea(frames.last.bytes);
+      final b = RadarService.overlayBounds();
+      if (!mounted) return;
+      setState(() {
+        _radarPng = cropped;
+        _radarSw = LatLng(b.swLat, b.swLon);
+        _radarNe = LatLng(b.neLat, b.neLon);
+        final t = frames.last.time;
+        _radarInfo = '${t.month}/${t.day} ${t.hour.toString().padLeft(2, '0')}:'
+            '${t.minute.toString().padLeft(2, '0')} · ${wx.radarTitle ?? ''}';
+        _radarLoading = false;
+      });
+      debugPrint('[雷达] 已加载 ${cropped?.length ?? 0} 字节');
+    } catch (e) {
+      debugPrint('[雷达] 加载失败: $e');
+      if (mounted) setState(() => _radarLoading = false);
+    }
+  }
+
   @override
   void dispose() {
     _animTimer?.cancel();
     _input.dispose();
     _amap.dispose();
     _meteo.dispose();
+    _nmc.dispose();
     super.dispose();
   }
 
@@ -418,8 +480,19 @@ class _LocationScreenState extends State<LocationScreen> {
                 _layerChip('云量', _LayerMode.cloud),
                 const SizedBox(width: 6),
                 _layerChip('雨量', _LayerMode.rain),
+                const SizedBox(width: 6),
+                _layerChip('雷达图', _LayerMode.radar),
                 const Spacer(),
-                if (_layerMode != _LayerMode.none && _timeCount > 0)
+                if (_layerMode == _LayerMode.radar && _radarInfo != null)
+                  Flexible(
+                    child: Text(
+                      _radarInfo!,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 10.5, color: AppTheme.accent, fontWeight: FontWeight.w600),
+                    ),
+                  )
+                else if (_layerMode != _LayerMode.none && _timeCount > 0)
                   Text(_timeLabel,
                       style: const TextStyle(
                           fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
@@ -430,21 +503,59 @@ class _LocationScreenState extends State<LocationScreen> {
               borderRadius: BorderRadius.circular(10),
               child: SizedBox(
                 height: 300,
-                child: AmapView(
-                  lat: r.center.lat,
-                  lon: r.center.lon,
-                  zoom: 11.5,
-                  markers: r.markers, // 带文字标注
-                  // 天气叠加：用 GroundOverlay 贴一张平滑位图（仅 1 个图层）
-                  overlayImage: _overlayPng,
-                  overlaySouthwest: _overlayBounds()?.sw,
-                  overlayNortheast: _overlayBounds()?.ne,
-                  interactive: true,
+                child: Stack(
+                  children: [
+                    AmapView(
+                      lat: r.center.lat,
+                      lon: r.center.lon,
+                      zoom: _mapZoom,
+                      markers: r.markers, // 带文字标注
+                      // 叠加层：雷达模式用真实拼图，其余用网格反演位图
+                      overlayImage: _layerMode == _LayerMode.radar ? _radarPng : _overlayPng,
+                      overlaySouthwest: _layerMode == _LayerMode.radar
+                          ? _radarSw
+                          : _overlayBounds()?.sw,
+                      overlayNortheast: _layerMode == _LayerMode.radar
+                          ? _radarNe
+                          : _overlayBounds()?.ne,
+                      // 雷达拼图半透明，保留底图信息（否则整片盖住地图）
+                      overlayTransparency: _layerMode == _LayerMode.radar ? 0.45 : 0.0,
+                      interactive: true,
+                    ),
+                    if (_layerMode == _LayerMode.radar && _radarLoading)
+                      const Positioned(
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        bottom: 0,
+                        child: ColoredBox(
+                          color: Color(0x99101820),
+                          child: Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2, color: AppTheme.accent),
+                                ),
+                                SizedBox(height: 8),
+                                Text('正在加载雷达拼图…',
+                                    style: TextStyle(fontSize: 11.5, color: AppTheme.textDim)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
-            // ===== 时间轴（看云/雨往哪飘）=====
-            if (_layerMode != _LayerMode.none && _timeCount > 0) ...[
+            // ===== 时间轴（看云/雨往哪飘；雷达模式不需要）=====
+            if (_layerMode != _LayerMode.none &&
+                _layerMode != _LayerMode.radar &&
+                _timeCount > 0) ...[
               const SizedBox(height: 4),
               Row(
                 children: [
@@ -508,7 +619,15 @@ class _LocationScreenState extends State<LocationScreen> {
           _layerMode = mode;
           _playing = false;
         });
-        _regenerateOverlay();
+        if (mode == _LayerMode.radar) {
+          // 雷达拼图分辨率有限，自动缩到能看清回波全貌的级别
+          _mapZoom = 7.5;
+          final c = _result?.center;
+          if (c != null) _loadRadar(c.lat, c.lon);
+        } else {
+          _mapZoom = 11.5;
+          _regenerateOverlay();
+        }
       },
       borderRadius: BorderRadius.circular(8),
       child: Container(
@@ -532,6 +651,43 @@ class _LocationScreenState extends State<LocationScreen> {
 
   /// 图层图例（色阶说明）
   Widget _layerLegend() {
+    // 雷达模式：显示 dBZ 色阶
+    if (_layerMode == _LayerMode.radar) {
+      final items = <({Color c, String t})>[];
+      for (final dbz in [10, 20, 30, 40, 50, 60]) {
+        final rgb = RadarPalette.dbzToRgb(dbz);
+        if (rgb == null) continue;
+        items.add((
+          c: Color.fromRGBO(rgb.r, rgb.g, rgb.b, 0.85),
+          t: '$dbz',
+        ));
+      }
+      return Padding(
+        padding: const EdgeInsets.only(top: 2, left: 4),
+        child: Row(
+          children: [
+            const Text('dBZ ', style: TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+            for (final it in items) ...[
+              Container(
+                width: 18,
+                height: 9,
+                decoration: BoxDecoration(
+                  color: it.c,
+                  border: Border.all(color: AppTheme.borderSoft),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(width: 3),
+              Text(it.t, style: const TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+              const SizedBox(width: 6),
+            ],
+            const Spacer(),
+            const Text('弱 → 强', style: TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+          ],
+        ),
+      );
+    }
+
     final items = _layerMode == _LayerMode.cloud
         ? [
             (_cloudColor(10), '少云'),
