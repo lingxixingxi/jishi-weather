@@ -536,12 +536,8 @@ class _LocationScreenState extends State<LocationScreen> {
                 _layerChip('雨量', _LayerMode.rain),
                 const SizedBox(width: 6),
                 _layerChip('雷达图', _LayerMode.radar),
-                const SizedBox(width: 6),
-                _layerChip('雷达瓦片', _LayerMode.radarTile),
                 const Spacer(),
-                if ((_layerMode == _LayerMode.radar ||
-                        _layerMode == _LayerMode.radarTile) &&
-                    _radarInfo != null)
+                if (_layerMode == _LayerMode.radar && _radarInfo != null)
                   Flexible(
                     child: Text(
                       _radarInfo!,
@@ -591,8 +587,8 @@ class _LocationScreenState extends State<LocationScreen> {
                       },
                       interactive: true,
                     ),
-                    // zoom 过大时瓦片源不支持，给出提示
-                    if (_layerMode == _LayerMode.radarTile && !_tileUsable)
+                    // zoom 过大时雷达拼图会被拉得很糊（源图 1px≈2.6km）
+                    if (_layerMode == _LayerMode.radar && _currentZoom > 9.5)
                       Positioned(
                         left: 8,
                         right: 8,
@@ -602,12 +598,11 @@ class _LocationScreenState extends State<LocationScreen> {
                           decoration: BoxDecoration(
                             color: const Color(0xE6141A24),
                             borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: AppTheme.accent),
+                            border: Border.all(color: AppTheme.accent.withValues(alpha: 0.7)),
                           ),
-                          child: Text(
-                            '雷达瓦片源仅支持缩放 ≤ ${_tileMaxZoom.toStringAsFixed(0)} 级，'
-                            '当前 ${_currentZoom.toStringAsFixed(1)} 级 —— 请缩小地图查看',
-                            style: const TextStyle(fontSize: 11, color: AppTheme.accent, height: 1.35),
+                          child: const Text(
+                            '雷达拼图为区域全貌（约 2.6km/像素），建议缩小到 20km 以上查看更清晰',
+                            style: TextStyle(fontSize: 11, color: AppTheme.accent, height: 1.35),
                           ),
                         ),
                       ),

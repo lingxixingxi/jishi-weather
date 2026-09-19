@@ -121,24 +121,66 @@ class QWeatherService {
     }
   }
 
+  /// 解析单条逐小时数据
+  ///
+  /// ⚠️ 新旧版结构差异很大：
+  /// · 新版 `/weather/v1/hourly`：**嵌套对象** + 特殊单位
+  ///   `temperature.value` / `wind.speed.value`(m/s) / `visibility.value`(米)
+  ///   `humidity`(0~1) / `cloudCover`(0~1) / `precipitation.probability`(0~1)
+  /// · 旧版 `/v7/weather/24h`：**扁平字符串**字段（temp/windSpeed km/h 等）
   QWeatherHourly _parseHourly(Map map, {required bool v1}) {
-    double? num_(dynamic v) {
-      if (v == null) return null;
-      if (v is num) return v.toDouble();
-      return double.tryParse('$v');
+    if (v1) {
+      // 兼容取标量或 {value: x}
+      double? v(dynamic o) {
+        if (o == null) return null;
+        if (o is num) return o.toDouble();
+        if (o is Map) {
+          final x = o['value'];
+          if (x is num) return x.toDouble();
+          return double.tryParse('$x');
+        }
+        return double.tryParse('$o');
+      }
+
+      final precip = map['precipitation'] as Map?;
+      final wind = map['wind'] as Map?;
+      final windDir = wind?['direction'] as Map?;
+      final cond = map['condition'] as Map?;
+
+      final hum = v(map['humidity']); // 0~1
+      final pop = v(precip?['probability']); // 0~1
+      final cloud = v(map['cloudCover']); // 0~1
+      final windMs = v(wind?['speed']); // m/s
+      final gustMs = v(map['windGust']); // m/s
+      final visM = v(map['visibility']); // 米
+
+      return QWeatherHourly(
+        // 新版时间带 Z（UTC），需转本地
+        time: DateTime.tryParse('${map['forecastTime']}')?.toLocal() ?? DateTime.now(),
+        temperature: v(map['temperature']),
+        humidity: hum == null ? null : hum * 100,
+        precipitationProbability: pop == null ? null : (pop * 100).round(),
+        // 优先用强度（mm/h），退回累计量
+        precipitation: v(precip?['intensity']) ?? v(precip?['amount']),
+        windSpeed: windMs == null ? null : windMs * 3.6, // m/s → km/h
+        windDirection: v(windDir?['degree'])?.round(),
+        windGust: gustMs == null ? null : gustMs * 3.6,
+        visibility: visM == null ? null : visM / 1000.0, // 米 → 公里
+        cloudCover: cloud == null ? null : cloud * 100,
+        weatherText: cond?['text'] as String?,
+        iconCode: v(cond?['code'])?.round(),
+      );
     }
 
-    DateTime time;
-    if (v1) {
-      // 新版：fxTime 形如 2026-09-19T15:00+08:00
-      time = DateTime.tryParse('${map['fxTime'] ?? map['time']}')?.toLocal() ?? DateTime.now();
-    } else {
-      // 旧版：2026-09-19T15:00+08:00
-      time = DateTime.tryParse('${map['fxTime']}')?.toLocal() ?? DateTime.now();
+    // 旧版：扁平字段
+    double? num_(dynamic x) {
+      if (x == null) return null;
+      if (x is num) return x.toDouble();
+      return double.tryParse('$x');
     }
 
     return QWeatherHourly(
-      time: time,
+      time: DateTime.tryParse('${map['fxTime']}')?.toLocal() ?? DateTime.now(),
       temperature: num_(map['temp']),
       humidity: num_(map['humidity']),
       precipitationProbability: num_(map['pop'])?.round(),

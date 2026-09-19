@@ -223,7 +223,7 @@ class RadarVerdictEngine {
 
     // ② 降水强度量级接近度
     if (radarSaysRain && modelSaysRain) {
-      final rDbz = RadarService.dbzToRainRate(radarDbz!);
+      final rDbz = RadarService.dbzToRainRate(radarDbz);
       final diff = (modelRain - rDbz).abs();
       if (diff < 1) {
         score += 20;

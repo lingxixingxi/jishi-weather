@@ -103,9 +103,9 @@ class MultiSourceService {
   }) async {
     if (points.isEmpty) return const [];
 
-    // 1. Open-Meteo 三模型（并行）
+    // 1. Open-Meteo 三模型（并行，带单点超时降级）
     final meteoAll = await _meteo.fetchMultiModelMany(
-      points,
+      points: points,
       forecastDays: forecastDays,
     );
 

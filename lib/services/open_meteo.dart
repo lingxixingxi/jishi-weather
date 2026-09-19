@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/hourly_weather.dart';
@@ -305,21 +306,83 @@ class OpenMeteoService {
     return out;
   }
 
-  /// 多地点 × 多模型（路线沿途采样点用）
-  Future<List<List<MultiModelHourly>>> fetchMultiModelMany(
-    List<({double lat, double lon, String place})> points, {
+  /// 多地点 × 多模型，**带超时降级**
+  ///
+  /// 三模型请求的响应体积是单模型的 3 倍，网络慢时容易超时。
+  /// 这里给每个点单独设超时；超时的点自动降级为 `best_match` 单模型，
+  /// 保证整条路线仍能出研判结果（而不是整个流程失败）。
+  Future<List<List<MultiModelHourly>>> fetchMultiModelMany({
+    required List<({double lat, double lon, String place})> points,
     List<String> models = defaultModels,
     int forecastDays = 2,
     List<String>? variables,
+    Duration perPointTimeout = const Duration(seconds: 20),
   }) {
-    return Future.wait(points.map((p) => fetchMultiModel(
-          lat: p.lat,
-          lon: p.lon,
-          place: p.place,
+    return Future.wait(points.map((p) => _fetchOneWithFallback(
+          p,
           models: models,
           forecastDays: forecastDays,
           variables: variables,
+          timeout: perPointTimeout,
         )));
+  }
+
+  Future<List<MultiModelHourly>> _fetchOneWithFallback(
+    ({double lat, double lon, String place}) p, {
+    required List<String> models,
+    required int forecastDays,
+    List<String>? variables,
+    required Duration timeout,
+  }) async {
+    try {
+      return await fetchMultiModel(
+        lat: p.lat,
+        lon: p.lon,
+        place: p.place,
+        models: models,
+        forecastDays: forecastDays,
+        variables: variables,
+      ).timeout(timeout);
+    } catch (e) {
+      debugPrint('[Open-Meteo] 三模型失败(${p.place})，降级单模型: $e');
+      // 降级：单模型 best_match
+      try {
+        final single = await fetchHourly(
+          lat: p.lat,
+          lon: p.lon,
+          place: p.place,
+          forecastDays: forecastDays,
+          variables: variables,
+        );
+        return single
+            .map((w) => MultiModelHourly(
+                  place: p.place,
+                  lat: p.lat,
+                  lon: p.lon,
+                  time: w.time,
+                  sources: [
+                    ModelForecast(
+                      model: 'best_match',
+                      displayName: '综合',
+                      temperature: w.temperature,
+                      precipitationProbability: w.precipitationProbability,
+                      precipitation: w.precipitation,
+                      windSpeed: w.windSpeed,
+                      windDirection: w.windDirection,
+                      windGust: w.windGust,
+                      visibility: w.visibility,
+                      cloudCover: w.cloudCover,
+                      weatherCode: w.weatherCode,
+                      weatherText: w.weatherText,
+                    ),
+                  ],
+                ))
+            .toList();
+      } catch (e2) {
+        debugPrint('[Open-Meteo] 降级也失败(${p.place}): $e2');
+        return const <MultiModelHourly>[];
+      }
+    }
   }
 
   void dispose() => _client.close();
