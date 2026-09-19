@@ -19,6 +19,7 @@ import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../services/radar_service.dart';
 import '../services/rainviewer_service.dart';
+import '../services/satellite_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
@@ -91,6 +92,9 @@ enum _LayerMode {
 
   /// RainViewer 雷达瓦片（瓦片式，任意缩放都清晰）
   radarTile,
+
+  /// 风云四号**卫星云图**（看云系，与雷达互补；分辨率粗，适合小比例尺）
+  satellite,
 }
 
 /// 地点查询页 —— 方圆 10km 区域天气
@@ -153,6 +157,12 @@ class _LocationScreenState extends State<LocationScreen> {
   RainTileInfo? _rainTile;
   bool _tileLoading = false;
 
+  /// 风云四号卫星云图（看云系）
+  final _satellite = SatelliteService();
+  Uint8List? _satellitePng;
+  String? _satelliteInfo;
+  bool _satelliteLoading = false;
+
   /// 当前地图缩放级别（由地图回调更新）
   ///
   /// RainViewer 免费版**最大只到 zoom 7**（z≥8 返回「Zoom Level Not
@@ -177,6 +187,35 @@ class _LocationScreenState extends State<LocationScreen> {
       setState(() => _overlayPng = png);
     } catch (e) {
       debugPrint('[叠加] 渲染失败: $e');
+    }
+  }
+
+  /// 加载风云四号卫星云图（看云系，与雷达互补）
+  Future<void> _loadSatellite() async {
+    if (_satelliteLoading) return;
+    setState(() => _satelliteLoading = true);
+    try {
+      final r = await _satellite.fetchLatest();
+      if (!mounted) return;
+      if (r == null) {
+        setState(() {
+          _satelliteLoading = false;
+          _satelliteInfo = '卫星云图拉取失败';
+        });
+        return;
+      }
+      final png = await SatelliteService.normalize(r.bytes);
+      if (!mounted) return;
+      setState(() {
+        _satellitePng = png;
+        _satelliteInfo = '${r.time.month}/${r.time.day} '
+            '${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')} · FY-4B 真彩色';
+        _satelliteLoading = false;
+      });
+      debugPrint('[卫星云图] 已加载 ${png?.length ?? 0} 字节');
+    } catch (e) {
+      debugPrint('[卫星云图] 失败: $e');
+      if (mounted) setState(() => _satelliteLoading = false);
     }
   }
 
@@ -254,6 +293,7 @@ class _LocationScreenState extends State<LocationScreen> {
     _meteo.dispose();
     _nmc.dispose();
     _rainViewer.dispose();
+    _satellite.dispose();
     super.dispose();
   }
 
@@ -767,11 +807,18 @@ class _LocationScreenState extends State<LocationScreen> {
                 _layerChip('雨量', _LayerMode.rain),
                 const SizedBox(width: 6),
                 _layerChip('雷达图', _LayerMode.radar),
+                const SizedBox(width: 6),
+                _layerChip('卫星云图', _LayerMode.satellite),
                 const Spacer(),
-                if (_layerMode == _LayerMode.radar && _radarInfo != null)
+                if ((_layerMode == _LayerMode.radar ||
+                        _layerMode == _LayerMode.radarTile ||
+                        _layerMode == _LayerMode.satellite) &&
+                    (_radarInfo != null || _satelliteInfo != null))
                   Flexible(
                     child: Text(
-                      _radarInfo!,
+                      _layerMode == _LayerMode.satellite
+                          ? (_satelliteInfo ?? '')
+                          : (_radarInfo ?? ''),
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                           fontSize: 10.5, color: AppTheme.accent, fontWeight: FontWeight.w600),
@@ -795,16 +842,20 @@ class _LocationScreenState extends State<LocationScreen> {
                       lon: r.center.lon,
                       zoom: _mapZoom,
                       markers: r.markers, // 带文字标注
-                      // 叠加层：雷达模式用真实拼图，其余用网格反演位图
-                      overlayImage: _layerMode == _LayerMode.radar ? _radarPng : _overlayPng,
-                      overlaySouthwest: _layerMode == _LayerMode.radar
-                          ? _radarSw
-                          : _overlayBounds()?.sw,
-                      overlayNortheast: _layerMode == _LayerMode.radar
-                          ? _radarNe
-                          : _overlayBounds()?.ne,
-                      // 雷达拼图半透明，保留底图信息（否则整片盖住地图）
-                      overlayTransparency: _layerMode == _LayerMode.radar ? 0.45 : 0.0,
+                      // 叠加层：卫星模式用风云四号云图；雷达模式用拼图；其余用网格反演位图
+                      overlayImage: _layerMode == _LayerMode.satellite
+                          ? _satellitePng
+                          : (_layerMode == _LayerMode.radar ? _radarPng : _overlayPng),
+                      overlaySouthwest: _layerMode == _LayerMode.satellite
+                          ? const LatLng(SatelliteGeo.latMin, SatelliteGeo.lonMin)
+                          : (_layerMode == _LayerMode.radar ? _radarSw : _overlayBounds()?.sw),
+                      overlayNortheast: _layerMode == _LayerMode.satellite
+                          ? const LatLng(SatelliteGeo.latMax, SatelliteGeo.lonMax)
+                          : (_layerMode == _LayerMode.radar ? _radarNe : _overlayBounds()?.ne),
+                      // 雷达拼图半透明；卫星云图更淡（避免盖住底图）
+                      overlayTransparency: _layerMode == _LayerMode.radar
+                          ? 0.45
+                          : (_layerMode == _LayerMode.satellite ? 0.35 : 0.0),
                       // 瓦片式雷达（RainViewer）：仅 zoom ≤ 7 有效
                       tileOverlayUrl:
                           _layerMode == _LayerMode.radarTile && _tileUsable
@@ -1244,6 +1295,9 @@ class _LocationScreenState extends State<LocationScreen> {
         } else if (mode == _LayerMode.radarTile) {
           // RainViewer 瓦片（任意缩放清晰）
           _loadRadarTile();
+        } else if (mode == _LayerMode.satellite) {
+          // 风云四号卫星云图（看云系）
+          _loadSatellite();
         } else {
           _regenerateOverlay();
         }
