@@ -177,6 +177,50 @@ class AmapService {
     return options;
   }
 
+  /// IP 定位兜底：**无需 GPS、无需定位权限**，只要有网就能拿到城市级大概位置。
+  ///
+  /// 天气研判是 10km 尺度，城市级位置完全够用；室内/无 GPS 场景靠它保底。
+  /// 链路：太平洋 IP 库拿出口 IP 的 adcode（纯数字，避开 GBK 中文编码问题）
+  ///      → 高德行政区划 API 换中心坐标。
+  Future<GeoPoint?> ipLocation() async {
+    try {
+      // 1) 取出口 IP 对应的行政区划码
+      final ipResp = await _client
+          .get(Uri.parse('https://whois.pconline.com.cn/ipJson.jsp?json=true'))
+          .timeout(const Duration(seconds: 10));
+      // 该接口返回 GBK，中文会乱码，但我们只提取纯数字 adcode，不受影响
+      final text = latin1.decode(ipResp.bodyBytes);
+      final m = RegExp(r'"cityCode"\s*:\s*"(\d+)"').firstMatch(text);
+      final adcode = m?.group(1);
+      if (adcode == null || adcode == '0' || adcode.isEmpty) return null;
+
+      // 2) adcode → 中心坐标（高德行政区划）
+      final uri = Uri.parse('https://restapi.amap.com/v3/config/district').replace(queryParameters: {
+        'keywords': adcode,
+        'subdistrict': '0',
+        'extensions': 'base',
+        'key': Secrets.amapWebKey,
+      });
+      final resp = await _client.get(uri).timeout(const Duration(seconds: 10));
+      final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
+      if (data['status'] != '1') return null;
+      final districts = data['districts'] as List?;
+      if (districts == null || districts.isEmpty) return null;
+      final first = districts.first as Map;
+      final center = first['center'] as String?;
+      if (center == null || center.isEmpty) return null;
+      final parts = center.split(',');
+      final cityName = (first['name'] as String?) ?? '所在城市';
+      return GeoPoint(
+        lon: double.parse(parts[0]),
+        lat: double.parse(parts[1]),
+        name: '$cityName（IP定位）',
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 折线抽稀：沿路径均匀取 [maxPoints] 个点（含首尾）
   static List<GeoPoint> simplify(List<GeoPoint> pts, {int maxPoints = 20}) {
     if (pts.length <= maxPoints) return List.of(pts);

@@ -35,7 +35,7 @@ class LocationScreen extends StatefulWidget {
 }
 
 class _LocationScreenState extends State<LocationScreen> {
-  final _input = TextEditingController();
+  final _input = TextEditingController(text: '上海虹桥站');
   final _amap = AmapService();
   final _meteo = OpenMeteoService();
 
@@ -63,12 +63,37 @@ class _LocationScreenState extends State<LocationScreen> {
         perm = await Geolocator.requestPermission();
       }
       if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
-        throw Exception('未授予定位权限');
+        throw Exception('未授予定位权限，请在系统设置中开启');
       }
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
-      );
-      await _analyze(GeoPoint(lat: pos.latitude, lon: pos.longitude, name: '当前位置'));
+
+      // 定位策略（天气查询只需公里级精度，不强求 GPS）：
+      // 1) 低精度系统定位（WiFi/基站网络定位）
+      // 2) 退回「最后已知位置」
+      // 3) 仍失败 → **IP 定位兜底**（免 GPS、免权限，只要有网就能拿城市级位置）
+      Position? pos;
+      try {
+        pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.low, // 网络定位，不强制 GPS
+            timeLimit: Duration(seconds: 10),
+          ),
+        );
+      } catch (_) {
+        pos = await Geolocator.getLastKnownPosition();
+      }
+
+      if (pos != null) {
+        await _analyze(GeoPoint(lat: pos.latitude, lon: pos.longitude, name: '当前位置'));
+        return;
+      }
+
+      // 系统定位全失败 → IP 定位兜底
+      final ipPoint = await _amap.ipLocation();
+      if (ipPoint != null) {
+        await _analyze(ipPoint);
+        return;
+      }
+      throw Exception('定位失败：请开启系统「位置信息」，或直接输入地点');
     } catch (e) {
       setState(() {
         _loading = false;

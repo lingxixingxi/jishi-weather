@@ -54,3 +54,4 @@ android/key.properties
 android/local.properties
 key.properties
 android-keys/
+lib/config/secrets.dart
