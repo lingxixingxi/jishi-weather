@@ -129,6 +129,21 @@ class ScreenScaffold extends StatelessWidget {
                         color: AppTheme.text,
                       ),
                     ),
+                    const SizedBox(width: 8),
+                    // 内测版标识（0.1.0 内测，禁止外传）
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: AppTheme.accent.withValues(alpha: .15),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: AppTheme.accent.withValues(alpha: .55)),
+                      ),
+                      child: const Text(
+                        '0.1.0 内测 · 禁止外传',
+                        style: TextStyle(
+                            fontSize: 9, color: AppTheme.accent, fontWeight: FontWeight.w700),
+                      ),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 4),
