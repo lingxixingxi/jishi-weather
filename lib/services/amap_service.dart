@@ -83,9 +83,30 @@ class RouteOption {
 
 /// 高德 Web 服务 API（地理编码 / 路线规划）
 ///
+/// 高德逆地理编码结果
+class AmapAddress {
+  final String province;
+  final String city;
+  final String district;
+  final String adcode;
+  final String formatted;
+
+  const AmapAddress({
+    required this.province,
+    required this.city,
+    required this.district,
+    required this.adcode,
+    this.formatted = '',
+  });
+
+  @override
+  String toString() => '$province$city$district';
+}
+
 /// ⚠️ 用的是 **Web服务 Key**，不是 Android 平台 Key。
 class AmapService {
   static const String _geoUrl = 'https://restapi.amap.com/v3/geocode/geo';
+  static const String _regeoUrl = 'https://restapi.amap.com/v3/geocode/regeo';
   static const String _driveUrl = 'https://restapi.amap.com/v3/direction/driving';
 
   final http.Client _client;
@@ -108,6 +129,40 @@ class AmapService {
     final loc = (list.first as Map)['location'] as String; // "经度,纬度"
     final parts = loc.split(',');
     return GeoPoint(lon: double.parse(parts[0]), lat: double.parse(parts[1]), name: address);
+  }
+
+  /// **逆地理编码**：坐标 → 行政区（用于匹配中央气象台城市）
+  ///
+  /// 中央气象台按「城市」组织数据（2529 个），没有经纬度索引，
+  /// 所以用高德把采样点坐标还原成城市名，再去匹配它的城市 code。
+  /// 直辖市（北京/上海/天津/重庆）的 `city` 字段为空，此时退回 `province`。
+  Future<AmapAddress?> regeo(double lat, double lon) async {
+    _ensureKey();
+    final uri = Uri.parse(_regeoUrl).replace(queryParameters: {
+      'location': '$lon,$lat',
+      'extensions': 'base',
+      'key': Secrets.amapWebKey,
+    });
+    final resp = await _client.get(uri).timeout(const Duration(seconds: 15));
+    final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
+    if (data['status'] != '1') {
+      throw Exception('逆地理编码失败: ${data['info']}');
+    }
+    final rc = data['regeocode'] as Map<String, dynamic>?;
+    final comp = rc?['addressComponent'] as Map<String, dynamic>?;
+    if (comp == null) return null;
+
+    var city = '${comp['city'] ?? ''}';
+    if (city.isEmpty || city == '[]' || city == 'null') {
+      city = '${comp['province'] ?? ''}'; // 直辖市
+    }
+    return AmapAddress(
+      province: '${comp['province'] ?? ''}',
+      city: city,
+      district: '${comp['district'] ?? ''}',
+      adcode: '${comp['adcode'] ?? ''}',
+      formatted: '${rc?['formatted_address'] ?? ''}',
+    );
   }
 
   /// 驾车路线规划 —— 返回**多条候选路线**供用户选择
