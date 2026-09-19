@@ -53,11 +53,20 @@ class RadarPointVerdict {
 
 /// 单个数值模型与雷达实况的吻合度
 class ModelScore {
+  /// 模型标识（如 ecmwf_ifs025 / nmc / qweather）
+  final String modelKey;
+
+  /// 展示名（如 ECMWF / 中央气象台）
   final String modelName;
   final int score; // 0~100
   final String reason;
 
-  const ModelScore({required this.modelName, required this.score, required this.reason});
+  const ModelScore({
+    required this.modelKey,
+    required this.modelName,
+    required this.score,
+    required this.reason,
+  });
 }
 
 /// 雷达定调结论
@@ -65,8 +74,11 @@ class RadarVerdict {
   final RadarPointVerdict? radar;
   final List<ModelScore> scores;
 
-  /// 与雷达实况最吻合的模型（分歧大时的「定调」依据）
+  /// 与雷达实况最吻合的模型展示名（分歧大时的「定调」依据）
   final String? bestModel;
+
+  /// 与雷达实况最吻合的**模型标识**（用于取该源的数据显示详情）
+  final String? bestModelKey;
 
   /// 结论摘要
   final String summary;
@@ -78,6 +90,7 @@ class RadarVerdict {
     this.radar,
     this.scores = const [],
     this.bestModel,
+    this.bestModelKey,
     this.summary = '',
     this.arbitrationUsed = false,
   });
@@ -197,6 +210,7 @@ class RadarVerdictEngine {
       radar: pointVerdict,
       scores: scores,
       bestModel: scores.isEmpty ? null : scores.first.modelName,
+      bestModelKey: scores.isEmpty ? null : scores.first.modelKey,
       summary: _summarize(pointVerdict, scores, arbitration),
       arbitrationUsed: arbitration,
     );
@@ -244,6 +258,7 @@ class RadarVerdictEngine {
     }
 
     return ModelScore(
+      modelKey: src.model,
       modelName: src.displayName,
       score: score.clamp(0, 100),
       reason: reasons.join('，'),

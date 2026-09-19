@@ -58,6 +58,12 @@ class _RouteScreenState extends State<RouteScreen> {
   RadarVerdict? _verdict;
   bool _verdictLoading = false;
 
+  /// 保存最近一次研判的原始数据，用于雷达定调后按最优源重建分段
+  List<({GeoPoint point, double kmFromStart})> _lastSamples = const [];
+  List<MultiModelHourly?> _lastMulti = const [];
+  List<HourlyWeather?> _lastWeathers = const [];
+  RouteOption? _lastOpt;
+
   /// 选中某条候选路线（地图会因 fitPoints 变化自动缩放到该路线）
   void _selectRoute(int index) {
     setState(() => _selectedIndex = index);
@@ -298,6 +304,10 @@ class _RouteScreenState extends State<RouteScreen> {
       });
 
       // ===== 雷达定调（异步，不阻塞主流程）=====
+      _lastSamples = samples;
+      _lastMulti = multiAtArrival;
+      _lastWeathers = weathers;
+      _lastOpt = opt;
       _runRadarVerdict(samples, multiAtArrival);
     } catch (e) {
       setState(() {
@@ -334,10 +344,50 @@ class _RouteScreenState extends State<RouteScreen> {
         _verdict = v;
         _verdictLoading = false;
       });
+
+      // 雷达定调判出了最吻合的源 → 用它重建分段详情
+      // （各要素取自该源；「多源验证」信息依然保留）
+      if (v.bestModelKey != null && v.scores.isNotEmpty) {
+        _rebuildWithSource(v.bestModelKey!);
+      }
     } catch (_) {
       if (!mounted) return;
       setState(() => _verdictLoading = false);
     }
+  }
+
+  /// 用雷达定调判出的**最吻合源**重建分段详情
+  ///
+  /// 各要素（温度/降水/概率/风速等）改用该源的值，
+  /// 但**多源验证信息（各源数值 + 一致性评分）依然保留**在研判依据里。
+  void _rebuildWithSource(String modelKey) {
+    final opt = _lastOpt;
+    if (opt == null || _lastSamples.isEmpty) return;
+
+    final segments = RouteAnalyzer.buildSegments(
+      samples: _lastSamples,
+      weathers: _lastWeathers,
+      departAt: _departAt,
+      totalMinutes: opt.durationMinutes,
+      totalKm: opt.distanceKm,
+      originName: _origin.text.trim(),
+      destinationName: _dest.text.trim(),
+      fullPolyline: opt.fullPolyline,
+      multiModels: _lastMulti,
+      preferredModel: modelKey,
+    );
+
+    setState(() {
+      _analysis = RouteAnalysis(
+        segments: segments,
+        totalKm: opt.distanceKm,
+        totalMinutes: opt.durationMinutes,
+        originName: _origin.text.trim(),
+        destinationName: _dest.text.trim(),
+        overallGrade: RouteAnalyzer.worstGrade(segments.map((s) => s.grade)),
+      );
+    });
+    debugPrint('[雷达定调] 已按最优源重建分段: $modelKey');
   }
 
   @override
@@ -895,6 +945,30 @@ class _RouteScreenState extends State<RouteScreen> {
               ),
             ],
           ),
+          // 采用源标识（雷达定调判出最吻合源后，各要素取自该源）
+          if (seg.adoptedSource != null) ...[
+            const SizedBox(height: 7),
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: AppTheme.green.withValues(alpha: .12),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: AppTheme.green.withValues(alpha: .45)),
+                  ),
+                  child: Text(
+                    '采用 ${seg.adoptedSource}',
+                    style: const TextStyle(
+                        fontSize: 10.5, color: AppTheme.green, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                const Text('（雷达定调最吻合源）',
+                    style: TextStyle(fontSize: 10.5, color: AppTheme.textFaint)),
+              ],
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             children: [
