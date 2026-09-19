@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import '../models/hourly_weather.dart';
 import 'nmc_city_repository.dart';
 import 'nmc_service.dart';
@@ -143,17 +145,35 @@ class MultiSourceService {
     }
 
     // 未来：用日预报（中央气象台预报粒度是日/夜）
+    //
+    // ⚠️ 中央气象台给的是**日最高温 / 夜间最低温**，不是逐小时值，
+    // 直接拿最高温去和 Open-Meteo 的逐小时温度比会系统性偏高。
+    // 这里按日温变化规律插值到目标时刻（最低 05 时、最高 14 时）。
     final f = wx.forecastAt(t);
-    final temp = (t.hour >= 6 && t.hour < 18) ? f?.dayTemp : f?.nightTemp;
+    final temp = _diurnalTemp(f?.dayTemp, f?.nightTemp, t.hour) ?? wx.temperature;
     final text = (t.hour >= 6 && t.hour < 18) ? f?.dayText : f?.nightText;
     return ModelForecast(
       model: 'nmc',
       displayName: '中央气象台',
-      temperature: temp ?? wx.temperature,
+      temperature: temp,
       humidity: wx.humidity,
       precipitation: f?.precipitation,
       weatherText: text ?? wx.weatherText,
       isObservation: false,
     ).enriched();
+  }
+
+  /// 由日最高温 / 夜最低温插值出指定小时的温度
+  ///
+  /// 采用余弦日变化模型：最高出现在 14 时、最低出现在 02 时（近似）。
+  static double? _diurnalTemp(double? dayMax, double? nightMin, int hour) {
+    if (dayMax == null && nightMin == null) return null;
+    if (dayMax == null) return nightMin;
+    if (nightMin == null) return dayMax;
+    final mean = (dayMax + nightMin) / 2;
+    final amp = (dayMax - nightMin) / 2;
+    // 峰值 14 时，谷值 02 时（周期 24h）
+    final phase = (hour - 14) * math.pi / 12;
+    return mean + amp * math.cos(phase);
   }
 }

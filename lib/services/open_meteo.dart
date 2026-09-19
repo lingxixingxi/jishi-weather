@@ -287,7 +287,8 @@ class OpenMeteoService {
           windSpeed: at('wind_speed_10m_$m', i),
           windDirection: at('wind_direction_10m_$m', i)?.round(),
           windGust: at('wind_gusts_10m_$m', i),
-          visibility: at('visibility_$m', i),
+          // ⚠️ Open-Meteo 的 visibility 单位是**米**，统一换算成公里
+          visibility: at('visibility_$m', i) == null ? null : at('visibility_$m', i)! / 1000.0,
           cloudCover: at('cloud_cover_$m', i),
           weatherCode: wc?.round(),
           weatherText: wc == null ? null : wmoCodeText[wc.round()],
