@@ -438,12 +438,42 @@ class RadarService {
 
   /// 查询某经纬度上的回波强度（dBZ），无回波返回 null
   ///
-  /// 在 [radiusPx] 像素半径内取**最大值**，避免因采样步长漏掉小块回波。
+  /// ⚠️ 两个关键点（之前实现有误，导致误报）：
+  /// 1. **半径要小**：拼图分辨率 1px ≈ 2.6km，之前默认 8px ≈ **21km**，
+  ///    会把 20km 外的回波算到目标点头上 → 明明是阴天却报「中到大雨」。
+  ///    现在默认 1px（≈2.6km），与数据源本身的空间精度匹配。
+  /// 2. **取最近点而非最大值**：目标点是否有雨取决于**它自己**的回波，
+  ///    而不是附近最强的回波。
   static int? sampleAt(
     RadarFrame frame,
     double lat,
     double lon, {
-    int radiusPx = 8,
+    int radiusPx = 1,
+  }) {
+    final p = RadarGeo.latLonToPixel(lat, lon);
+    int? best;
+    var bestDist = double.infinity;
+    for (final e in frame.echoes) {
+      final dx = (e.x - p.x).abs();
+      final dy = (e.y - p.y).abs();
+      if (dx > radiusPx || dy > radiusPx) continue;
+      final d = dx + dy; // 曼哈顿距离即可
+      if (d < bestDist) {
+        bestDist = d;
+        best = e.dbz;
+      }
+    }
+    return best;
+  }
+
+  /// 目标点**及其周边**的最大回波（用于判断「附近有雨」而不是「正上方有雨」）
+  ///
+  /// [radiusPx] 建议不超过 3（≈8km），过大会把远处回波算进来。
+  static int? maxEchoNear(
+    RadarFrame frame,
+    double lat,
+    double lon, {
+    int radiusPx = 3,
   }) {
     final p = RadarGeo.latLonToPixel(lat, lon);
     int? best;
@@ -456,7 +486,7 @@ class RadarService {
   }
 
   /// 查询某经纬度的降水强度（mm/h），由 dBZ 经 Z-R 关系反演
-  static double? rainRateAt(RadarFrame frame, double lat, double lon, {int radiusPx = 8}) {
+  static double? rainRateAt(RadarFrame frame, double lat, double lon, {int radiusPx = 1}) {
     final dbz = sampleAt(frame, lat, lon, radiusPx: radiusPx);
     return dbz == null ? null : dbzToRainRate(dbz);
   }

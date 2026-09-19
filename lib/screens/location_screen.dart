@@ -35,6 +35,12 @@ class _AreaResult {
   /// 预生成的地图标注（带文字，Marker 不支持常驻文字故自绘）
   final List<Marker> markers;
 
+  /// 雷达定调判出的**最优源**展示名（中心点采用该源的值）
+  final String? adoptedSource;
+
+  /// 中心点最终采用的天气（最优源的值；null 表示用多源融合值）
+  final HourlyWeather? centerWeather;
+
   const _AreaResult({
     required this.placeName,
     required this.center,
@@ -43,7 +49,31 @@ class _AreaResult {
     this.minTemp,
     this.maxTemp,
     this.maxPop,
+    this.adoptedSource,
+    this.centerWeather,
   });
+
+  /// 中心点生效的天气（优先最优源，否则取 samples 里的中心）
+  HourlyWeather? get effectiveCenter {
+    if (centerWeather != null) return centerWeather;
+    for (final s in samples) {
+      if (s.label == '中心') return s.weather;
+    }
+    return null;
+  }
+
+  /// 复制并覆盖采用源与中心天气
+  _AreaResult copyWithSource(String? source, HourlyWeather? weather) => _AreaResult(
+        placeName: placeName,
+        center: center,
+        samples: samples,
+        markers: markers,
+        minTemp: minTemp,
+        maxTemp: maxTemp,
+        maxPop: maxPop,
+        adoptedSource: source,
+        centerWeather: weather,
+      );
 }
 
 /// 地图叠加图层模式
@@ -530,6 +560,41 @@ class _LocationScreenState extends State<LocationScreen> {
         _verdict = v;
         _verdictLoading = false;
       });
+
+      // 用雷达定调判出的**最优源**更新中心点显示（区域概览随之切换）
+      if (v.bestModelKey != null && _result != null) {
+        ModelForecast? src;
+        for (final s in nowMulti.sources) {
+          if (s.model == v.bestModelKey) {
+            src = s;
+            break;
+          }
+        }
+        if (src != null) {
+          final r = _result!;
+          final eff = HourlyWeather(
+            place: r.placeName,
+            lat: center.lat,
+            lon: center.lon,
+            time: nowMulti.time,
+            source: src.displayName,
+            temperature: src.temperature,
+            precipitationProbability: src.precipitationProbability,
+            precipitation: src.precipitation,
+            windSpeed: src.windSpeed,
+            windDirection: src.windDirection,
+            windGust: src.windGust,
+            visibility: src.visibility,
+            cloudCover: src.cloudCover,
+            weatherCode: src.weatherCode,
+            weatherText: src.weatherText,
+          );
+          setState(() {
+            _result = r.copyWithSource(src!.displayName, eff);
+          });
+          debugPrint('[地点] 中心点改用最优源: ${src.displayName}');
+        }
+      }
     } catch (_) {
       if (!mounted) return;
       setState(() => _verdictLoading = false);
@@ -606,12 +671,12 @@ class _LocationScreenState extends State<LocationScreen> {
         ),
         if (_result != null) ..._resultWidgets(_result!),
 
+        // ===== 未来预测（紧跟地图，便于对着地图看趋势）=====
+        if (_hourlyForecast.isNotEmpty || _dailyForecast.isNotEmpty) _forecastCard(),
+
         // ===== 多源交叉验证 + 雷达定调（与出行路线页同款逻辑）=====
         if (_centerMulti != null) _multiSourceCard(),
         if (_verdictLoading || _verdict != null) _radarVerdictCard(),
-
-        // ===== 未来预测（逐小时 + 逐日）=====
-        if (_hourlyForecast.isNotEmpty || _dailyForecast.isNotEmpty) _forecastCard(),
       ],
     );
   }
@@ -619,14 +684,56 @@ class _LocationScreenState extends State<LocationScreen> {
   List<Widget> _resultWidgets(_AreaResult r) {
     return [
       PanelCard(
-        heading: '区域概览',        child: Column(
+        heading: '区域概览',
+        child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(r.placeName,
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppTheme.text)),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(r.placeName,
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.w700, color: AppTheme.text)),
+                ),
+                if (r.adoptedSource != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: AppTheme.green.withValues(alpha: .12),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: AppTheme.green.withValues(alpha: .45)),
+                    ),
+                    child: Text('采用 ${r.adoptedSource}',
+                        style: const TextStyle(
+                            fontSize: 10.5, color: AppTheme.green, fontWeight: FontWeight.w700)),
+                  ),
+              ],
+            ),
             const SizedBox(height: 2),
             Text('${r.center.lat.toStringAsFixed(4)}, ${r.center.lon.toStringAsFixed(4)}',
                 style: const TextStyle(fontSize: 11.5, color: AppTheme.textFaint)),
+            // 中心点实况（雷达定调后改用最优源）
+            if (r.effectiveCenter != null) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const Icon(Icons.place, size: 15, color: AppTheme.cyan),
+                  const SizedBox(width: 6),
+                  Text(
+                    '中心 ${r.effectiveCenter!.weatherText ?? '—'} '
+                    '${r.effectiveCenter!.temperature?.toStringAsFixed(1) ?? '--'}°',
+                    style: const TextStyle(
+                        fontSize: 13, color: AppTheme.text, fontWeight: FontWeight.w600),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '降水 ${r.effectiveCenter!.precipitationProbability ?? '--'}%'
+                    '${r.effectiveCenter!.visibility == null ? '' : ' · 能见度 ${r.effectiveCenter!.visibility!.toStringAsFixed(1)}km'}',
+                    style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 14),
             Row(
               children: [
