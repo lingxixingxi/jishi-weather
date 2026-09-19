@@ -145,7 +145,19 @@ class _PlaceSearchFieldState extends State<PlaceSearchField> {
                     hintStyle: const TextStyle(fontSize: 13.5, color: AppTheme.textFaint),
                     helperText: widget.subtitle,
                     helperStyle: const TextStyle(fontSize: 10, color: AppTheme.textFaint),
+                    // ⚠️ 边框必须把**所有状态**都设成 none。
+                    // 只设 border 不够 —— Flutter 在聚焦/错误时会改用
+                    // focusedBorder/errorBorder，未显式指定就回落到主题默认的
+                    // OutlineInputBorder，于是外层容器边框内侧又多出一圈琥珀框
+                    // （用户反馈「高亮部分没有全部覆盖整个搜索框」）。
+                    // 高亮统一由外层 Container 的 border 负责。
                     border: InputBorder.none,
+                    enabledBorder: InputBorder.none,
+                    focusedBorder: InputBorder.none,
+                    errorBorder: InputBorder.none,
+                    focusedErrorBorder: InputBorder.none,
+                    disabledBorder: InputBorder.none,
+                    isDense: true,
                     contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 14),
                   ),
                 ),
