@@ -250,10 +250,16 @@ class _LocationScreenState extends State<LocationScreen> {
       debugPrint('[网格] 失败: $e');
     }
 
-    // 时间轴默认定位到「当前小时」
-    final nowHour = DateTime.now().hour;
-    final tCount = grid.isEmpty ? 0 : grid.first.length;
-    final startIdx = tCount == 0 ? 0 : nowHour.clamp(0, tCount - 1);
+    // 时间轴默认定位到「当前小时」（数据含过去 24h + 未来 24h）
+    var startIdx = 0;
+    if (grid.isNotEmpty) {
+      final times = grid.first.times;
+      final now = DateTime.now();
+      final target = '${now.year}-${now.month.toString().padLeft(2, '0')}-'
+          '${now.day.toString().padLeft(2, '0')}T${now.hour.toString().padLeft(2, '0')}:00';
+      final idx = times.indexOf(target);
+      startIdx = idx >= 0 ? idx : (24 + now.hour).clamp(0, math.max(0, times.length - 1));
+    }
 
     setState(() {
       _grid = grid;

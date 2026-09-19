@@ -138,6 +138,7 @@ class OpenMeteoService {
     double spanKm = 24, // 覆盖范围（公里）
     int n = 5, // 每边格点数
     int forecastDays = 1,
+    int pastDays = 1, // 含过去 N 天（可回看移动轨迹）
   }) async {
     final half = spanKm / 2 / 111.0;
     final dLat = spanKm / 111.0 / (n - 1);
@@ -158,6 +159,7 @@ class OpenMeteoService {
       'longitude': lons.map((e) => e.toStringAsFixed(4)).join(','),
       'hourly': 'cloud_cover,precipitation,precipitation_probability',
       'forecast_days': '$forecastDays',
+      'past_days': '$pastDays',
       'timezone': 'Asia/Shanghai',
     });
 
