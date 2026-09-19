@@ -240,7 +240,8 @@ class _LocationScreenState extends State<LocationScreen> {
           text: '${s.label} $tempText',
           color: isCenter ? AppTheme.accent : AppTheme.cyan,
           textColor: isCenter ? const Color(0xFF14100A) : Colors.white,
-          fontSize: 17, // 放大地图标签（原来 12 太小看不清）
+          // 中心点常规字号；东西南北 4 个方位点放大一倍（原 17 -> 34）
+          fontSize: isCenter ? 17 : 34,
         ),
         infoWindow: InfoWindow(
           title: s.label,
@@ -538,10 +539,10 @@ class _LocationScreenState extends State<LocationScreen> {
             (_cloudColor(95), '阴'),
           ]
         : [
-            (const Color(0x994FC3F7), '小雨'),
-            (const Color(0xBB2979FF), '中雨'),
-            (const Color(0xDD7C4DFF), '大雨'),
-            (const Color(0xEEB388FF), '暴雨'),
+            (_rainColor(0.5), '小雨'),
+            (_rainColor(3), '中雨'),
+            (_rainColor(9), '大雨'),
+            (_rainColor(20), '暴雨'),
           ];
     return Padding(
       padding: const EdgeInsets.only(top: 2, left: 4),
@@ -667,13 +668,27 @@ class _LocationScreenState extends State<LocationScreen> {
     return Color.fromRGBO(r, g, b, a);
   }
 
-  /// 雨量(mm/h) → 颜色：小雨蓝 → 中雨深蓝 → 大雨紫 → 暴雨亮紫
+  /// 雨量(mm/h) → 颜色：**连续渐变**（浅蓝→蓝→深蓝→紫），与云量的平滑渲染一致
+  ///
+  /// 0.1mm/h 起色，20mm/h 达到最浓，中间平滑过渡（而非阶梯色）
   Color _rainColor(double rain) {
-    if (rain < 0.1) return const Color(0x00000000);
-    if (rain < 2.5) return const Color(0x994FC3F7);
-    if (rain < 8.0) return const Color(0xBB2979FF);
-    if (rain < 16.0) return const Color(0xDD7C4DFF);
-    return const Color(0xEEB388FF);
+    if (rain < 0.08) return const Color(0x00000000);
+    final t = ((rain - 0.08) / 18.0).clamp(0.0, 1.0);
+    // 三段线性插值：浅蓝 → 亮蓝 → 深紫
+    late final int r, g, b;
+    final a = (0.35 + t * 0.5).clamp(0.0, 0.85);
+    if (t < 0.5) {
+      final k = t / 0.5;
+      r = (110 - 71 * k).round(); // 110 → 39
+      g = (200 - 129 * k).round(); // 200 → 71
+      b = (250 - 9 * k).round(); // 250 → 241
+    } else {
+      final k = (t - 0.5) / 0.5;
+      r = (39 + 85 * k).round(); // 39 → 124
+      g = (71 + 6 * k).round(); // 71 → 77
+      b = (241 + 14 * k).round(); // 241 → 255
+    }
+    return Color.fromRGBO(r, g, b, a);
   }
 
   /// 当前时刻标签（时间轴显示用）
