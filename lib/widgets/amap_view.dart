@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:amap_map/amap_map.dart';
@@ -140,7 +141,7 @@ class _AmapViewState extends State<AmapView> {
     if (span < 1e-5) return CameraPosition(target: center, zoom: 14);
     // 粗略换算 zoom：跨度 0.1° ≈ z11，每翻倍降 1 级
     final z = 11 - (math.log(span / 0.1) / math.ln2);
-    return CameraPosition(target: center, zoom: z.clamp(4.0, 17.0));
+    return CameraPosition(target: center, zoom: z.clamp(4.0, 17.0).toDouble());
   }
 
   /// 延迟执行 fitBounds：地图刚创建时立即调用常不生效，多试几次
