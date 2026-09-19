@@ -800,38 +800,51 @@ class _LocationScreenState extends State<LocationScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // ===== 图层切换 =====
-            Row(
-              children: [
-                _layerChip('关闭', _LayerMode.none),
-                const SizedBox(width: 6),
-                _layerChip('云量', _LayerMode.cloud),
-                const SizedBox(width: 6),
-                _layerChip('雨量', _LayerMode.rain),
-                const SizedBox(width: 6),
-                _layerChip('雷达图', _LayerMode.radar),
-                const SizedBox(width: 6),
-                _layerChip('卫星云图', _LayerMode.satellite),
-                const Spacer(),
-                if ((_layerMode == _LayerMode.radar ||
-                        _layerMode == _LayerMode.radarTile ||
-                        _layerMode == _LayerMode.satellite) &&
-                    (_radarInfo != null || _satelliteInfo != null))
-                  Flexible(
-                    child: Text(
-                      _layerMode == _LayerMode.satellite
-                          ? (_satelliteInfo ?? '')
-                          : (_radarInfo ?? ''),
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          fontSize: 10.5, color: AppTheme.accent, fontWeight: FontWeight.w600),
-                    ),
-                  )
-                else if (_layerMode != _LayerMode.none && _timeCount > 0)
-                  Text(_timeLabel,
-                      style: const TextStyle(
-                          fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
-              ],
+            // ===== 图层切换（按钮已有 5 个，横向可滚动以避免溢出）=====
+            SizedBox(
+              height: 30,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                children: [
+                  _layerChip('关闭', _LayerMode.none),
+                  const SizedBox(width: 6),
+                  _layerChip('云量', _LayerMode.cloud),
+                  const SizedBox(width: 6),
+                  _layerChip('雨量', _LayerMode.rain),
+                  const SizedBox(width: 6),
+                  _layerChip('雷达图', _LayerMode.radar),
+                  const SizedBox(width: 6),
+                  _layerChip('卫星云图', _LayerMode.satellite),
+                ],
+              ),
             ),
+            // 信息标签（雷达/卫星的时刻）单独一行，右对齐
+            if ((_layerMode == _LayerMode.radar ||
+                    _layerMode == _LayerMode.radarTile ||
+                    _layerMode == _LayerMode.satellite) &&
+                (_radarInfo != null || _satelliteInfo != null)) ...[
+              const SizedBox(height: 6),
+              Align(
+                alignment: Alignment.centerRight,
+                child: Text(
+                  _layerMode == _LayerMode.satellite
+                      ? (_satelliteInfo ?? '')
+                      : (_radarInfo ?? ''),
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 10.5, color: AppTheme.accent, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ] else if (_layerMode != _LayerMode.none && _timeCount > 0) ...[
+              const SizedBox(height: 6),
+              Align(
+                alignment: Alignment.centerRight,
+                child: Text(_timeLabel,
+                    style: const TextStyle(
+                        fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
+              ),
+            ],
             const SizedBox(height: 8),
             ClipRRect(
               borderRadius: BorderRadius.circular(10),
