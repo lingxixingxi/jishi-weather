@@ -47,7 +47,7 @@ class OpenMeteoService {
       if (model != 'best_match') 'models': model,
     });
 
-    final resp = await _client.get(uri).timeout(const Duration(seconds: 20));
+    final resp = await _client.get(uri).timeout(const Duration(seconds: 35));
     if (resp.statusCode != 200) {
       throw Exception('Open-Meteo 返回 ${resp.statusCode}');
     }

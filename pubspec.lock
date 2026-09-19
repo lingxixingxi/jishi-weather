@@ -566,7 +566,7 @@ packages:
     source: hosted
     version: "6.4.0"
   x_amap_base:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: x_amap_base
       sha256: "0affc5a3e40c12f717d53554afb3655359435b89f77e5ff5db6730d82f2ba8f5"

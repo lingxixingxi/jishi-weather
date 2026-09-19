@@ -40,6 +40,7 @@ dependencies:
   intl: ^0.20.3
   shared_preferences: ^2.5.5
   amap_flutter_location: ^3.0.0
+  x_amap_base: ^1.0.3
 
 dev_dependencies:
   flutter_test:

@@ -1,11 +1,14 @@
+import 'package:amap_map/amap_map.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:x_amap_base/x_amap_base.dart';
 
 import '../models/hourly_weather.dart';
 import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
+import '../widgets/amap_view.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
 
 /// 地点查询结果：方圆区域天气
@@ -54,48 +57,36 @@ class _LocationScreenState extends State<LocationScreen> {
 
   /// 用当前位置
   ///
-  /// 四级定位策略（天气查询只需公里级精度，一路降级保证可用）：
-  /// 1. **高德定位**：WiFi + 基站 + GPS 混合，国内精度最高（微信/QQ 同款原理）
-  /// 2. geolocator 网络定位（WiFi/基站）
-  /// 3. 系统「最后已知位置」
-  /// 4. **IP 定位兜底**（免 GPS、免权限，城市级）
+  /// **并行竞速**定位（避免逐级串行等待导致慢）：
+  /// · 高德定位（WiFi+基站+GPS）与系统定位**同时启动**
+  /// · 高德优先：8 秒内返回就用它（最准）
+  /// · 高德没回来 → 用已并行跑着的系统定位结果
+  /// · 都失败 → IP 定位兜底（1-2 秒）
   Future<void> _useCurrent() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      // 1) 首选：高德定位（不依赖 GMS，室内可用）
-      final amapPoint = await AmapLocationService.locate();
+      // 同时启动两条定位链路
+      final amapFuture = AmapLocationService.locate(timeout: const Duration(seconds: 8));
+      final geoFuture = _locateBySystem(timeout: const Duration(seconds: 8));
+
+      // 高德优先
+      final amapPoint = await amapFuture;
       if (amapPoint != null) {
         await _analyze(amapPoint);
         return;
       }
 
-      // 2) geolocator 网络定位
-      var perm = await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
-      }
-      Position? pos;
-      if (perm == LocationPermission.whileInUse || perm == LocationPermission.always) {
-        try {
-          pos = await Geolocator.getCurrentPosition(
-            locationSettings: const LocationSettings(
-              accuracy: LocationAccuracy.low, // 网络定位，不强制 GPS
-              timeLimit: Duration(seconds: 10),
-            ),
-          );
-        } catch (_) {
-          pos = await Geolocator.getLastKnownPosition();
-        }
-      }
-      if (pos != null) {
-        await _analyze(GeoPoint(lat: pos.latitude, lon: pos.longitude, name: '当前位置'));
+      // 高德未成功 → 取系统定位（已在并行跑，无需重新等）
+      final geoPoint = await geoFuture;
+      if (geoPoint != null) {
+        await _analyze(geoPoint);
         return;
       }
 
-      // 3) IP 定位兜底
+      // 最后兜底：IP 定位
       final ipPoint = await _amap.ipLocation();
       if (ipPoint != null) {
         await _analyze(ipPoint);
@@ -107,6 +98,34 @@ class _LocationScreenState extends State<LocationScreen> {
         _loading = false;
         _error = '$e';
       });
+    }
+  }
+
+  /// 系统定位（geolocator）：网络定位优先，失败退回「最后已知位置」
+  Future<GeoPoint?> _locateBySystem({required Duration timeout}) async {
+    try {
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm != LocationPermission.whileInUse && perm != LocationPermission.always) {
+        return null;
+      }
+      try {
+        final pos = await Geolocator.getCurrentPosition(
+          locationSettings: LocationSettings(
+            accuracy: LocationAccuracy.low, // 低精度=网络定位，不强制 GPS
+            timeLimit: timeout,
+          ),
+        );
+        return GeoPoint(lat: pos.latitude, lon: pos.longitude, name: '当前位置');
+      } catch (_) {
+        final last = await Geolocator.getLastKnownPosition();
+        if (last == null) return null;
+        return GeoPoint(lat: last.latitude, lon: last.longitude, name: '当前位置');
+      }
+    } catch (_) {
+      return null;
     }
   }
 
@@ -148,7 +167,7 @@ class _LocationScreenState extends State<LocationScreen> {
 
     final forecasts = await _meteo.fetchMany(
       points.map((p) => (lat: p.point.lat, lon: p.point.lon, place: p.label)).toList(),
-      forecastDays: 2,
+      forecastDays: 1, // 只取当天，减小响应体积
     );
 
     final now = DateTime.now();
@@ -282,17 +301,45 @@ class _LocationScreenState extends State<LocationScreen> {
           children: r.samples.map((s) => _sampleRow(s)).toList(),
         ),
       ),
-      const PanelCard(
+      PanelCard(
         heading: '地图',
-        child: Padding(
-          padding: EdgeInsets.symmetric(vertical: 20),
-          child: Center(
-            child: Text('高德地图接入中…',
-                style: TextStyle(fontSize: 12.5, color: AppTheme.textFaint)),
+        padding: const EdgeInsets.all(12),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            height: 280,
+            child: AmapView(
+              lat: r.center.lat,
+              lon: r.center.lon,
+              zoom: 12,
+              markers: _buildMarkers(r),
+            ),
           ),
         ),
       ),
     ];
+  }
+
+  /// 中心点 + 4 方位采样点标注
+  ///
+  /// 注：不用 `defaultMarkerWithHue`（它从 asset 加载图片，会触发插件
+  /// FlutterLoader 为 null 的崩溃），改用不依赖 asset 的 `defaultMarker`。
+  List<Marker> _buildMarkers(_AreaResult r) {
+    final markers = <Marker>[];
+    for (final s in r.samples) {
+      final w = s.weather;
+      markers.add(Marker(
+        position: LatLng(s.point.lat, s.point.lon),
+        infoWindow: InfoWindow(
+          title: s.label,
+          snippet: w == null
+              ? '无数据'
+              : '${w.weatherText ?? ''} ${w.temperature?.toStringAsFixed(1) ?? '—'}°',
+        ),
+        icon: BitmapDescriptor.defaultMarker,
+      ));
+    }
+    return markers;
   }
 
   Widget _metric(String k, String v) {

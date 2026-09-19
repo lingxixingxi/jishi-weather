@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:amap_flutter_location/amap_flutter_location.dart';
 import 'package:amap_flutter_location/amap_location_option.dart';
+import 'package:flutter/foundation.dart';
 
 import '../config/secrets.dart';
 import 'amap_service.dart' show GeoPoint;
@@ -29,6 +30,7 @@ class AmapLocationService {
         _keyInitialized = true;
       }
 
+      debugPrint('[高德定位] 开始定位…');
       final option = AMapLocationOption()
         ..onceLocation = true // 单次定位
         ..needAddress = true // 需要逆地理地址
@@ -36,6 +38,7 @@ class AmapLocationService {
       location.setLocationOption(option);
 
       sub = location.onLocationChanged().listen((result) {
+        debugPrint('[高德定位] 收到结果: $result');
         final lat = (result['latitude'] as num?)?.toDouble();
         final lon = (result['longitude'] as num?)?.toDouble();
         // 高德失败时可能返回 0,0，需过滤
@@ -54,7 +57,10 @@ class AmapLocationService {
       });
 
       location.startLocation();
-      return await completer.future.timeout(timeout, onTimeout: () => null);
+      return await completer.future.timeout(timeout, onTimeout: () {
+        debugPrint('[高德定位] 超时 ${timeout.inSeconds}s（检查 Key 是否勾选「Android定位SDK」）');
+        return null;
+      });
     } catch (_) {
       return null;
     } finally {

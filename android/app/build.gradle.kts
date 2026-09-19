@@ -57,6 +57,9 @@ kotlin {
     }
 }
 
+// 注：高德定位类（com.amap.api.location.*）已由 amap_map 插件依赖的
+// 3dmap-location-search 提供，无需再加 com.amap.api:location（否则类重复）。
+
 flutter {
     source = "../.."
 }
