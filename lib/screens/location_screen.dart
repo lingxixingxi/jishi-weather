@@ -865,24 +865,24 @@ class _LocationScreenState extends State<LocationScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // ===== 图层切换 =====
-            // ===== 图层切换（按钮已有 5 个，横向可滚动以避免溢出）=====
-            SizedBox(
-              height: 30,
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                physics: const BouncingScrollPhysics(),
-                children: [
-                  _layerChip('关闭', _LayerMode.none),
-                  const SizedBox(width: 6),
-                  _layerChip('云量', _LayerMode.cloud),
-                  const SizedBox(width: 6),
-                  _layerChip('雨量', _LayerMode.rain),
-                  const SizedBox(width: 6),
-                  _layerChip('雷达图', _LayerMode.radar),
-                  const SizedBox(width: 6),
-                  _layerChip('卫星云图', _LayerMode.satellite),
-                ],
-              ),
+            // ===== 图层切换 =====
+            //
+            // 注意：这里**不能**用横向 ListView —— 它嵌在页面的垂直滚动里会产生
+            // 手势冲突：按钮行既滚不动，点击也会被外层滚动吞掉（实测点不动）。
+            // 5 个按钮总宽约 317px，远小于卡片宽度；时间标签已拆到独立行，
+            // 因此用 Row 既不会溢出、点击也正常。
+            Row(
+              children: [
+                _layerChip('关闭', _LayerMode.none),
+                const SizedBox(width: 6),
+                _layerChip('云量', _LayerMode.cloud),
+                const SizedBox(width: 6),
+                _layerChip('雨量', _LayerMode.rain),
+                const SizedBox(width: 6),
+                _layerChip('雷达图', _LayerMode.radar),
+                const SizedBox(width: 6),
+                _layerChip('卫星云图', _LayerMode.satellite),
+              ],
             ),
             // 信息标签（雷达/卫星的时刻）单独一行，右对齐
             if ((_layerMode == _LayerMode.radar ||
@@ -1444,16 +1444,19 @@ class _LocationScreenState extends State<LocationScreen> {
       );
     }
 
-    // 卫星云图模式：说明「只叠加云，越白越厚」
+    // 卫星云图模式：图例必须与 cloudOnly() 的实际配色一致（灰蓝系），
+    // 否则会出现「图例是白色、实际云是蓝灰」的错配。
+    // 取值按 cloudOnly 的映射反算（等效云量 c = 0.38 / 0.70 / 1.0）：
+    //   r = 176-102c, g = 190-98c, b = 210-90c，alpha = 0.30+0.52c
     if (_layerMode == _LayerMode.satellite) {
       return Padding(
         padding: const EdgeInsets.only(top: 2, left: 4),
         child: Row(
           children: [
             for (final it in [
-              (const Color(0x33FFFFFF), '薄云'),
-              (const Color(0x99FFFFFF), '中云'),
-              (const Color(0xFFFFFFFF), '厚云'),
+              (const Color(0x808999B0), '薄云'), // c≈0.38 RGB(137,153,176)
+              (const Color(0xA8697993), '中云'), // c≈0.70 (105,121,147)
+              (const Color(0xD24A5C78), '厚云'), // c=1.00 (74,92,120)
             ]) ...[
               Container(
                 width: 16,
@@ -1469,7 +1472,7 @@ class _LocationScreenState extends State<LocationScreen> {
               const SizedBox(width: 10),
             ],
             const Spacer(),
-            const Text('仅叠加云 · 越白越厚', style: TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+            const Text('仅叠加云 · 越蓝越厚', style: TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
           ],
         ),
       );
