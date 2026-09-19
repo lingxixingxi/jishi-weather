@@ -285,6 +285,25 @@ class MethodChannelAMapFlutterMap implements AMapFlutterPlatform {
     return channel(mapId).invokeMethod<void>('map#removeGroundOverlay');
   }
 
+  /// 瓦片式叠加（按 z/x/y 请求图片，任意缩放都清晰）
+  Future<void> setTileOverlay(
+    String urlTemplate, {
+    double transparency = 0.0,
+    required int mapId,
+  }) {
+    return channel(mapId).invokeMethod<void>('map#tileOverlay', <String, dynamic>{
+      'urlTemplate': urlTemplate,
+      'transparency': transparency,
+    });
+  }
+
+  /// 移除瓦片叠加
+  Future<void> removeTileOverlay({
+    required int mapId,
+  }) {
+    return channel(mapId).invokeMethod<void>('map#removeTileOverlay');
+  }
+
   Future<void> clearDisk({
     required int mapId,
   }) {

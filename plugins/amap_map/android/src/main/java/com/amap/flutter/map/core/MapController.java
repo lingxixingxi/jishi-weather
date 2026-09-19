@@ -20,12 +20,16 @@ import com.amap.api.maps.model.LatLng;
 import com.amap.api.maps.model.LatLngBounds;
 import com.amap.api.maps.model.MyLocationStyle;
 import com.amap.api.maps.model.Poi;
+import com.amap.api.maps.model.TileOverlay;
+import com.amap.api.maps.model.TileOverlayOptions;
+import com.amap.api.maps.model.UrlTileProvider;
 import com.amap.flutter.map.MyMethodCallHandler;
 import com.amap.flutter.map.utils.Const;
 import com.amap.flutter.map.utils.ConvertUtil;
 import com.amap.flutter.map.utils.LogUtil;
 
 import java.io.ByteArrayOutputStream;
+import java.net.URL;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +62,9 @@ public class MapController
 
     /** 天气叠加图片层（云图/雷达图），同一时刻只保留一个 */
     private GroundOverlay groundOverlay;
+
+    /** 瓦片式叠加层（按 z/x/y 请求图片，任意缩放都清晰） */
+    private TileOverlay tileOverlay;
 
     public MapController(MethodChannel methodChannel, TextureMapView mapView) {
         this.methodChannel = methodChannel;
@@ -158,6 +165,15 @@ public class MapController
                 removeGroundOverlay();
                 result.success(null);
                 break;
+            case Const.METHOD_MAP_TILE_OVERLAY:
+                // 瓦片式叠加：按 z/x/y 请求图片，任意缩放都清晰
+                setTileOverlay(call.argument("urlTemplate"), call.argument("transparency"));
+                result.success(null);
+                break;
+            case Const.METHOD_MAP_REMOVE_TILE_OVERLAY:
+                removeTileOverlay();
+                result.success(null);
+                break;
             default:
                 LogUtil.w(CLASS_NAME, "onMethodCall not find methodId:" + call.method);
                 break;
@@ -225,6 +241,65 @@ public class MapController
             }
         } catch (Throwable e) {
             LogUtil.e(CLASS_NAME, "removeGroundOverlay", e);
+        }
+    }
+
+    /**
+     * 设置瓦片式叠加层（按 z/x/y 请求图片）
+     *
+     * 相比 GroundOverlay 的单张图片拉伸，瓦片在**任意缩放级别都清晰**，
+     * 适合雷达/卫星等需要放大的叠加数据源。
+     *
+     * @param urlTemplate  形如 https://host/path/{z}/{x}/{y}.png
+     * @param transparency 0~1（0 = 不透明）
+     */
+    public void setTileOverlay(Object urlTemplate, Object transparency) {
+        if (amap == null || urlTemplate == null) {
+            return;
+        }
+        try {
+            final String template = urlTemplate.toString();
+            if (tileOverlay != null) {
+                tileOverlay.remove();
+                tileOverlay = null;
+            }
+
+            UrlTileProvider provider = new UrlTileProvider(256, 256) {
+                @Override
+                public URL getTileUrl(int x, int y, int zoom) {
+                    try {
+                        String url = template
+                                .replace("{x}", String.valueOf(x))
+                                .replace("{y}", String.valueOf(y))
+                                .replace("{z}", String.valueOf(zoom));
+                        return new URL(url);
+                    } catch (Throwable e) {
+                        return null;
+                    }
+                }
+            };
+            // 注意：高德的 TileOverlayOptions **没有** transparency() 方法
+            // （只有 GroundOverlayOptions 有）。好在雷达瓦片自身就是透明的
+            // （仅回波像素有颜色），因此无需额外控制透明度。
+            TileOverlayOptions options = new TileOverlayOptions()
+                    .tileProvider(provider)
+                    .zIndex(1f);
+            tileOverlay = amap.addTileOverlay(options);
+            LogUtil.i(CLASS_NAME, "setTileOverlay success");
+        } catch (Throwable e) {
+            LogUtil.e(CLASS_NAME, "setTileOverlay", e);
+        }
+    }
+
+    /** 移除瓦片叠加层 */
+    public void removeTileOverlay() {
+        try {
+            if (tileOverlay != null) {
+                tileOverlay.remove();
+                tileOverlay = null;
+            }
+        } catch (Throwable e) {
+            LogUtil.e(CLASS_NAME, "removeTileOverlay", e);
         }
     }
 

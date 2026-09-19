@@ -45,6 +45,13 @@ class AmapView extends StatefulWidget {
   final LatLng? overlayNortheast;
   final double overlayTransparency;
 
+  /// 瓦片式叠加层的 URL 模板（形如 `https://host/{z}/{x}/{y}.png`）
+  ///
+  /// 与 [overlayImage] 二选一：瓦片在任意缩放级别都清晰，适合雷达数据；
+  /// 单张图片则会随放大而模糊。
+  final String? tileOverlayUrl;
+  final double tileTransparency;
+
   const AmapView({
     super.key,
     required this.lat,
@@ -58,6 +65,8 @@ class AmapView extends StatefulWidget {
     this.overlaySouthwest,
     this.overlayNortheast,
     this.overlayTransparency = 0.0,
+    this.tileOverlayUrl,
+    this.tileTransparency = 0.3,
     this.interactive = true,
     this.tapToActivate = true,
     this.onMapCreated,
@@ -105,6 +114,11 @@ class _AmapViewState extends State<AmapView> {
     // 叠加图片变化（切换图层 / 拖动时间轴）→ 重新贴图
     if (!identical(oldWidget.overlayImage, widget.overlayImage)) {
       _applyOverlay();
+    }
+
+    // 瓦片 URL 变化（切换雷达瓦片源）→ 重建瓦片层
+    if (oldWidget.tileOverlayUrl != widget.tileOverlayUrl) {
+      _applyTileOverlay();
     }
 
     // fitPoints 变化（如切换候选路线）→ 自动缩放到新范围
@@ -160,6 +174,23 @@ class _AmapViewState extends State<AmapView> {
     // 粗略换算 zoom：跨度 0.1° ≈ z11，每翻倍降 1 级
     final z = 11 - (math.log(span / 0.1) / math.ln2);
     return CameraPosition(target: center, zoom: z.clamp(4.0, 17.0).toDouble());
+  }
+
+  /// 应用/更新瓦片式叠加层（按 z/x/y 请求，任意缩放清晰）
+  Future<void> _applyTileOverlay() async {
+    final c = _controller;
+    if (c == null || !mounted) return;
+    final url = widget.tileOverlayUrl;
+    try {
+      if (url == null || url.isEmpty) {
+        await c.removeTileOverlay();
+        return;
+      }
+      await c.setTileOverlay(url, transparency: widget.tileTransparency);
+      debugPrint('[AmapView] 瓦片叠加已设置');
+    } catch (e) {
+      debugPrint('[AmapView] 瓦片叠加失败: $e');
+    }
   }
 
   /// 应用/更新天气叠加图片（GroundOverlay，仅占 1 个图层）
@@ -278,6 +309,7 @@ class _AmapViewState extends State<AmapView> {
         _controller = c;
         _scheduleFit(); // 地图就绪后自动框住 fitPoints
         _applyOverlay(); // 应用天气叠加图片
+        _applyTileOverlay(); // 应用瓦片叠加
         widget.onMapCreated?.call(c);
       },
       onCameraMoveEnd: (pos) => widget.onCameraMoveEnd?.call(pos.target, pos.zoom),

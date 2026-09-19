@@ -15,6 +15,7 @@ import '../services/nmc_city_repository.dart';
 import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../services/radar_service.dart';
+import '../services/rainviewer_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
@@ -43,7 +44,21 @@ class _AreaResult {
 }
 
 /// 地图叠加图层模式
-enum _LayerMode { none, cloud, rain, radar }
+enum _LayerMode {
+  none,
+
+  /// 云量（Open-Meteo 网格插值）
+  cloud,
+
+  /// 雨量（Open-Meteo 网格插值）
+  rain,
+
+  /// 中央气象台官方雷达拼图（单图，缩小看全貌）
+  radar,
+
+  /// RainViewer 雷达瓦片（瓦片式，任意缩放都清晰）
+  radarTile,
+}
 
 /// 地点查询页 —— 方圆 10km 区域天气
 class LocationScreen extends StatefulWidget {
@@ -82,10 +97,25 @@ class _LocationScreenState extends State<LocationScreen> {
   bool _radarLoading = false;
   String? _radarInfo;
 
+  /// RainViewer 雷达瓦片（瓦片式，任意缩放清晰）
+  final _rainViewer = RainViewerService();
+  RainTileInfo? _rainTile;
+  bool _tileLoading = false;
+
+  /// 当前地图缩放级别（由地图回调更新）
+  ///
+  /// RainViewer 免费版**最大只到 zoom 7**（z≥8 返回「Zoom Level Not
+  /// Supported」占位图），所以瓦片层只在 zoom ≤ 7 时挂载。
+  static const double _tileMaxZoom = 7;
+  double _currentZoom = 11.5;
+
+  bool get _tileUsable => _currentZoom <= _tileMaxZoom;
+
   /// 地图缩放级别
   ///
-  /// ⚠️ 雷达拼图源分辨率有限（774px 覆盖约 2000km，1px≈2.6km），
-  /// 地图放大到 zoom 11 以上会严重模糊，所以切到雷达图层时自动缩小。
+  /// 雷达拼图源分辨率有限（774px 覆盖约 2000km，1px≈2.6km），
+  /// 放大地图时会变模糊 —— 这是数据源本身的限制，
+  /// 因此**不自动修改用户的缩放**，只在界面上给出说明。
   double _mapZoom = 11.5;
 
   /// 重新渲染叠加位图（网格数据 → 平滑 PNG）
@@ -96,6 +126,29 @@ class _LocationScreenState extends State<LocationScreen> {
       setState(() => _overlayPng = png);
     } catch (e) {
       debugPrint('[叠加] 渲染失败: $e');
+    }
+  }
+
+  /// 加载 RainViewer 雷达瓦片（瓦片式，任意缩放清晰）
+  Future<void> _loadRadarTile() async {
+    if (_tileLoading) return;
+    setState(() => _tileLoading = true);
+    try {
+      final info = await _rainViewer.latestRadar();
+      if (!mounted) return;
+      setState(() {
+        _rainTile = info;
+        _tileLoading = false;
+        if (info != null) {
+          final t = info.time.toLocal();
+          _radarInfo = '${t.month}/${t.day} '
+              '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')} · RainViewer';
+        }
+      });
+      debugPrint('[雷达瓦片] ${info?.urlTemplate ?? '失败'}');
+    } catch (e) {
+      debugPrint('[雷达瓦片] 失败: $e');
+      if (mounted) setState(() => _tileLoading = false);
     }
   }
 
@@ -149,6 +202,7 @@ class _LocationScreenState extends State<LocationScreen> {
     _amap.dispose();
     _meteo.dispose();
     _nmc.dispose();
+    _rainViewer.dispose();
     super.dispose();
   }
 
@@ -482,8 +536,12 @@ class _LocationScreenState extends State<LocationScreen> {
                 _layerChip('雨量', _LayerMode.rain),
                 const SizedBox(width: 6),
                 _layerChip('雷达图', _LayerMode.radar),
+                const SizedBox(width: 6),
+                _layerChip('雷达瓦片', _LayerMode.radarTile),
                 const Spacer(),
-                if (_layerMode == _LayerMode.radar && _radarInfo != null)
+                if ((_layerMode == _LayerMode.radar ||
+                        _layerMode == _LayerMode.radarTile) &&
+                    _radarInfo != null)
                   Flexible(
                     child: Text(
                       _radarInfo!,
@@ -520,8 +578,39 @@ class _LocationScreenState extends State<LocationScreen> {
                           : _overlayBounds()?.ne,
                       // 雷达拼图半透明，保留底图信息（否则整片盖住地图）
                       overlayTransparency: _layerMode == _LayerMode.radar ? 0.45 : 0.0,
+                      // 瓦片式雷达（RainViewer）：仅 zoom ≤ 7 有效
+                      tileOverlayUrl:
+                          _layerMode == _LayerMode.radarTile && _tileUsable
+                              ? _rainTile?.urlTemplate
+                              : null,
+                      tileTransparency: 0.25,
+                      onCameraMoveEnd: (target, zoom) {
+                        if ((zoom - _currentZoom).abs() > 0.01) {
+                          setState(() => _currentZoom = zoom);
+                        }
+                      },
                       interactive: true,
                     ),
+                    // zoom 过大时瓦片源不支持，给出提示
+                    if (_layerMode == _LayerMode.radarTile && !_tileUsable)
+                      Positioned(
+                        left: 8,
+                        right: 8,
+                        bottom: 46,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                          decoration: BoxDecoration(
+                            color: const Color(0xE6141A24),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: AppTheme.accent),
+                          ),
+                          child: Text(
+                            '雷达瓦片源仅支持缩放 ≤ ${_tileMaxZoom.toStringAsFixed(0)} 级，'
+                            '当前 ${_currentZoom.toStringAsFixed(1)} 级 —— 请缩小地图查看',
+                            style: const TextStyle(fontSize: 11, color: AppTheme.accent, height: 1.35),
+                          ),
+                        ),
+                      ),
                     if (_layerMode == _LayerMode.radar && _radarLoading)
                       const Positioned(
                         left: 0,
@@ -620,12 +709,13 @@ class _LocationScreenState extends State<LocationScreen> {
           _playing = false;
         });
         if (mode == _LayerMode.radar) {
-          // 雷达拼图分辨率有限，自动缩到能看清回波全貌的级别
-          _mapZoom = 7.5;
+          // 中央气象台官方拼图（单图，缩小看全貌）
           final c = _result?.center;
           if (c != null) _loadRadar(c.lat, c.lon);
+        } else if (mode == _LayerMode.radarTile) {
+          // RainViewer 瓦片（任意缩放清晰）
+          _loadRadarTile();
         } else {
-          _mapZoom = 11.5;
           _regenerateOverlay();
         }
       },

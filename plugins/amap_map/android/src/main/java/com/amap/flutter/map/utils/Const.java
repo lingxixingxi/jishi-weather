@@ -24,6 +24,9 @@ public class Const {
     /** GroundOverlay：把一张图片按经纬度范围贴到地图上（天气云图/雷达图叠加） */
     public static final String METHOD_MAP_GROUND_OVERLAY = "map#groundOverlay";
     public static final String METHOD_MAP_REMOVE_GROUND_OVERLAY = "map#removeGroundOverlay";
+    /** TileOverlay：按 z/x/y 请求瓦片（瓦片式雷达图，任意缩放都清晰） */
+    public static final String METHOD_MAP_TILE_OVERLAY = "map#tileOverlay";
+    public static final String METHOD_MAP_REMOVE_TILE_OVERLAY = "map#removeTileOverlay";
 
     public static final String METHOD_SET_TERRAIN_ENABLE = "#setTerrainEnable";
 
@@ -39,7 +42,9 @@ public class Const {
             METHOD_MAP_TO_SCREEN_COORDINATE,
             METHOD_MAP_FROM_SCREEN_COORDINATE,
             METHOD_MAP_GROUND_OVERLAY,
-            METHOD_MAP_REMOVE_GROUND_OVERLAY
+            METHOD_MAP_REMOVE_GROUND_OVERLAY,
+            METHOD_MAP_TILE_OVERLAY,
+            METHOD_MAP_REMOVE_TILE_OVERLAY
     };
 
 

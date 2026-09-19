@@ -153,6 +153,29 @@ class AMapController {
     return _methodChannel.removeGroundOverlay(mapId: mapId);
   }
 
+  /// 瓦片式叠加层（按 z/x/y 请求图片）
+  ///
+  /// 相比 [setGroundOverlay] 的单张图片拉伸，瓦片在**任意缩放级别都清晰**，
+  /// 适合雷达/卫星等需要放大的叠加数据。
+  ///
+  /// [urlTemplate] 形如 `https://host/path/{z}/{x}/{y}.png`
+  /// （`{x}` `{y}` `{z}` 会被自动替换）。
+  Future<void> setTileOverlay(
+    String urlTemplate, {
+    double transparency = 0.0,
+  }) {
+    return _methodChannel.setTileOverlay(
+      urlTemplate,
+      transparency: transparency,
+      mapId: mapId,
+    );
+  }
+
+  /// 移除瓦片叠加层
+  Future<void> removeTileOverlay() {
+    return _methodChannel.removeTileOverlay(mapId: mapId);
+  }
+
   /// 清空缓存
   Future<void> clearDisk() {
     return _methodChannel.clearDisk(mapId: mapId);
