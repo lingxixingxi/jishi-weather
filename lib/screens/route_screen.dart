@@ -37,7 +37,8 @@ class _RouteScreenState extends State<RouteScreen> {
 
   Future<void> _warmUpLocation() async {
     try {
-      final p = await AmapLocationService.locate(timeout: const Duration(seconds: 5));
+      var p = await AmapLocationService.locate(timeout: const Duration(seconds: 5));
+      p ??= await _amap.ipLocation(); // 真实定位失败时用 IP 兜底
       if (!mounted || p == null) return;
       setState(() => _myLocation = p);
       debugPrint('[路线] 当前位置已获取: ${p.lat},${p.lon}（用于联想排序）');

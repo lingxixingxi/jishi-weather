@@ -107,6 +107,28 @@ class LocationScreen extends StatefulWidget {
 }
 
 class _LocationScreenState extends State<LocationScreen> {
+  @override
+  void initState() {
+    super.initState();
+    _warmUpLocation();
+  }
+
+  /// 预热定位 —— 只为让 POI 联想候选**按距离排序**（用户附近的排前面）
+  ///
+  /// 策略：真实定位（5s 超时）→ 失败则 IP 定位兜底（1~2 秒）。
+  /// 完全失败也不影响使用，只是候选不限地域。
+  Future<void> _warmUpLocation() async {
+    try {
+      var p = await AmapLocationService.locate(timeout: const Duration(seconds: 5));
+      p ??= await _amap.ipLocation();
+      if (!mounted || p == null) return;
+      setState(() => _myLocation = p);
+      debugPrint('[地点] 预热定位成功: ${p.lat},${p.lon}（联想将按距离排序）');
+    } catch (_) {
+      // 定位失败不影响使用
+    }
+  }
+
   final _input = TextEditingController(text: '上海虹桥站');
 
   /// 联想搜索选中的精确坐标（优先于纯文本地理编码）
