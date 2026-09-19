@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../config/secrets.dart';
@@ -104,13 +105,125 @@ class AmapAddress {
 }
 
 /// ⚠️ 用的是 **Web服务 Key**，不是 Android 平台 Key。
+/// 高德 POI 输入提示项（搜索联想候选）
+class PoiTip {
+  final String name;
+  final String district; // 行政区（如「上海市浦东新区」）
+  final String address; // 详细地址
+  final String? lat;
+  final String? lon;
+  final String? adcode;
+  final String type; // POI 类型码
+
+  const PoiTip({
+    required this.name,
+    this.district = '',
+    this.address = '',
+    this.lat,
+    this.lon,
+    this.adcode,
+    this.type = '',
+  });
+
+  /// 是否有坐标（高德对某些提示只给行政区不给坐标）
+  bool get hasLocation =>
+      lat != null && lon != null && lat!.isNotEmpty && lon!.isNotEmpty;
+
+  GeoPoint? get point =>
+      hasLocation ? GeoPoint(lat: double.parse(lat!), lon: double.parse(lon!), name: name) : null;
+
+  /// 副标题：行政区 · 地址
+  String get subtitle {
+    final parts = <String>[];
+    if (district.isNotEmpty && district != '[]') parts.add(district);
+    if (address.isNotEmpty && address != '[]') parts.add(address);
+    return parts.join(' · ');
+  }
+}
+
 class AmapService {
   static const String _geoUrl = 'https://restapi.amap.com/v3/geocode/geo';
   static const String _regeoUrl = 'https://restapi.amap.com/v3/geocode/regeo';
   static const String _driveUrl = 'https://restapi.amap.com/v3/direction/driving';
+  static const String _tipUrl = 'https://restapi.amap.com/v3/assistant/inputtips';
 
   final http.Client _client;
   AmapService({http.Client? client}) : _client = client ?? http.Client();
+
+  /// **POI 输入提示**（搜索联想）—— 地点输入必须有候选列表
+  ///
+  /// ⚠️ 为什么必须做：
+  /// 直接拿用户输入的文本去地理编码，**误差极大**。典型例子：
+  /// 「海底捞火锅」全国有几千家，`geocode` 只会返回其中一家（或返回
+  /// 一个莫名其妙的地点），用户以为查的是附近那家，结果跑了半个城。
+  /// 正确做法是把候选列出来让用户**点选**。
+  ///
+  /// [city] 限定城市（可提高精度）；[location] 传 `经度,纬度` 时
+  /// 高德会按距离排序（配合 `citylimit=false` 可跨城）。
+  Future<List<PoiTip>> inputTips(
+    String keyword, {
+    String? city,
+    String? location,
+    int max = 12,
+  }) async {
+    _ensureKey();
+    final kw = keyword.trim();
+    if (kw.isEmpty) return const [];
+
+    final params = <String, String>{
+      'keywords': kw,
+      'key': Secrets.amapWebKey,
+    };
+    if (city != null && city.isNotEmpty) params['city'] = city;
+    if (location != null && location.isNotEmpty) {
+      params['location'] = location; // 按距离排序
+      params['citylimit'] = 'false'; // 允许跨城结果
+    }
+
+    try {
+      final uri = Uri.parse(_tipUrl).replace(queryParameters: params);
+      final resp = await _client.get(uri).timeout(const Duration(seconds: 12));
+      final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
+      if (data['status'] != '1') {
+        debugPrint('[POI 联想] 失败: ${data['info']}');
+        return const [];
+      }
+      final list = data['tips'] as List?;
+      if (list == null) return const [];
+
+      final out = <PoiTip>[];
+      for (final e in list) {
+        if (out.length >= max) break;
+        final m = e as Map;
+        final name = '${m['name'] ?? ''}';
+        if (name.isEmpty) continue;
+
+        final loc = '${m['location'] ?? ''}';
+        String? lat, lon;
+        if (loc.contains(',')) {
+          final p = loc.split(',');
+          if (p.length == 2 && p[0].isNotEmpty && p[1].isNotEmpty) {
+            lon = p[0];
+            lat = p[1];
+          }
+        }
+        out.add(PoiTip(
+          name: name,
+          district: '${m['district'] ?? ''}',
+          address: '${m['address'] ?? ''}',
+          lat: lat,
+          lon: lon,
+          adcode: '${m['adcode'] ?? ''}',
+          type: '${m['typecode'] ?? ''}',
+        ));
+      }
+      debugPrint('[POI 联想] "$kw" -> ${out.length} 条候选');
+      return out;
+    } catch (e) {
+      debugPrint('[POI 联想] 异常: $e');
+      return const [];
+    }
+  }
 
   /// 地理编码：中文地名 → 坐标
   Future<GeoPoint?> geocode(String address) async {

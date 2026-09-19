@@ -22,6 +22,7 @@ import '../services/rainviewer_service.dart';
 import '../services/satellite_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
+import '../widgets/place_search_field.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
 
 /// 地点查询结果：方圆区域天气
@@ -107,6 +108,13 @@ class LocationScreen extends StatefulWidget {
 
 class _LocationScreenState extends State<LocationScreen> {
   final _input = TextEditingController(text: '上海虹桥站');
+
+  /// 联想搜索选中的精确坐标（优先于纯文本地理编码）
+  GeoPoint? _selectedPoint;
+  String? _selectedText;
+
+  /// 我的当前位置（用于联想排序与定位）
+  GeoPoint? _myLocation;
   final _amap = AmapService();
   final _meteo = OpenMeteoService();
   final _nmc = NmcService();
@@ -205,16 +213,24 @@ class _LocationScreenState extends State<LocationScreen> {
         });
         return;
       }
-      final png = await SatelliteService.normalize(r.bytes);
-      debugPrint('[卫星云图] normalize -> ${png?.length ?? 0} 字节');
+      // 只保留云（陆地/海洋透明化），否则整图叠加会让地图发暗发脏
+      final png = await SatelliteService.cloudOnly(r.bytes);
+      debugPrint('[卫星云图] cloudOnly -> ${png?.length ?? 0} 字节');
       if (!mounted) return;
+      if (png == null) {
+        setState(() {
+          _satelliteLoading = false;
+          _satelliteInfo = '云图处理失败';
+        });
+        return;
+      }
       setState(() {
         _satellitePng = png;
         _satelliteInfo = '${r.time.month}/${r.time.day} '
             '${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')} · FY-4B 真彩色';
         _satelliteLoading = false;
       });
-      debugPrint('[卫星云图] 已设置叠加层 ${png?.length ?? 0} 字节');
+      debugPrint('[卫星云图] 已设置叠加层 ${png.length} 字节');
     } catch (e) {
       debugPrint('[卫星云图] 异常: $e');
       if (mounted) setState(() => _satelliteLoading = false);
@@ -324,6 +340,7 @@ class _LocationScreenState extends State<LocationScreen> {
       final point = amapPoint ?? await geoFuture;
 
       if (point != null) {
+        setState(() => _myLocation = point); // 记录，供联想按距离排序
         await _analyze(point);
         return;
       }
@@ -331,6 +348,7 @@ class _LocationScreenState extends State<LocationScreen> {
       // 最后兜底：IP 定位
       final ipPoint = await _amap.ipLocation();
       if (ipPoint != null) {
+        setState(() => _myLocation = ipPoint);
         await _analyze(ipPoint);
         return;
       }
@@ -380,6 +398,10 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 按地名查询
+  ///
+  /// **优先使用联想搜索选中的坐标**：同名的连锁店（海底捞火锅等）
+  /// 直接走文本地理编码会定位到错误的门店，必须用用户点选的坐标。
+  /// 仅当文字被改过（选中记录失效）时才退回文本地理编码。
   Future<void> _searchByName() async {
     final q = _input.text.trim();
     if (q.isEmpty) {
@@ -391,7 +413,16 @@ class _LocationScreenState extends State<LocationScreen> {
       _error = null;
     });
     try {
-      final p = await _amap.geocode(q);
+      GeoPoint? p;
+      final sel = _selectedPoint;
+      // ① 用户从候选列表点选过，且文字没再改 → 用精确坐标
+      if (sel != null && _selectedText == q) {
+        p = sel;
+        debugPrint('[地点] 使用联想选中的坐标: ${sel.lat},${sel.lon}');
+      } else {
+        // ② 否则退化为文本地理编码（有歧义，仅作兜底）
+        p = await _amap.geocode(q);
+      }
       if (p == null) throw Exception('未找到该地点：$q');
       await _analyze(p);
     } catch (e) {
@@ -668,14 +699,18 @@ class _LocationScreenState extends State<LocationScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              TextField(
+              PlaceSearchField(
                 controller: _input,
-                style: const TextStyle(color: AppTheme.text, fontSize: 14.5),
-                decoration: const InputDecoration(
-                  hintText: '输入地点，如：上海市静安区',
-                  prefixIcon: Icon(Icons.search, size: 20, color: AppTheme.textDim),
-                ),
-                onSubmitted: (_) => _searchByName(),
+                amap: _amap,
+                icon: Icons.search,
+                hint: '搜索地点（如：海底捞火锅、静安寺）',
+                subtitle: '输入后从候选列表点选 —— 避免同名地点定位错误',
+                near: _myLocation,
+                onSelected: (p, tip) {
+                  _selectedPoint = p;
+                  _selectedText = _input.text.trim();
+                  debugPrint('[地点] 选中候选「${tip.name}」-> ${p.lat},${p.lon}');
+                },
               ),
               const SizedBox(height: 10),
               Row(
@@ -867,10 +902,8 @@ class _LocationScreenState extends State<LocationScreen> {
                       overlayNortheast: _layerMode == _LayerMode.satellite
                           ? const LatLng(SatelliteGeo.latMax, SatelliteGeo.lonMax)
                           : (_layerMode == _LayerMode.radar ? _radarNe : _overlayBounds()?.ne),
-                      // 雷达拼图半透明；卫星云图更淡（避免盖住底图）
-                      overlayTransparency: _layerMode == _LayerMode.radar
-                          ? 0.45
-                          : (_layerMode == _LayerMode.satellite ? 0.35 : 0.0),
+                      // 雷达拼图半透明；卫星云图已在像素层处理过透明度，这里不再叠加
+                      overlayTransparency: _layerMode == _LayerMode.radar ? 0.45 : 0.0,
                       // 瓦片式雷达（RainViewer）：仅 zoom ≤ 7 有效
                       tileOverlayUrl:
                           _layerMode == _LayerMode.radarTile && _tileUsable
@@ -1374,6 +1407,42 @@ class _LocationScreenState extends State<LocationScreen> {
           ],
         ),
       );
+    }
+
+    // 卫星云图模式：说明「只叠加云，越白越厚」
+    if (_layerMode == _LayerMode.satellite) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 2, left: 4),
+        child: Row(
+          children: [
+            for (final it in [
+              (const Color(0x33FFFFFF), '薄云'),
+              (const Color(0x99FFFFFF), '中云'),
+              (const Color(0xFFFFFFFF), '厚云'),
+            ]) ...[
+              Container(
+                width: 16,
+                height: 9,
+                decoration: BoxDecoration(
+                  color: it.$1,
+                  border: Border.all(color: AppTheme.borderSoft),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Text(it.$2, style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+              const SizedBox(width: 10),
+            ],
+            const Spacer(),
+            const Text('仅叠加云 · 越白越厚', style: TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+          ],
+        ),
+      );
+    }
+
+    // 雷达瓦片 / 无图层时不显示图例
+    if (_layerMode == _LayerMode.radarTile) {
+      return const SizedBox(height: 14);
     }
 
     final items = _layerMode == _LayerMode.cloud

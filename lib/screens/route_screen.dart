@@ -5,6 +5,7 @@ import 'package:x_amap_base/x_amap_base.dart';
 import '../engine/radar_verdict.dart';
 import '../engine/route_analyzer.dart';
 import '../models/hourly_weather.dart';
+import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
 import '../services/multi_source_service.dart';
 import '../services/nmc_city_repository.dart';
@@ -12,6 +13,7 @@ import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
+import '../widgets/place_search_field.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
 
 /// 出行路线页
@@ -26,8 +28,33 @@ class RouteScreen extends StatefulWidget {
 }
 
 class _RouteScreenState extends State<RouteScreen> {
+  @override
+  void initState() {
+    super.initState();
+    // 异步取一次当前位置：仅用于让联想候选按距离排序（失败无影响）
+    _warmUpLocation();
+  }
+
+  Future<void> _warmUpLocation() async {
+    try {
+      final p = await AmapLocationService.locate(timeout: const Duration(seconds: 5));
+      if (!mounted || p == null) return;
+      setState(() => _myLocation = p);
+      debugPrint('[路线] 当前位置已获取: ${p.lat},${p.lon}（用于联想排序）');
+    } catch (_) {
+      // 定位失败不影响使用
+    }
+  }
+
   final _origin = TextEditingController(text: '上海虹桥站');
   final _dest = TextEditingController(text: '苏州工业园区');
+
+  /// 联想搜索选中的精确坐标（优先于纯文本地理编码）
+  GeoPoint? _originPoint;
+  GeoPoint? _destPoint;
+
+  /// 我的当前位置（用于联想排序）
+  GeoPoint? _myLocation;
 
   final _amap = AmapService();
   final _meteo = OpenMeteoService();
@@ -179,8 +206,13 @@ class _RouteScreenState extends State<RouteScreen> {
       _analysis = null;
     });
     try {
-      final from = await _amap.geocode(o);
-      final to = await _amap.geocode(d);
+      // 优先用联想搜索选中的坐标（连锁店名走文本地理编码会定位错）
+      final from = (_originPoint != null && _originPoint!.name == o)
+          ? _originPoint
+          : await _amap.geocode(o);
+      final to = (_destPoint != null && _destPoint!.name == d)
+          ? _destPoint
+          : await _amap.geocode(d);
       if (from == null) throw Exception('未找到起点：$o');
       if (to == null) throw Exception('未找到终点：$d');
       final routes = await _amap.drivingRoutes(from, to);
@@ -401,37 +433,48 @@ class _RouteScreenState extends State<RouteScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              TextField(
+              PlaceSearchField(
                 controller: _origin,
-                style: const TextStyle(color: AppTheme.text, fontSize: 14.5),
-                decoration: const InputDecoration(
-                  hintText: '起点',
-                  prefixIcon: Icon(Icons.trip_origin, size: 18, color: AppTheme.accent),
-                ),
+                amap: _amap,
+                icon: Icons.trip_origin,
+                hint: '起点',
+                near: _myLocation,
+                onSelected: (p, tip) {
+                  _originPoint = p;
+                  debugPrint('[路线] 起点选中「${tip.name}」-> ${p.lat},${p.lon}');
+                },
               ),
               const SizedBox(height: 9),
-              TextField(
+              PlaceSearchField(
                 controller: _dest,
-                style: const TextStyle(color: AppTheme.text, fontSize: 14.5),
-                decoration: const InputDecoration(
-                  hintText: '终点',
-                  prefixIcon: Icon(Icons.place, size: 18, color: AppTheme.green),
-                ),
+                amap: _amap,
+                icon: Icons.place,
+                hint: '终点',
+                near: _myLocation,
+                onSelected: (p, tip) {
+                  _destPoint = p;
+                  debugPrint('[路线] 终点选中「${tip.name}」-> ${p.lat},${p.lon}');
+                },
               ),
               const SizedBox(height: 9),
               OutlinedButton.icon(
                 onPressed: () async {
+                  // 日期选择器：套深色主题，否则是系统默认浅色（与 App 风格不符）
                   final d = await showDatePicker(
                     context: context,
                     initialDate: _departAt,
                     firstDate: DateTime.now().subtract(const Duration(days: 1)),
                     lastDate: DateTime.now().add(const Duration(days: 7)),
+                    builder: (ctx, child) =>
+                        Theme(data: AppTheme.pickerTheme(ctx), child: child!),
                   );
                   if (d == null) return;
                   if (!context.mounted) return;
                   final t = await showTimePicker(
                     context: context,
                     initialTime: TimeOfDay.fromDateTime(_departAt),
+                    builder: (ctx, child) =>
+                        Theme(data: AppTheme.pickerTheme(ctx), child: child!),
                   );
                   if (t == null) return;
                   setState(() {

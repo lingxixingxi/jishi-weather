@@ -57,6 +57,67 @@ class AppTheme {
     'sans-serif',
   ];
 
+  /// 日期/时间选择器的**深色主题**
+  ///
+  /// Flutter 默认的 `showDatePicker` / `showTimePicker` 是浅色 Material
+  /// 样式，与 App 的深色航空主题完全不搭（用户反馈「像是系统默认的」）。
+  /// 用 `builder` 包一层这个 Theme 即可统一风格。
+  ///
+  /// 用法：
+  /// ```dart
+  /// showDatePicker(
+  ///   context: context, ...,
+  ///   builder: (ctx, child) => Theme(data: AppTheme.pickerTheme(ctx), child: child!),
+  /// );
+  /// ```
+  static ThemeData pickerTheme(BuildContext context) {
+    final base = Theme.of(context);
+    return base.copyWith(
+      colorScheme: base.colorScheme.copyWith(
+        primary: accent,
+        onPrimary: const Color(0xFF14100A),
+        surface: bgCard,
+        onSurface: text,
+        surfaceContainerHighest: bgInset,
+        onSurfaceVariant: textDim,
+        outline: border,
+      ),
+      dialogTheme: const DialogThemeData(
+        backgroundColor: bgCard,
+        surfaceTintColor: Colors.transparent,
+      ),
+      datePickerTheme: const DatePickerThemeData(
+        backgroundColor: bgCard,
+        surfaceTintColor: Colors.transparent,
+        headerBackgroundColor: bgInset,
+        headerForegroundColor: text,
+        weekdayStyle: TextStyle(color: textFaint, fontSize: 12, fontWeight: FontWeight.w600),
+        dayStyle: TextStyle(fontSize: 14),
+        dayForegroundColor: WidgetStatePropertyAll(text),
+        todayForegroundColor: WidgetStatePropertyAll(accent),
+        todayBorder: BorderSide(color: accent),
+        yearForegroundColor: WidgetStatePropertyAll(text),
+        rangePickerBackgroundColor: bgInset,
+        dividerColor: borderSoft,
+      ),
+      timePickerTheme: const TimePickerThemeData(
+        backgroundColor: bgCard,
+        dialBackgroundColor: bgInset,
+        dialHandColor: accent,
+        dialTextColor: text,
+        hourMinuteColor: bgInset,
+        hourMinuteTextColor: text,
+        entryModeIconColor: textDim,
+        dayPeriodColor: bgInset,
+        dayPeriodTextColor: text,
+        helpTextStyle: TextStyle(color: textDim, fontSize: 12),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(foregroundColor: accent),
+      ),
+    );
+  }
+
   static ThemeData dark() {
     final base = ThemeData.dark(useMaterial3: true);
     return base.copyWith(

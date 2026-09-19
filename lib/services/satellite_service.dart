@@ -186,5 +186,65 @@ class SatelliteService {
     return bd?.buffer.asUint8List();
   }
 
+  /// 把可见光真彩色云图处理成「**只保留云**」的透明 PNG
+  ///
+  /// ⚠️ 为什么需要：
+  /// 可见光图里**陆地/海洋是暗褐色**，直接整图叠加会让地图发暗发脏
+  /// （用户反馈「感觉外面全是云」）。云是唯一有信息量的部分。
+  ///
+  /// 处理规则（按像素亮度）：
+  /// · 亮度 < [lowCut]（≈105）  → 完全透明（陆地/海洋/晴空）
+  /// · 亮度 > [highCut]（≈205） → 白色，alpha 0.55~1.0（厚云）
+  /// · 中间                     → 白色，alpha 0~0.5（薄云）
+  ///
+  /// 结果：地图底图保持清晰，只有云被叠加，且越白越厚。
+  static Future<Uint8List?> cloudOnly(
+    Uint8List jpgBytes, {
+    double lowCut = 105,
+    double highCut = 205,
+  }) async {
+    try {
+      final codec = await ui.instantiateImageCodec(jpgBytes);
+      final frame = await codec.getNextFrame();
+      final img = frame.image;
+      final w = img.width, h = img.height;
+
+      final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (bd == null) return null;
+      final px = bd.buffer.asUint8List();
+
+      for (var i = 0; i < px.length; i += 4) {
+        final r = px[i], g = px[i + 1], b = px[i + 2];
+        final lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (lum <= lowCut) {
+          px[i + 3] = 0; // 透明：无云
+        } else {
+          // 云：统一成白色，alpha 随亮度递增
+          final t = ((lum - lowCut) / (highCut - lowCut)).clamp(0.0, 1.0);
+          px[i] = 255;
+          px[i + 1] = 255;
+          px[i + 2] = 255;
+          px[i + 3] = (255 * (0.15 + 0.85 * t)).clamp(0, 255).toInt();
+        }
+      }
+
+      // 用处理后的像素重编码为 PNG（decodeImageFromPixels 是回调式 API）
+      final completer = Completer<ui.Image>();
+      ui.decodeImageFromPixels(
+        px,
+        w,
+        h,
+        ui.PixelFormat.rgba8888,
+        completer.complete,
+      );
+      final outImg = await completer.future;
+      final png = await outImg.toByteData(format: ui.ImageByteFormat.png);
+      return png?.buffer.asUint8List();
+    } catch (e) {
+      debugPrint('[卫星云图] cloudOnly 失败: $e');
+      return null;
+    }
+  }
+
   void dispose() => _client.close();
 }
