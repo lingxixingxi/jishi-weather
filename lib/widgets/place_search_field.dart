@@ -143,8 +143,11 @@ class _PlaceSearchFieldState extends State<PlaceSearchField> {
                   decoration: InputDecoration(
                     hintText: widget.hint,
                     hintStyle: const TextStyle(fontSize: 13.5, color: AppTheme.textFaint),
-                    helperText: widget.subtitle,
-                    helperStyle: const TextStyle(fontSize: 10, color: AppTheme.textFaint),
+                    // ⚠️ 说明文字**不放这里**。
+                    // InputDecoration.helperText 会绘制在 TextField 内部下沿，
+                    // 而 TextField 又被外层 Container 包着，于是文字落在框**里面**
+                    // （用户反馈「把输入框里的小字移出去」）。
+                    // 现在改为容器下方的独立 Text（见下方 _subtitleText）。
                     // ⚠️ 边框必须把**所有状态**都设成 none。
                     // 只设 border 不够 —— Flutter 在聚焦/错误时会改用
                     // focusedBorder/errorBorder，未显式指定就回落到主题默认的
@@ -188,6 +191,25 @@ class _PlaceSearchFieldState extends State<PlaceSearchField> {
             ],
           ),
         ),
+
+        // 说明文字：放在**输入框容器外面**（不再用 InputDecoration.helperText，
+        // 那个会画在框内部下沿，视觉上像「框里的小字」）
+        if (widget.subtitle != null && widget.subtitle!.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6, left: 4),
+            child: Row(
+              children: [
+                const Icon(Icons.info_outline, size: 12, color: AppTheme.textFaint),
+                const SizedBox(width: 5),
+                Flexible(
+                  child: Text(
+                    widget.subtitle!,
+                    style: const TextStyle(fontSize: 10.5, color: AppTheme.textFaint, height: 1.3),
+                  ),
+                ),
+              ],
+            ),
+          ),
 
         // ===== 候选列表 =====
         //
