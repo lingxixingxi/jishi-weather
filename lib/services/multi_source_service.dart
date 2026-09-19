@@ -109,28 +109,24 @@ class MultiSourceService {
       forecastDays: forecastDays,
     );
 
-    // 2. 和风天气（只取路线中点，避免超出免费配额）
+    // 2. 和风天气（所有采样点并行；免费配额 1000 次/天，正常用量足够）
     var result = meteoAll;
     if (_qweather.isConfigured && points.isNotEmpty) {
-      try {
-        final mid = points.length ~/ 2;
-        final qw = await _qweather.hourly(
-          points[mid].lat,
-          points[mid].lon,
-          hours: forecastDays * 24,
-        );
-        if (qw.isNotEmpty) {
-          result = List.generate(result.length, (i) {
-            if (i != mid) return result[i];
-            return result[i].map((m) {
-              final h = QWeatherService.nearest(qw, m.time);
-              return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
-            }).toList();
-          });
+      final qwAll = await Future.wait(points.map((p) async {
+        try {
+          return await _qweather.hourly(p.lat, p.lon, hours: forecastDays * 24);
+        } catch (_) {
+          return const <QWeatherHourly>[];
         }
-      } catch (_) {
-        // 和风失败不影响其他源
-      }
+      }));
+      result = List.generate(result.length, (i) {
+        final qw = i < qwAll.length ? qwAll[i] : const <QWeatherHourly>[];
+        if (qw.isEmpty) return result[i];
+        return result[i].map((m) {
+          final h = QWeatherService.nearest(qw, m.time);
+          return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
+        }).toList();
+      });
     }
 
     if (!includeNmc) return result;
