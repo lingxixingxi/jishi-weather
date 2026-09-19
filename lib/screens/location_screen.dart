@@ -59,7 +59,7 @@ class _LocationScreenState extends State<LocationScreen> {
 
   // ===== 叠加图层：网格数据 + 模式 + 时间轴 =====
   List<GridPoint> _grid = const [];
-  final int _gridN = 5;
+  final int _gridN = 9; // 9×9 网格（64 个热力格），比 5×5 细腻得多
   _LayerMode _layerMode = _LayerMode.cloud;
   int _timeIndex = 0;
   bool _playing = false;
@@ -506,9 +506,9 @@ class _LocationScreenState extends State<LocationScreen> {
   Widget _layerLegend() {
     final items = _layerMode == _LayerMode.cloud
         ? [
-            (const Color(0x2EECF1FC), '少云'),
-            (const Color(0x80ECF1FC), '多云'),
-            (const Color(0xCCECF1FC), '阴'),
+            (_cloudColor(10), '少云'),
+            (_cloudColor(50), '多云'),
+            (_cloudColor(95), '阴'),
           ]
         : [
             (const Color(0x994FC3F7), '小雨'),
@@ -540,32 +540,75 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 当前图层模式 + 当前时刻对应的热力格
-  List<Polygon> _layerPolygons() {
+  ///
+  /// 为做出「卫星云图」般的连续效果（而非马赛克方块），
+  /// 这里对 n×n 原始格点做**双线性插值上采样**到 [sub]×[sub] 细格，
+  /// 每个细格取插值后的颜色 —— 格子足够小即视觉连续。
+  List<Polygon> _layerPolygons({int sub = 24}) {
     if (_layerMode == _LayerMode.none || _grid.isEmpty) return const [];
     final n = _gridN;
     final t = _timeIndex.clamp(0, math.max(0, _timeCount - 1)).toInt();
+
+    // 取值函数
+    double? valueAt(int r, int c) {
+      if (r < 0 || c < 0 || r >= n || c >= n) return null;
+      final p = _grid[r * n + c];
+      return _layerMode == _LayerMode.cloud ? p.cloudAt(t) : p.rainAt(t);
+    }
+
+    // 双线性插值：把 [0, n-1] 的浮点坐标映射为数值
+    double? sample(double gr, double gc) {
+      final r0 = gr.floor().clamp(0, n - 1);
+      final c0 = gc.floor().clamp(0, n - 1);
+      final r1 = (r0 + 1).clamp(0, n - 1);
+      final c1 = (c0 + 1).clamp(0, n - 1);
+      final fr = gr - r0;
+      final fc = gc - c0;
+      final v00 = valueAt(r0, c0);
+      final v01 = valueAt(r0, c1);
+      final v10 = valueAt(r1, c0);
+      final v11 = valueAt(r1, c1);
+      if (v00 == null && v01 == null && v10 == null && v11 == null) return null;
+      final a = v00 ?? v01 ?? v10 ?? v11!;
+      final b = v01 ?? a;
+      final c = v10 ?? a;
+      final d = v11 ?? b;
+      final top = a + (b - a) * fc;
+      final bottom = c + (d - c) * fc;
+      return top + (bottom - top) * fr;
+    }
+
     final polys = <Polygon>[];
+    final steps = sub - 1; // 细格数 = steps × steps
 
-    for (var r = 0; r < n - 1; r++) {
-      for (var c = 0; c < n - 1; c++) {
-        final p00 = _grid[r * n + c];
-        final p01 = _grid[r * n + c + 1];
-        final p11 = _grid[(r + 1) * n + c + 1];
-        final p10 = _grid[(r + 1) * n + c];
+    for (var i = 0; i < steps; i++) {
+      for (var j = 0; j < steps; j++) {
+        // 细格四角在「原始网格坐标系」中的浮点位置
+        final gr0 = i * (n - 1) / steps;
+        final gr1 = (i + 1) * (n - 1) / steps;
+        final gc0 = j * (n - 1) / steps;
+        final gc1 = (j + 1) * (n - 1) / steps;
 
-        final value = _layerMode == _LayerMode.cloud ? p00.cloudAt(t) : p00.rainAt(t);
-        if (value == null) continue;
-        final color = _layerMode == _LayerMode.cloud ? _cloudColor(value) : _rainColor(value);
-        if (color.a == 0) continue;
+        final v = sample((gr0 + gr1) / 2, (gc0 + gc1) / 2);
+        if (v == null) continue;
+        final color = _layerMode == _LayerMode.cloud ? _cloudColor(v) : _rainColor(v);
+        if (color.a < 0.02) continue;
+
+        // 经纬度：把网格坐标线性映射回经纬度
+        LatLng toLatLng(double gr_, double gc_) {
+          final lat = _grid[0].lat + gr_ * (_grid[(n - 1) * n].lat - _grid[0].lat) / (n - 1);
+          final lon = _grid[0].lon + gc_ * (_grid[n - 1].lon - _grid[0].lon) / (n - 1);
+          return LatLng(lat, lon);
+        }
 
         polys.add(Polygon(
           points: [
-            LatLng(p00.lat, p00.lon),
-            LatLng(p01.lat, p01.lon),
-            LatLng(p11.lat, p11.lon),
-            LatLng(p10.lat, p10.lon),
+            toLatLng(gr0, gc0),
+            toLatLng(gr0, gc1),
+            toLatLng(gr1, gc1),
+            toLatLng(gr1, gc0),
           ],
-          strokeWidth: 0.1,
+          strokeWidth: 0, // 不描边，避免网格线
           strokeColor: Colors.transparent,
           fillColor: color,
         ));
@@ -574,10 +617,15 @@ class _LocationScreenState extends State<LocationScreen> {
     return polys;
   }
 
-  /// 云量(0-100) → 颜色：云越厚越白越不透明（已加强可见度）
+  /// 云量(0-100) → 颜色：灰蓝渐变（少云淡、厚云深灰蓝），在浅色地图上对比明显
   Color _cloudColor(double cloud) {
-    final a = (0.18 + cloud / 100.0 * 0.62).clamp(0.0, 0.8);
-    return Color.fromRGBO(236, 241, 252, a);
+    final t = (cloud / 100.0).clamp(0.0, 1.0);
+    // 浅灰蓝 (176,190,210) → 深灰蓝 (74,92,120)
+    final r = (176 - 102 * t).round();
+    final g = (190 - 98 * t).round();
+    final b = (210 - 90 * t).round();
+    final a = (0.10 + t * 0.58).clamp(0.0, 0.72);
+    return Color.fromRGBO(r, g, b, a);
   }
 
   /// 雨量(mm/h) → 颜色：小雨蓝 → 中雨深蓝 → 大雨紫 → 暴雨亮紫
