@@ -44,6 +44,11 @@ class RouteSegment {
   /// 否则为 null（表示用多源融合值）。
   final String? adoptedSource;
 
+  /// **切段依据** —— 为什么在这里开始一个新段
+  ///
+  /// 例：`降水强度变化：无雨 → 小雨`、`路线起点 · 无雨`
+  final String? splitReason;
+
   /// 研判依据（展示用）
   final List<({String label, String value})> basis;
 
@@ -65,6 +70,7 @@ class RouteSegment {
     this.agreementText,
     this.sourceCount,
     this.adoptedSource,
+    this.splitReason,
     this.temperature,
     this.precipitation,
     this.precipitationLevel = '未知',
@@ -231,6 +237,21 @@ class RouteAnalyzer {
           ? destinationName
           : _label(samples[endIdx].point, originName, destinationName, endKm, totalKm);
 
+      // 切段依据：说明为什么在这里开一个新段
+      String reason;
+      if (b == 0) {
+        reason = '路线起点 · ${signature(w)}';
+      } else {
+        final prev = signature(weathers[bounds[b] - 1]);
+        final cur = signature(w);
+        reason = '降水强度变化：$prev → $cur';
+      }
+      if (b + 1 == bounds.length) {
+        reason = '$reason · 路线终点（${endKm.toStringAsFixed(0)}km）';
+      } else if (b > 0) {
+        reason = '$reason（${startKm.toStringAsFixed(0)}km 处）';
+      }
+
       segments.add(_makeSegment(
         index: b + 1,
         fromName: fromName,
@@ -243,6 +264,7 @@ class RouteAnalyzer {
         points: _sliceByKm(fullPolyline, startKm, endKm),
         mm: startIdx < multiModels.length ? multiModels[startIdx] : null,
         preferredModel: preferredModel,
+        splitReason: reason,
       ));
     }
     return segments;
@@ -325,6 +347,7 @@ class RouteAnalyzer {
     List<({double lat, double lon})> points = const [],
     MultiModelHourly? mm,
     String? preferredModel,
+    String? splitReason,
   }) {
     // 若指定了优先源（雷达定调判出的最吻合源），改用该源的值
     ModelForecast? chosen;
@@ -421,6 +444,7 @@ class RouteAnalyzer {
       agreementText: mm?.agreementText,
       sourceCount: mm?.sources.length,
       adoptedSource: chosen?.displayName,
+      splitReason: splitReason,
     );
   }
 

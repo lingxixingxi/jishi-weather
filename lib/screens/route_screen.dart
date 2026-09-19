@@ -969,6 +969,26 @@ class _RouteScreenState extends State<RouteScreen> {
               ],
             ),
           ],
+          // 分段依据（说明为什么在这里切段）
+          if (seg.splitReason != null) ...[
+            const SizedBox(height: 6),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(top: 1),
+                  child: Icon(Icons.content_cut, size: 13, color: AppTheme.textFaint),
+                ),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    seg.splitReason!,
+                    style: const TextStyle(fontSize: 11, color: AppTheme.textFaint, height: 1.35),
+                  ),
+                ),
+              ],
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             children: [
