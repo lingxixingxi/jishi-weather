@@ -948,6 +948,15 @@ class _LocationScreenState extends State<LocationScreen> {
           _kvRow('阵风', mm.spreadText((s) => s.windGust, digits: 0, unit: '')),
           _kvRow('能见度', mm.spreadText((s) => s.visibility, digits: 1, unit: 'km')),
           _kvRow('云量', mm.spreadText((s) => s.cloudCover, digits: 0, unit: '%')),
+          // 天气现象对比（诊断「晴天/阴天」不一致）
+          _kvRow('天气现象', mm.weatherTextSpread),
+          _kvRow('天气码', mm.weatherCodeSpread),
+          if (mm.consensusWeatherText != null)
+            _kvRow(
+              '共识判定',
+              '${mm.consensusWeatherText}（各源云量中位数 '
+              '${mm.consensusCloudCover?.toStringAsFixed(0) ?? '--'}%）',
+            ),
         ],
       ),
     );
@@ -1497,19 +1506,45 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   Widget _sampleRow(({String label, GeoPoint point, HourlyWeather? weather}) s) {
-    final w = s.weather;
+    // 中心行：雷达定调判出最优源后，改用该源的值（与区域概览一致）
+    final isCenter = s.label == '中心';
+    final adopted = _result?.adoptedSource;
+    final useAdopted = isCenter && adopted != null && _result?.effectiveCenter != null;
+    final w = useAdopted ? _result!.effectiveCenter : s.weather;
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
       child: Row(
         children: [
           SizedBox(
             width: 62,
-            child: Text(s.label,
-                style: const TextStyle(fontSize: 12.5, color: AppTheme.textDim, fontWeight: FontWeight.w600)),
+            child: Row(
+              children: [
+                Text(s.label,
+                    style: const TextStyle(
+                        fontSize: 12.5, color: AppTheme.textDim, fontWeight: FontWeight.w600)),
+                if (useAdopted) ...[
+                  const SizedBox(width: 3),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: AppTheme.green.withValues(alpha: .15),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(adopted!.split(' ').first,
+                        style: const TextStyle(
+                            fontSize: 8, color: AppTheme.green, fontWeight: FontWeight.w700)),
+                  ),
+                ],
+              ],
+            ),
           ),
           Expanded(
             child: Text(w?.weatherText ?? '无数据',
-                style: const TextStyle(fontSize: 13, color: AppTheme.text)),
+                style: TextStyle(
+                    fontSize: 13,
+                    color: useAdopted ? AppTheme.green : AppTheme.text,
+                    fontWeight: useAdopted ? FontWeight.w600 : FontWeight.w400)),
           ),
           Text(w?.temperature == null ? '—' : '${w!.temperature!.toStringAsFixed(1)}°',
               style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppTheme.text)),

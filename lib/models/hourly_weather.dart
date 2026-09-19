@@ -298,10 +298,76 @@ class MultiModelHourly {
     return parts.join(' / ');
   }
 
+  /// 各源的**天气现象文字**并列展示（诊断「晴天/阴天」不一致用）
+  String get weatherTextSpread {
+    final parts = <String>[];
+    for (final s in sources) {
+      final t = s.weatherText;
+      if (t == null || t.isEmpty) continue;
+      parts.add('${s.displayName} $t');
+    }
+    return parts.join(' / ');
+  }
+
+  /// 各源的**天气码**并列展示
+  String get weatherCodeSpread {
+    final parts = <String>[];
+    for (final s in sources) {
+      final c = s.weatherCode;
+      if (c == null) continue;
+      parts.add('${s.displayName} $c');
+    }
+    return parts.join(' / ');
+  }
+
+  /// **按云量共识判定天气现象**（比单源文字可靠）
+  ///
+  /// 各源云量普遍很高时（如 GFS/ICON/和风都 100%），即使第一个源报「晴」，
+  /// 实际也应是「阴」—— 单取一个源的文字会出现「显示晴天、实际阴天很多云」。
+  ///
+  /// 规则：取各源云量的**中位数**，再按区间映射：
+  /// ≥85% 阴 / 60~85% 多云 / 30~60% 少云 / <30% 晴
+  String? get consensusWeatherText {
+    final clouds = sources.map((s) => s.cloudCover).whereType<double>().toList();
+    if (clouds.isEmpty) return null;
+    clouds.sort();
+    final median = clouds.length.isOdd
+        ? clouds[clouds.length ~/ 2]
+        : (clouds[clouds.length ~/ 2 - 1] + clouds[clouds.length ~/ 2]) / 2;
+    if (median >= 85) return '阴';
+    if (median >= 60) return '多云';
+    if (median >= 30) return '少云';
+    return '晴';
+  }
+
+  /// 共识云量（各源中位数）
+  double? get consensusCloudCover {
+    final clouds = sources.map((s) => s.cloudCover).whereType<double>().toList();
+    if (clouds.isEmpty) return null;
+    clouds.sort();
+    return clouds.length.isOdd
+        ? clouds[clouds.length ~/ 2]
+        : (clouds[clouds.length ~/ 2 - 1] + clouds[clouds.length ~/ 2]) / 2;
+  }
+
   /// 生成一条 HourlyWeather（用融合值，source 标记为多源）
+  ///
+  /// **天气现象的取值逻辑修正**：
+  /// 有降水 → 用降水来源的文字（如「小雨」）；
+  /// 无降水 → **按各源云量的共识判定**（晴/少云/多云/阴）。
+  /// 这样避免「第一个源报晴、其余源云量 100%」时显示成晴天的问题。
   HourlyWeather toHourlyWeather({String source = 'multi-model'}) {
     final codes = sources.map((s) => s.weatherCode).whereType<int>().toList();
     final texts = sources.map((s) => s.weatherText).whereType<String>().toList();
+
+    final hasPrecip = (precipitation ?? 0) >= 0.1;
+    final String? effectiveText;
+    if (hasPrecip) {
+      effectiveText = texts.isEmpty ? null : texts.first;
+    } else {
+      effectiveText = consensusWeatherText ?? (texts.isEmpty ? null : texts.first);
+    }
+
     return HourlyWeather(
       place: place,
       lat: lat,
@@ -314,9 +380,10 @@ class MultiModelHourly {
       windSpeed: windSpeed,
       windGust: windGust,
       visibility: visibility,
-      cloudCover: cloudCover,
+      // 云量也用共识中位数（避免单源极端值）
+      cloudCover: consensusCloudCover ?? cloudCover,
       weatherCode: codes.isEmpty ? null : codes.first,
-      weatherText: texts.isEmpty ? null : texts.first,
+      weatherText: effectiveText,
     );
   }
 }
