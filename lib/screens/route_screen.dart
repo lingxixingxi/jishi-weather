@@ -2,6 +2,7 @@ import 'package:amap_map/amap_map.dart';
 import 'package:flutter/material.dart';
 import 'package:x_amap_base/x_amap_base.dart';
 
+import '../engine/radar_verdict.dart';
 import '../engine/route_analyzer.dart';
 import '../models/hourly_weather.dart';
 import '../services/amap_service.dart';
@@ -52,6 +53,10 @@ class _RouteScreenState extends State<RouteScreen> {
 
   /// 当前展开的分段（横向路线条点击切换）
   int _selectedSegment = 0;
+
+  /// 雷达定调结果（用真实雷达回波裁决模型分歧）
+  RadarVerdict? _verdict;
+  bool _verdictLoading = false;
 
   /// 选中某条候选路线（地图会因 fitPoints 变化自动缩放到该路线）
   void _selectRoute(int index) {
@@ -281,6 +286,7 @@ class _RouteScreenState extends State<RouteScreen> {
       setState(() {
         _analyzing = false;
         _selectedSegment = 0; // 新研判回到第一段
+        _verdict = null;
         _analysis = RouteAnalysis(
           segments: segments,
           totalKm: opt.distanceKm,
@@ -290,11 +296,47 @@ class _RouteScreenState extends State<RouteScreen> {
           overallGrade: RouteAnalyzer.worstGrade(segments.map((s) => s.grade)),
         );
       });
+
+      // ===== 雷达定调（异步，不阻塞主流程）=====
+      _runRadarVerdict(samples, multiAtArrival);
     } catch (e) {
       setState(() {
         _analyzing = false;
         _error = '$e';
       });
+    }
+  }
+
+  /// 异步跑雷达定调：用真实雷达回波裁决各模型分歧
+  ///
+  /// 取路线中点做代表点（雷达图覆盖范围内最可能被关注的区域）。
+  Future<void> _runRadarVerdict(
+    List<({GeoPoint point, double kmFromStart})> samples,
+    List<MultiModelHourly?> multiAtArrival,
+  ) async {
+    final path = _multi.lastRadarPath;
+    if (path == null || samples.isEmpty) return;
+
+    final mid = samples.length ~/ 2;
+    final models = mid < multiAtArrival.length ? multiAtArrival[mid] : null;
+    if (models == null) return;
+
+    setState(() => _verdictLoading = true);
+    try {
+      final v = await RadarVerdictEngine.judge(
+        lat: samples[mid].point.lat,
+        lon: samples[mid].point.lon,
+        models: [models],
+        radarPath: path,
+      );
+      if (!mounted) return;
+      setState(() {
+        _verdict = v;
+        _verdictLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _verdictLoading = false);
     }
   }
 
@@ -553,8 +595,144 @@ class _RouteScreenState extends State<RouteScreen> {
 
       // ===== 当前选中段的详情（对应 demo 的 seg-detail）=====
       _segmentDetailCard(seg),
+
+      // ===== 雷达定调：模型分歧时用真实雷达回波裁决 =====
+      if (_verdictLoading || _verdict != null) _radarVerdictCard(),
     ];
   }
+
+  /// 雷达定调卡片
+  Widget _radarVerdictCard() {
+    if (_verdictLoading && _verdict == null) {
+      return const PanelCard(
+        heading: '雷达定调 · 真实回波校验',
+        child: Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.accent),
+            ),
+            SizedBox(width: 10),
+            Text('正在分析雷达回波…', style: TextStyle(fontSize: 12.5, color: AppTheme.textDim)),
+          ],
+        ),
+      );
+    }
+    final v = _verdict!;
+    final r = v.radar;
+    return PanelCard(
+      heading: '雷达定调 · 真实回波校验',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (v.arbitrationUsed)
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+              decoration: BoxDecoration(
+                color: AppTheme.accentDim,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.accent),
+              ),
+              child: const Text(
+                '模型分歧较大 → 以雷达实况定调',
+                style: TextStyle(fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600),
+              ),
+            ),
+          if (r != null) ...[
+            Row(
+              children: [
+                _metric('雷达回波', r.echoText),
+                _metric('全图覆盖', '${r.coverage.toStringAsFixed(1)}%'),
+                _metric('区域最强', '${r.maxDbz} dBZ'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (r.rainNow != null && r.rainNow! >= 0.1)
+              _kv('反演降水', '${r.rainNow!.toStringAsFixed(1)} mm/h（Z-R 关系）'),
+            if (r.motionSpeedKmh != null && r.motionSpeedKmh! > 1)
+              _kv('回波移动',
+                  '向${r.motionDirection} ${r.motionSpeedKmh!.toStringAsFixed(0)} km/h（${r.framesUsed} 帧追踪）'),
+            if (r.expectedRainAhead)
+              _kv('外推预警', '未来 ${RadarVerdictEngine.horizonMinutes} 分钟该区域可能受影响'),
+            const Divider(height: 20, color: AppTheme.borderSoft),
+          ],
+          if (v.scores.isNotEmpty) ...[
+            const Text('各源与雷达吻合度',
+                style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            for (final s in v.scores)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2.5),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 62,
+                      child: Text(
+                        s.modelName,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: s.modelName == v.bestModel ? FontWeight.w700 : FontWeight.w500,
+                          color: s.modelName == v.bestModel ? AppTheme.accent : AppTheme.textDim,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(3),
+                        child: LinearProgressIndicator(
+                          value: s.score / 100,
+                          minHeight: 6,
+                          backgroundColor: AppTheme.bgInset,
+                          valueColor: AlwaysStoppedAnimation(
+                            s.score >= 70 ? AppTheme.green : (s.score >= 45 ? AppTheme.accent : AppTheme.red),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 30,
+                      child: Text('${s.score}',
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim)),
+                    ),
+                  ],
+                ),
+              ),
+            const SizedBox(height: 10),
+          ],
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppTheme.bgInset,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: AppTheme.borderSoft),
+            ),
+            child: Text(
+              v.summary,
+              style: const TextStyle(fontSize: 12, color: AppTheme.textDim, height: 1.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2.5),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 70,
+              child: Text(k, style: const TextStyle(fontSize: 11.5, color: AppTheme.textFaint)),
+            ),
+            Expanded(child: Text(v, style: const TextStyle(fontSize: 12, color: AppTheme.textDim))),
+          ],
+        ),
+      );
 
   /// 地图锚点纬度（分段点为空时退回起终点/整条路线）
   double _mapAnchorLat(RouteSegment seg, RouteAnalysis a) {

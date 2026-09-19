@@ -18,6 +18,12 @@ class MultiSourceService {
   final NmcService _nmc;
   final NmcCityRepository _cityRepo;
 
+  /// 最近一次中央气象台返回的雷达拼图路径（供雷达定调用）
+  String? lastRadarPath;
+
+  /// 最近一次中央气象台的完整天气（含实况/逐小时实测）
+  NmcWeather? lastNmcWeather;
+
   MultiSourceService({
     required OpenMeteoService meteo,
     required NmcService nmc,
@@ -97,7 +103,11 @@ class MultiSourceService {
     final wxByCode = <String, NmcWeather>{};
     await Future.wait(cityCodes.values.map((c) async {
       try {
-        wxByCode[c.code] = await _nmc.weather(c.code, cityName: c.city);
+        final wx = await _nmc.weather(c.code, cityName: c.city);
+        wxByCode[c.code] = wx;
+        // 记录雷达路径供定调使用
+        lastRadarPath ??= wx.radarImagePath;
+        lastNmcWeather ??= wx;
       } catch (_) {
         // 单城市失败忽略
       }
