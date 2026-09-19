@@ -1559,6 +1559,18 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
+  /// 源名简称（徽章空间有限，避免布局溢出）
+  String _shortSource(String name) {
+    switch (name) {
+      case '中央气象台':
+        return '央台';
+      case '和风天气':
+        return '和风';
+      default:
+        return name.length <= 5 ? name : name.substring(0, 5);
+    }
+  }
+
   Widget _sampleRow(({String label, GeoPoint point, HourlyWeather? weather}) s) {
     // 中心行：雷达定调判出最优源后，改用该源的值（与区域概览一致）
     final isCenter = s.label == '中心';
@@ -1571,7 +1583,7 @@ class _LocationScreenState extends State<LocationScreen> {
       child: Row(
         children: [
           SizedBox(
-            width: 62,
+            width: 78,
             child: Row(
               children: [
                 Text(s.label,
@@ -1579,15 +1591,20 @@ class _LocationScreenState extends State<LocationScreen> {
                         fontSize: 12.5, color: AppTheme.textDim, fontWeight: FontWeight.w600)),
                 if (useAdopted) ...[
                   const SizedBox(width: 3),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
-                    decoration: BoxDecoration(
-                      color: AppTheme.green.withValues(alpha: .15),
-                      borderRadius: BorderRadius.circular(3),
+                  Flexible(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: AppTheme.green.withValues(alpha: .15),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                      child: Text(_shortSource(adopted!),
+                          maxLines: 1,
+                          overflow: TextOverflow.clip,
+                          softWrap: false,
+                          style: const TextStyle(
+                              fontSize: 8, color: AppTheme.green, fontWeight: FontWeight.w700)),
                     ),
-                    child: Text(adopted!.split(' ').first,
-                        style: const TextStyle(
-                            fontSize: 8, color: AppTheme.green, fontWeight: FontWeight.w700)),
                   ),
                 ],
               ],

@@ -165,9 +165,22 @@ class ModelForecast {
       visibility: vis,
       cloudCover: cloud,
       weatherCode: weatherCode,
-      weatherText: weatherText,
+      // 天气文字缺失时用云量反推（中央气象台某些时刻取不到文字，
+      // 不补的话 UI 会显示「无数据」）
+      weatherText: (weatherText != null && weatherText!.isNotEmpty)
+          ? weatherText
+          : _textFromCloud(cloud),
       isObservation: isObservation,
     );
+  }
+
+  /// 由云量反推天气现象文字
+  static String? _textFromCloud(double? cloud) {
+    if (cloud == null) return null;
+    if (cloud >= 85) return '阴';
+    if (cloud >= 60) return '多云';
+    if (cloud >= 30) return '少云';
+    return '晴';
   }
 }
 
