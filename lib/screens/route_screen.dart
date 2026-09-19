@@ -1,9 +1,12 @@
+import 'package:amap_map/amap_map.dart';
 import 'package:flutter/material.dart';
+import 'package:x_amap_base/x_amap_base.dart';
 
 import '../engine/route_analyzer.dart';
 import '../services/amap_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
+import '../widgets/amap_view.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
 
 /// 出行路线页
@@ -35,6 +38,74 @@ class _RouteScreenState extends State<RouteScreen> {
   List<RouteOption> _options = const [];
   int _selectedIndex = 0;
   RouteAnalysis? _analysis;
+
+  /// 地图控制器：选中路线后用它自动缩放到该路线范围
+  AMapController? _mapController;
+
+  /// 选中某条候选路线 → 高亮 + 地图自动缩放到该路线
+  void _selectRoute(int index) {
+    setState(() => _selectedIndex = index);
+    _fitToRoute(_options[index]);
+  }
+
+  /// 把地图镜头调整到刚好框住整条路线
+  void _fitToRoute(RouteOption opt) {
+    final c = _mapController;
+    final pts = opt.polyline;
+    if (c == null || pts.isEmpty) return;
+
+    if (pts.length == 1) {
+      c.moveCamera(CameraUpdate.newLatLngZoom(LatLng(pts.first.lat, pts.first.lon), 13));
+      return;
+    }
+    var minLat = pts.first.lat, maxLat = pts.first.lat;
+    var minLon = pts.first.lon, maxLon = pts.first.lon;
+    for (final p in pts) {
+      minLat = minLat < p.lat ? minLat : p.lat;
+      maxLat = maxLat > p.lat ? maxLat : p.lat;
+      minLon = minLon < p.lon ? minLon : p.lon;
+      maxLon = maxLon > p.lon ? maxLon : p.lon;
+    }
+    c.moveCamera(CameraUpdate.newLatLngBounds(
+      LatLngBounds(
+        southwest: LatLng(minLat, minLon),
+        northeast: LatLng(maxLat, maxLon),
+      ),
+      56, // padding：留出边距，别让路线贴边
+    ));
+  }
+
+  /// 候选路线折线：选中的用琥珀色加粗，其余灰色
+  List<Polyline> _routePolylines() {
+    final lines = <Polyline>[];
+    for (final opt in _options) {
+      final selected = opt.index == _selectedIndex;
+      lines.add(Polyline(
+        points: opt.fullPolyline.map((p) => LatLng(p.lat, p.lon)).toList(),
+        width: selected ? 11 : 7,
+        color: selected ? AppTheme.accent : const Color(0x888493A6),
+      ));
+    }
+    return lines;
+  }
+
+  /// 起终点标注
+  List<Marker> _routeMarkers() {
+    final list = <Marker>[];
+    if (_from != null) {
+      list.add(Marker(
+        position: LatLng(_from!.lat, _from!.lon),
+        infoWindow: InfoWindow(title: '起点', snippet: _origin.text),
+      ));
+    }
+    if (_to != null) {
+      list.add(Marker(
+        position: LatLng(_to!.lat, _to!.lon),
+        infoWindow: InfoWindow(title: '终点', snippet: _dest.text),
+      ));
+    }
+    return list;
+  }
 
   @override
   void dispose() {
@@ -250,6 +321,32 @@ class _RouteScreenState extends State<RouteScreen> {
             ),
           ),
 
+        // ===== 路线地图：显示候选路线，点候选自动切换+缩放 =====
+        if (_options.isNotEmpty)
+          PanelCard(
+            heading: '路线地图 · 点候选路线自动缩放',
+            padding: const EdgeInsets.all(12),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: SizedBox(
+                height: 320,
+                child: AmapView(
+                  lat: _options[_selectedIndex].polyline.first.lat,
+                  lon: _options[_selectedIndex].polyline.first.lon,
+                  zoom: 10,
+                  markers: _routeMarkers(),
+                  polylines: _routePolylines(),
+                  interactive: true, // 可缩放拖动
+                  onMapCreated: (c) {
+                    _mapController = c;
+                    // 首次出图即框住当前选中路线
+                    _fitToRoute(_options[_selectedIndex]);
+                  },
+                ),
+              ),
+            ),
+          ),
+
         if (_analysis != null) ..._analysisWidgets(_analysis!),
       ],
     );
@@ -258,7 +355,7 @@ class _RouteScreenState extends State<RouteScreen> {
   Widget _optionTile(RouteOption opt) {
     final sel = opt.index == _selectedIndex;
     return InkWell(
-      onTap: () => setState(() => _selectedIndex = opt.index),
+      onTap: () => _selectRoute(opt.index),
       borderRadius: BorderRadius.circular(10),
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),

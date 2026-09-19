@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:amap_map/amap_map.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
@@ -20,10 +22,14 @@ class _AreaResult {
   final double? maxTemp;
   final int? maxPop; // 最高降水概率
 
+  /// 预生成的地图标注（带文字，Marker 不支持常驻文字故自绘）
+  final List<Marker> markers;
+
   const _AreaResult({
     required this.placeName,
     required this.center,
     required this.samples,
+    required this.markers,
     this.minTemp,
     this.maxTemp,
     this.maxPop,
@@ -69,20 +75,15 @@ class _LocationScreenState extends State<LocationScreen> {
     });
     try {
       // 同时启动两条定位链路
-      final amapFuture = AmapLocationService.locate(timeout: const Duration(seconds: 8));
-      final geoFuture = _locateBySystem(timeout: const Duration(seconds: 8));
+      final amapFuture = AmapLocationService.locate(timeout: const Duration(seconds: 6));
+      final geoFuture = _locateBySystem(timeout: const Duration(seconds: 6));
 
-      // 高德优先
+      // 高德优先；未回来则用系统定位（已在并行跑）
       final amapPoint = await amapFuture;
-      if (amapPoint != null) {
-        await _analyze(amapPoint);
-        return;
-      }
+      final point = amapPoint ?? await geoFuture;
 
-      // 高德未成功 → 取系统定位（已在并行跑，无需重新等）
-      final geoPoint = await geoFuture;
-      if (geoPoint != null) {
-        await _analyze(geoPoint);
+      if (point != null) {
+        await _analyze(point);
         return;
       }
 
@@ -162,13 +163,14 @@ class _LocationScreenState extends State<LocationScreen> {
 
   /// 核心：中心点 + 4 方位采样（约 5km）→ 拉天气 → 汇总
   Future<void> _analyze(GeoPoint center) async {
-    // 4 个方位点，距中心约 5km（纬度 1° ≈ 111km，经度按纬度修正）
-    const d = 5.0 / 111.0;
-    final dLon = d / (1000 * (center.lat.abs() / 90 * 0.7 + 0.3));
+    // 4 个方位点，距中心 5km
+    // 纬度 1° ≈ 111km；经度 1° ≈ 111km × cos(纬度)（高纬处经线间距变小）
+    const dLat = 5.0 / 111.0;
+    final dLon = dLat / math.cos(center.lat * math.pi / 180.0).abs().clamp(0.2, 1.0);
     final points = <({String label, GeoPoint point})>[
       (label: '中心', point: center),
-      (label: '北 5km', point: GeoPoint(lat: center.lat + d, lon: center.lon)),
-      (label: '南 5km', point: GeoPoint(lat: center.lat - d, lon: center.lon)),
+      (label: '北 5km', point: GeoPoint(lat: center.lat + dLat, lon: center.lon)),
+      (label: '南 5km', point: GeoPoint(lat: center.lat - dLat, lon: center.lon)),
       (label: '东 5km', point: GeoPoint(lat: center.lat, lon: center.lon + dLon)),
       (label: '西 5km', point: GeoPoint(lat: center.lat, lon: center.lon - dLon)),
     ];
@@ -194,12 +196,36 @@ class _LocationScreenState extends State<LocationScreen> {
       }
     }
 
+    // 生成「带文字」的标注：直接标出方位 + 温度（无需点击即可读）
+    final markers = <Marker>[];
+    for (final s in samples) {
+      final w = s.weather;
+      final isCenter = s.label == '中心';
+      final tempText = w?.temperature == null ? '--' : '${w!.temperature!.round()}°';
+      markers.add(Marker(
+        position: LatLng(s.point.lat, s.point.lon),
+        icon: await buildLabelIcon(
+          text: '${s.label} $tempText',
+          color: isCenter ? AppTheme.accent : AppTheme.cyan,
+          textColor: isCenter ? const Color(0xFF14100A) : Colors.white,
+        ),
+        infoWindow: InfoWindow(
+          title: s.label,
+          snippet: w == null
+              ? '无数据'
+              : '${w.weatherText ?? ''} ${w.temperature?.toStringAsFixed(1) ?? '--'}° '
+                  '降水${w.precipitationProbability ?? '--'}%',
+        ),
+      ));
+    }
+
     setState(() {
       _loading = false;
       _result = _AreaResult(
         placeName: center.name.isEmpty ? '所选位置' : center.name,
         center: center,
         samples: samples,
+        markers: markers,
         minTemp: temps.isEmpty ? null : temps.reduce((a, b) => a < b ? a : b),
         maxTemp: temps.isEmpty ? null : temps.reduce((a, b) => a > b ? a : b),
         maxPop: maxPop,
@@ -315,39 +341,18 @@ class _LocationScreenState extends State<LocationScreen> {
         child: ClipRRect(
           borderRadius: BorderRadius.circular(10),
           child: SizedBox(
-            height: 280,
+            height: 300,
             child: AmapView(
               lat: r.center.lat,
               lon: r.center.lon,
               zoom: 12,
-              markers: _buildMarkers(r),
+              markers: r.markers, // 预生成的带文字标注
+              interactive: true, // 独占手势：可缩放/拖动
             ),
           ),
         ),
       ),
     ];
-  }
-
-  /// 中心点 + 4 方位采样点标注
-  ///
-  /// 注：不用 `defaultMarkerWithHue`（它从 asset 加载图片，会触发插件
-  /// FlutterLoader 为 null 的崩溃），改用不依赖 asset 的 `defaultMarker`。
-  List<Marker> _buildMarkers(_AreaResult r) {
-    final markers = <Marker>[];
-    for (final s in r.samples) {
-      final w = s.weather;
-      markers.add(Marker(
-        position: LatLng(s.point.lat, s.point.lon),
-        infoWindow: InfoWindow(
-          title: s.label,
-          snippet: w == null
-              ? '无数据'
-              : '${w.weatherText ?? ''} ${w.temperature?.toStringAsFixed(1) ?? '—'}°',
-        ),
-        icon: BitmapDescriptor.defaultMarker,
-      ));
-    }
-    return markers;
   }
 
   Widget _metric(String k, String v) {
