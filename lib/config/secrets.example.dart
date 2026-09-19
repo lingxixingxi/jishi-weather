@@ -8,6 +8,10 @@
 /// Android 平台 Key 申请时需要：
 ///   PackageName: com.lingxi.jishiweather
 ///   SHA1: 用 keytool 获取（见 README）
+///
+/// 和风天气 Key 申请：https://dev.qweather.com/
+/// ⚠️ 2024 改版后必须使用**专属 API Host**（控制台 → 设置），
+///    通用域名 devapi/api.qweather.com 已停用。留空则跳过该数据源。
 class Secrets {
   Secrets._();
 
@@ -16,4 +20,10 @@ class Secrets {
 
   /// 高德 Android 平台 Key
   static const String amapAndroidKey = '';
+
+  /// 和风天气 API Key
+  static const String qweatherApiKey = '';
+
+  /// 和风天气专属 API Host（形如 abcdefg.re.qweatherapi.com）
+  static const String qweatherApiHost = '';
 }

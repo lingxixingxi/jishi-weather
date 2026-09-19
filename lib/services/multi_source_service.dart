@@ -4,6 +4,7 @@ import '../models/hourly_weather.dart';
 import 'nmc_city_repository.dart';
 import 'nmc_service.dart';
 import 'open_meteo.dart';
+import 'qweather_service.dart';
 
 /// 多源气象数据融合服务
 ///
@@ -18,6 +19,9 @@ class MultiSourceService {
   final NmcService _nmc;
   final NmcCityRepository _cityRepo;
 
+  /// 和风天气（可选第 5 源；未配置 API Host 时自动跳过）
+  final QWeatherService _qweather;
+
   /// 最近一次中央气象台返回的雷达拼图路径（供雷达定调用）
   String? lastRadarPath;
 
@@ -28,9 +32,11 @@ class MultiSourceService {
     required OpenMeteoService meteo,
     required NmcService nmc,
     required NmcCityRepository cityRepo,
+    QWeatherService? qweather,
   })  : _meteo = meteo,
         _nmc = nmc,
-        _cityRepo = cityRepo;
+        _cityRepo = cityRepo,
+        _qweather = qweather ?? QWeatherService();
 
   /// 拉取单点多源融合数据
   ///
@@ -51,20 +57,39 @@ class MultiSourceService {
     );
     if (!includeNmc || multi.isEmpty) return multi;
 
-    // 2. 中央气象台（定位城市 → 拉完整天气）
+    // 2. 和风天气（可选第 5 源；未配置 API Host 会自动跳过）
+    var result = multi;
+    if (_qweather.isConfigured) {
+      try {
+        final qw = await _qweather.hourly(lat, lon, hours: forecastDays * 24);
+        if (qw.isNotEmpty) {
+          result = result.map((m) {
+            final h = QWeatherService.nearest(qw, m.time);
+            return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
+          }).toList();
+        }
+      } catch (_) {
+        // 和风失败不影响其他源
+      }
+    }
+
+    // 3. 中央气象台（定位城市 → 拉完整天气）
+    if (!includeNmc || result.isEmpty) return result;
     try {
       final city = await _cityRepo.locate(lat, lon);
-      if (city == null) return multi;
+      if (city == null) return result;
 
       final wx = await _nmc.weather(city.code, cityName: city.city);
+      lastRadarPath ??= wx.radarImagePath;
+      lastNmcWeather ??= wx;
 
-      // 3. 按每个时刻注入中央气象台数据
-      return multi
+      // 4. 按每个时刻注入中央气象台数据
+      return result
           .map((m) => m.withExtraSource(nmcForecastAt(wx, m.time)))
           .toList();
     } catch (_) {
       // 中央气象台失败不影响主源
-      return multi;
+      return result;
     }
   }
 
@@ -83,7 +108,32 @@ class MultiSourceService {
       points,
       forecastDays: forecastDays,
     );
-    if (!includeNmc) return meteoAll;
+
+    // 2. 和风天气（只取路线中点，避免超出免费配额）
+    var result = meteoAll;
+    if (_qweather.isConfigured && points.isNotEmpty) {
+      try {
+        final mid = points.length ~/ 2;
+        final qw = await _qweather.hourly(
+          points[mid].lat,
+          points[mid].lon,
+          hours: forecastDays * 24,
+        );
+        if (qw.isNotEmpty) {
+          result = List.generate(result.length, (i) {
+            if (i != mid) return result[i];
+            return result[i].map((m) {
+              final h = QWeatherService.nearest(qw, m.time);
+              return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
+            }).toList();
+          });
+        }
+      } catch (_) {
+        // 和风失败不影响其他源
+      }
+    }
+
+    if (!includeNmc) return result;
 
     // 2. 每个点的城市（去重后只拉一次天气）
     final cityOf = <int, NmcCity?>{};
@@ -97,7 +147,7 @@ class MultiSourceService {
         cityOf[i] = null;
       }
     }
-    if (cityCodes.isEmpty) return meteoAll;
+    if (cityCodes.isEmpty) return result;
 
     // 3. 并行拉取各城市天气
     final wxByCode = <String, NmcWeather>{};
@@ -113,16 +163,16 @@ class MultiSourceService {
       }
     }));
 
-    // 4. 合并
+    // 4. 合并（注意用 result —— 它已含和风数据）
     final out = <List<MultiModelHourly>>[];
-    for (var i = 0; i < meteoAll.length; i++) {
+    for (var i = 0; i < result.length; i++) {
       final code = cityOf[i]?.code;
       final wx = code == null ? null : wxByCode[code];
       if (wx == null) {
-        out.add(meteoAll[i]);
+        out.add(result[i]);
         continue;
       }
-      out.add(meteoAll[i]
+      out.add(result[i]
           .map((m) => m.withExtraSource(nmcForecastAt(wx, m.time)))
           .toList());
     }
