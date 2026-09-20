@@ -204,4 +204,258 @@ class TyphoonVerdictEngine {
         return '${t.displayName} 对本地无直接影响，可按原计划出行。';
     }
   }
+
+  // ==================== 台风 × 路线（计划任务 4-1 / 10-2）====================
+
+  /// 机构分歧：各机构预报点相对 BABJ（中央气象台）的最大偏差（km）
+  ///
+  /// 这是**路径预报不确定度**的直接度量：分歧越大，越该对"最近距离"留余量。
+  static double agencySpread(TyphoonDetail t) {
+    final babj = t.agencyForecasts['BABJ'];
+    if (babj == null || t.agencyForecasts.length < 2) return 0;
+
+    var maxSpread = 0.0;
+    for (final e in t.agencyForecasts.entries) {
+      if (e.key == 'BABJ') continue;
+      final pts = e.value;
+      for (var i = 0; i < pts.length && i < babj.length; i++) {
+        final d = distanceKm(pts[i].lat, pts[i].lon, babj[i].lat, babj[i].lon);
+        if (d > maxSpread) maxSpread = d;
+      }
+    }
+    return maxSpread;
+  }
+
+  /// 台风 × 路线重叠分析
+  ///
+  /// 对路线每个采样点，取**该点到达时刻 ±6 小时**窗口内最近的台风路径点
+  /// （实况 + 预报），算距离：
+  /// - 距离 < 该时刻台风的 **7 级风圈半径**（无风圈数据时用 [defaultWindRadiusKm]）
+  ///   → 判为「受影响路段」
+  /// - 距离 < [highRiskKm] → 风险「高」，否则「中」
+  ///
+  /// 与 [judge] 的区别：[judge] 回答"台风对这个地点有没有影响"（单点），
+  /// 这里回答"这条路线上哪些路段会撞上台风"（沿程 + 时间窗）。
+  static RouteTyphoonImpact routeImpact({
+    required TyphoonDetail typhoon,
+    required List<RouteSample> samples,
+    double defaultWindRadiusKm = 200,
+    double highRiskKm = 100,
+  }) {
+    final spread = agencySpread(typhoon);
+    final agencyCount = typhoon.agencyForecasts.length;
+    final path = typhoon.fullTrack;
+
+    RouteTyphoonImpact empty(String reason) => RouteTyphoonImpact(
+          typhoonName: typhoon.displayName,
+          affected: false,
+          segments: const [],
+          agencySpreadKm: spread,
+          agencyCount: agencyCount,
+          advice: reason,
+          sampleCount: samples.length,
+        );
+
+    if (path.isEmpty) return empty('台风无有效路径数据，无法做路线重叠分析。');
+    if (samples.isEmpty) return empty('路线无采样点。');
+
+    final hit = <RouteTyphoonSegment>[];
+    double? nearest;
+    DateTime? nearestTime;
+    double? nearestKmMark;
+    String? nearestLabel;
+
+    for (final s in samples) {
+      TyphoonPoint? best;
+      var bestD = double.infinity;
+
+      for (final p in path) {
+        // ±6 小时时间窗
+        if (p.time.difference(s.time).inMinutes.abs() > 6 * 60) continue;
+        final d = distanceKm(p.lat, p.lon, s.lat, s.lon);
+        if (d < bestD) {
+          bestD = d;
+          best = p;
+        }
+      }
+      if (best == null) continue;
+
+      if (nearest == null || bestD < nearest) {
+        nearest = bestD;
+        nearestTime = s.time;
+        nearestKmMark = s.km;
+        nearestLabel = s.label;
+      }
+
+      // 该时刻台风的真实 7 级风圈半径（取最大象限，偏保守）
+      var radius = defaultWindRadiusKm;
+      for (final c in best.windCircles) {
+        if (c.name.startsWith('30')) {
+          radius = c.maxRadius;
+          break;
+        }
+      }
+
+      if (bestD < radius) {
+        hit.add(RouteTyphoonSegment(
+          km: s.km,
+          time: s.time,
+          distanceKm: bestD,
+          levelText: best.levelText,
+          windSpeed: best.windSpeed,
+          risk: bestD < highRiskKm ? '高' : '中',
+          label: s.label,
+        ));
+      }
+    }
+
+    // 受影响路段可能很密（每 10km 一个采样点），按里程抽稀到最多 8 条
+    final thinned = _thinSegments(hit, 8);
+
+    final affected = hit.isNotEmpty;
+    final highRisk = hit.any((h) => h.risk == '高');
+
+    final buf = StringBuffer();
+    if (!affected) {
+      buf.write('${typhoon.displayName} 对本次路线无直接影响');
+      if (nearest != null) buf.write('（全程最近 ${nearest.round()} km）');
+      buf.write('，可按原计划出行。');
+    } else if (highRisk) {
+      buf.write('路线有路段将进入 ${typhoon.displayName} 的 7 级风圈内且距离较近，'
+          '存在大风与强降雨风险，建议改期或调整路线。');
+    } else {
+      buf.write('路线部分路段处于 ${typhoon.displayName} 的外围影响范围内，'
+          '建议预留延误时间并关注预警更新。');
+    }
+    if (spread > 100) {
+      buf.write('另外，各机构对路径的预报分歧约 ${spread.round()} km，'
+          '不确定性较大，请以最新预报为准。');
+    }
+
+    return RouteTyphoonImpact(
+      typhoonName: typhoon.displayName,
+      affected: affected,
+      nearestKm: nearest,
+      nearestTime: nearestTime,
+      nearestKmMark: nearestKmMark,
+      nearestLabel: nearestLabel,
+      segments: thinned,
+      agencySpreadKm: spread,
+      agencyCount: agencyCount,
+      advice: buf.toString(),
+      sampleCount: samples.length,
+    );
+  }
+
+  /// 按里程均匀抽稀受影响路段，避免 10km 一个点铺满屏幕
+  static List<RouteTyphoonSegment> _thinSegments(
+    List<RouteTyphoonSegment> list,
+    int maxCount,
+  ) {
+    if (list.length <= maxCount) return list;
+    final out = <RouteTyphoonSegment>[];
+    final step = (list.length - 1) / (maxCount - 1);
+    for (var i = 0; i < maxCount; i++) {
+      out.add(list[(i * step).round().clamp(0, list.length - 1)]);
+    }
+    return out;
+  }
+}
+
+/// 路线上的一个采样点（台风 × 路线分析用）
+class RouteSample {
+  /// 里程（km）
+  final double km;
+
+  /// 到达时刻
+  final DateTime time;
+
+  final double lat;
+  final double lon;
+
+  /// 段名 / 地名（可选，展示用）
+  final String? label;
+
+  const RouteSample({
+    required this.km,
+    required this.time,
+    required this.lat,
+    required this.lon,
+    this.label,
+  });
+}
+
+/// 受台风影响的一个路段
+class RouteTyphoonSegment {
+  final double km;
+  final DateTime time;
+  final double distanceKm;
+
+  /// 该时刻台风的强度中文
+  final String levelText;
+
+  /// 该时刻台风的最大风速 m/s
+  final double? windSpeed;
+
+  /// 风险：高 / 中
+  final String risk;
+
+  final String? label;
+
+  const RouteTyphoonSegment({
+    required this.km,
+    required this.time,
+    required this.distanceKm,
+    required this.levelText,
+    required this.risk,
+    this.windSpeed,
+    this.label,
+  });
+}
+
+/// 台风对整条路线的影响
+class RouteTyphoonImpact {
+  final String typhoonName;
+  final bool affected;
+
+  /// 全程最近距离（km）
+  final double? nearestKm;
+
+  /// 最近点对应的到达时刻
+  final DateTime? nearestTime;
+
+  /// 最近点的里程
+  final double? nearestKmMark;
+
+  final String? nearestLabel;
+
+  /// 受影响路段（已抽稀）
+  final List<RouteTyphoonSegment> segments;
+
+  /// 机构分歧（km）
+  final double agencySpreadKm;
+
+  /// 参与预报的机构数
+  final int agencyCount;
+
+  final String advice;
+  final int sampleCount;
+
+  const RouteTyphoonImpact({
+    required this.typhoonName,
+    required this.affected,
+    required this.segments,
+    required this.agencySpreadKm,
+    required this.agencyCount,
+    required this.advice,
+    required this.sampleCount,
+    this.nearestKm,
+    this.nearestTime,
+    this.nearestKmMark,
+    this.nearestLabel,
+  });
+
+  /// 最高风险等级
+  String get worstRisk =>
+      segments.any((s) => s.risk == '高') ? '高' : (segments.isEmpty ? '无' : '中');
 }

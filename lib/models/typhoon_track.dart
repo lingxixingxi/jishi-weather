@@ -123,6 +123,13 @@ class TyphoonDetail {
   /// 预报机构名（如「中央气象台」）
   final String? forecastAgency;
 
+  /// **各机构的预报路径**（原始，用于计算「机构分歧」）
+  ///
+  /// key 为机构码（`BABJ` 中央气象台 / `RJTD` 日本 / `KWBC` 美国 …）。
+  /// 「机构分歧」= 各机构预报点相对 BABJ 的**最大偏差距离**，
+  /// 是路径预报不确定度的直接度量（计划任务 4-1 要求）。
+  final Map<String, List<TyphoonPoint>> agencyForecasts;
+
   /// 数据更新时间（原始字符串，形如 `2026年09月20日11时00分`）
   final String? updatedAt;
 
@@ -135,6 +142,7 @@ class TyphoonDetail {
     this.observed = const [],
     this.forecast = const [],
     this.forecastAgency,
+    this.agencyForecasts = const {},
     this.updatedAt,
   });
 

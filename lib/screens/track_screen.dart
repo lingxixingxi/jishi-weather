@@ -1,8 +1,14 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../data/track_circuits.dart';
 import '../engine/track_verdict.dart';
+import '../models/hourly_weather.dart';
+import '../services/open_meteo.dart';
 import '../services/open_meteo_extra.dart';
+import '../services/qweather_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/fade_slide_in.dart';
 import 'home_screen.dart' show PanelCard, ScreenScaffold;
@@ -15,6 +21,10 @@ import 'home_screen.dart' show PanelCard, ScreenScaffold;
 /// 数据源：Open-Meteo 扩展变量（免 key）
 /// `et0_fao_evapotranspiration` / `shortwave_radiation` / `cloud_cover` /
 /// `relative_humidity_2m` / `wind_speed_10m` / `visibility` / `precipitation`。
+///
+/// 另含计划（阶段 11）要求的两项：
+/// - **目标时刻**：当前时刻 / 指定时刻 二选一
+/// - **ECMWF 参考** + **Ventusky 坐标核对链接**
 class TrackScreen extends StatefulWidget {
   const TrackScreen({super.key});
 
@@ -24,10 +34,26 @@ class TrackScreen extends StatefulWidget {
 
 class _TrackScreenState extends State<TrackScreen> {
   final _extra = OpenMeteoExtraService();
+  final _meteo = OpenMeteoService();
+  final _qweather = QWeatherService();
 
   TrackCircuit _track = kTrackCircuits.first;
   ExtraWeather? _wx;
   TrackVerdict? _verdict;
+
+  /// **多源参考**：各模型在同一时刻的对照值
+  ///
+  /// 计划阶段 11 只写了「ECMWF 参考」，但赛道研判最关键的输入是**降水**，
+  /// 而降水的模式间分歧恰恰最大 —— 只给一个参照等于没有交叉验证。
+  /// 因此这里并列 ECMWF / GFS / ICON（+ 和风，若配置了 Key）。
+  List<RefValue> _refs = const [];
+
+  /// 降水分歧（各源极差，mm/h）
+  double? _precipSpread;
+
+  /// 研判目标时刻；null = 当前时刻
+  DateTime? _targetTime;
+
   bool _loading = true;
   String? _error;
 
@@ -40,7 +66,85 @@ class _TrackScreenState extends State<TrackScreen> {
   @override
   void dispose() {
     _extra.dispose();
+    _meteo.dispose();
+    _qweather.dispose();
     super.dispose();
+  }
+
+  /// 取最接近目标时刻的一条
+  static HourlyWeather? _nearestOf(List<HourlyWeather> list, DateTime t) {
+    if (list.isEmpty) return null;
+    HourlyWeather? best;
+    var bestDiff = const Duration(days: 999).inMinutes;
+    for (final h in list) {
+      final d = h.time.difference(t).inMinutes.abs();
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = h;
+      }
+    }
+    return best;
+  }
+
+  /// 并行拉取各模型在同一时刻的对照值
+  ///
+  /// 赛道研判最关键的输入是**降水**，而降水的模式间分歧最大 ——
+  /// 因此这里并列多个模式而不是只给一个 ECMWF。
+  Future<List<RefValue>> _fetchRefs(DateTime at) async {
+    const models = [
+      ('ecmwf_ifs025', 'ECMWF'),
+      ('gfs_global', 'GFS'),
+      ('icon_global', 'ICON'),
+    ];
+
+    final futures = <Future<RefValue?>>[
+      for (final m in models)
+        () async {
+          try {
+            final list = await _meteo.fetchHourly(
+              lat: _track.lat,
+              lon: _track.lon,
+              place: _track.name,
+              model: m.$1,
+              forecastDays: 3,
+            );
+            final h = _nearestOf(list, at);
+            if (h == null) return null;
+            return RefValue(
+              name: m.$2,
+              temperature: h.temperature,
+              precipitation: h.precipitation,
+              precipProb: h.precipitationProbability,
+              windSpeed: h.windSpeed,
+            );
+          } catch (e) {
+            debugPrint('[赛道] ${m.$2} 参考拉取失败: $e');
+            return null;
+          }
+        }(),
+      // 和风（未配置 Key 时跳过）
+      () async {
+        if (!_qweather.isConfigured) return null;
+        try {
+          final list = await _qweather.hourly(_track.lat, _track.lon);
+          final h = QWeatherService.nearest(list, at);
+          if (h == null) return null;
+          return RefValue(
+            name: '和风天气',
+            temperature: h.temperature,
+            precipitation: h.precipitation,
+            precipProb: h.precipitationProbability,
+            windSpeed: h.windSpeed,
+          );
+        } catch (e) {
+          debugPrint('[赛道] 和风参考拉取失败: $e');
+          return null;
+        }
+      }(),
+    ];
+
+    final results = await Future.wait(futures);
+    return results.whereType<RefValue>().toList();
   }
 
   Future<void> _load() async {
@@ -53,15 +157,28 @@ class _TrackScreenState extends State<TrackScreen> {
         lat: _track.lat,
         lon: _track.lon,
         pastDays: 1, // 需要过去 6h 降水
-        forecastDays: 2, // 需要未来逐小时 ET0 推算干燥时间
+        forecastDays: 3, // 需要未来逐小时 ET0 推算干燥时间
       );
-      final v = TrackVerdictEngine.judge(wx, DateTime.now());
+      final v = TrackVerdictEngine.judge(wx, _targetTime);
+
+      // ===== 多源参考（并行；单个源失败不影响其他）=====
+      final at = _targetTime ?? DateTime.now();
+      final refs = await _fetchRefs(at);
+      final precs = refs.map((r) => r.precipitation).whereType<double>().toList();
+      final spread = precs.length < 2
+          ? null
+          : (precs.reduce(math.max) - precs.reduce(math.min));
+
       debugPrint('[赛道] ${_track.name} 含水=${v?.waterMm.toStringAsFixed(2)} '
-          '分级=${v?.grip.label} 表温=${v?.surfaceTemp?.toStringAsFixed(1)}');
+          '分级=${v?.grip.label} 表温=${v?.surfaceTemp?.toStringAsFixed(1)} '
+          '参考源=${refs.map((r) => r.name).join("/")} '
+          '降水分歧=${spread?.toStringAsFixed(2) ?? "--"}mm/h');
       if (!mounted) return;
       setState(() {
         _wx = wx;
         _verdict = v;
+        _refs = refs;
+        _precipSpread = spread;
         _loading = false;
       });
     } catch (e) {
@@ -73,6 +190,45 @@ class _TrackScreenState extends State<TrackScreen> {
       });
     }
   }
+
+  /// 选择目标时刻（日期 + 时间，深色主题）
+  Future<void> _pickTargetTime() async {
+    final now = DateTime.now();
+    final base = _targetTime ?? now;
+
+    final date = await showDatePicker(
+      context: context,
+      initialDate: base,
+      firstDate: DateTime(now.year, now.month, now.day),
+      lastDate: now.add(const Duration(days: 3)),
+      helpText: '选择研判日期',
+      builder: (ctx, child) => Theme(data: AppTheme.pickerTheme(ctx), child: child!),
+    );
+    if (date == null || !mounted) return;
+
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(base),
+      helpText: '选择研判时刻',
+      builder: (ctx, child) => Theme(data: AppTheme.pickerTheme(ctx), child: child!),
+    );
+    if (time == null || !mounted) return;
+
+    setState(() {
+      _targetTime = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    });
+    await _load();
+  }
+
+  void _useNow() {
+    if (_targetTime == null) return;
+    setState(() => _targetTime = null);
+    _load();
+  }
+
+  String _fmtTime(DateTime t) =>
+      '${t.month}/${t.day} ${t.hour.toString().padLeft(2, '0')}:'
+      '${t.minute.toString().padLeft(2, '0')}';
 
   void _pick(TrackCircuit t) {
     if (t.name == _track.name) return;
@@ -89,13 +245,15 @@ class _TrackScreenState extends State<TrackScreen> {
       subtitle: '赛道湿滑 / 表面温度 / 干燥时间 · 路面状态评估',
       children: [
         FadeSlideIn(child: _trackPicker()),
-        if (_error != null) FadeSlideIn(delayMs: 20, child: _errorCard()),
+        FadeSlideIn(delayMs: 20, child: _timeCard()),
+        if (_error != null) FadeSlideIn(delayMs: 30, child: _errorCard()),
         if (_loading) FadeSlideIn(delayMs: 40, child: _loadingCard()),
         if (!_loading && _verdict != null) ...[
           FadeSlideIn(delayMs: 40, child: _gripCard(_verdict!)),
           FadeSlideIn(delayMs: 60, child: _metricsCard(_verdict!)),
           FadeSlideIn(delayMs: 80, child: _dryCard(_verdict!)),
           if (_wx != null) FadeSlideIn(delayMs: 100, child: _rainHistoryCard(_wx!)),
+          FadeSlideIn(delayMs: 110, child: _refsCard()),
           FadeSlideIn(delayMs: 120, child: _reasonCard(_verdict!)),
         ],
       ],
@@ -201,6 +359,243 @@ class _TrackScreenState extends State<TrackScreen> {
       );
 
   /// 湿滑状态卡（核心）
+  /// 研判时刻选择（计划阶段 11：当前时刻 / 指定时刻 二选一）
+  Widget _timeCard() {
+    final t = _targetTime;
+    final isNow = t == null;
+    return PanelCard(
+      heading: '研判时刻',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(isNow ? Icons.schedule : Icons.event_available,
+                  size: 15, color: AppTheme.accent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isNow ? '当前时刻' : _fmtTime(t),
+                  style: const TextStyle(
+                      fontSize: 14, fontWeight: FontWeight.w700, color: AppTheme.text),
+                ),
+              ),
+              if (!isNow)
+                TextButton(
+                  onPressed: _loading ? null : _useNow,
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 32),
+                    foregroundColor: AppTheme.accent,
+                  ),
+                  child: const Text('回到当前', style: TextStyle(fontSize: 12.5)),
+                ),
+              OutlinedButton(
+                onPressed: _loading ? null : _pickTargetTime,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppTheme.accent,
+                  side: const BorderSide(color: AppTheme.border),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  minimumSize: const Size(0, 34),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                child: Text(isNow ? '选择时刻' : '改时刻',
+                    style: const TextStyle(fontSize: 12)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            isNow ? '按此刻的气象条件研判路面状态。' : '按所选时刻的气象条件研判（未来 3 天内）。',
+            style: const TextStyle(fontSize: 11, color: AppTheme.textFaint),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 多源参考（各模式并列对照）+ Ventusky 坐标核对
+  ///
+  /// 计划阶段 11 只要求「ECMWF 参考」，但赛道研判的关键输入是**降水**，
+  /// 而降水的模式间分歧最大 —— 所以这里并列 ECMWF / GFS / ICON（+ 和风），
+  /// 并直接给出**降水分歧**，让你一眼看出这次研判可不可信。
+  Widget _refsCard() {
+    return PanelCard(
+      heading: '多源参考 · ${_refs.length} 个模式',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_refs.isEmpty)
+            const Text('参考模型数据不可用（不影响主研判）。',
+                style: TextStyle(fontSize: 12, color: AppTheme.textDim))
+          else ...[
+            // 表头
+            Row(
+              children: const [
+                SizedBox(width: 74, child: Text('模式', style: _th)),
+                SizedBox(
+                    width: 50, child: Text('温度', style: _th, textAlign: TextAlign.right)),
+                SizedBox(
+                    width: 54, child: Text('降水', style: _th, textAlign: TextAlign.right)),
+                SizedBox(
+                    width: 46, child: Text('概率', style: _th, textAlign: TextAlign.right)),
+                Expanded(child: Text('风速', style: _th, textAlign: TextAlign.right)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            const Divider(height: 1, color: AppTheme.borderSoft),
+            ..._refs.map((r) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 7),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 74,
+                        child: Text(r.name,
+                            style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.text)),
+                      ),
+                      SizedBox(
+                        width: 50,
+                        child: Text(
+                            r.temperature == null ? '—' : r.temperature!.toStringAsFixed(1),
+                            textAlign: TextAlign.right,
+                            style: const TextStyle(fontSize: 12, color: AppTheme.text)),
+                      ),
+                      SizedBox(
+                        width: 54,
+                        child: Text(
+                            r.precipitation == null
+                                ? '—'
+                                : r.precipitation!.toStringAsFixed(1),
+                            textAlign: TextAlign.right,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: (r.precipitation ?? 0) >= 0.1
+                                  ? FontWeight.w700
+                                  : FontWeight.w400,
+                              color: (r.precipitation ?? 0) >= 0.1
+                                  ? AppTheme.cyan
+                                  : AppTheme.textDim,
+                            )),
+                      ),
+                      SizedBox(
+                        width: 46,
+                        child: Text(r.precipProb == null ? '—' : '${r.precipProb}%',
+                            textAlign: TextAlign.right,
+                            style: const TextStyle(fontSize: 12, color: AppTheme.textDim)),
+                      ),
+                      Expanded(
+                        child: Text(r.windSpeed == null ? '—' : '${r.windSpeed!.round()}',
+                            textAlign: TextAlign.right,
+                            style: const TextStyle(fontSize: 12, color: AppTheme.textDim)),
+                      ),
+                    ],
+                  ),
+                )),
+            const SizedBox(height: 6),
+            const Text('温度 ℃ · 降水 mm/h · 风速 km/h　各模式为独立参照，'
+                '不参与主研判的融合计算',
+                style: TextStyle(fontSize: 10.5, color: AppTheme.textFaint, height: 1.4)),
+
+            // 降水分歧 —— 湿滑研判可不可信，主要看这个
+            if (_precipSpread != null) ...[
+              const SizedBox(height: 8),
+              _spreadBanner(_precipSpread!),
+            ],
+          ],
+          const SizedBox(height: 10),
+          GestureDetector(
+            onTap: _openVentusky,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              decoration: BoxDecoration(
+                color: AppTheme.bgInset,
+                borderRadius: BorderRadius.circular(9),
+                border: Border.all(color: AppTheme.borderSoft),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.open_in_new, size: 14, color: AppTheme.accent),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('在 Ventusky 核对',
+                            style: TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.accent)),
+                        const SizedBox(height: 2),
+                        Text(
+                          '${_track.lat.toStringAsFixed(3)}, ${_track.lon.toStringAsFixed(3)}',
+                          style: const TextStyle(fontSize: 10.5, color: AppTheme.textFaint),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Icon(Icons.chevron_right, size: 16, color: AppTheme.textFaint),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openVentusky() async {
+    final url = Uri.parse('https://www.ventusky.com/?lat='
+        '${_track.lat.toStringAsFixed(3)}&lon=${_track.lon.toStringAsFixed(3)}');
+    try {
+      final ok = await launchUrl(url, mode: LaunchMode.externalApplication);
+      if (!ok && mounted) _snack('无法打开浏览器');
+    } catch (e) {
+      debugPrint('[赛道] 打开 Ventusky 失败: $e');
+      if (mounted) _snack('无法打开浏览器');
+    }
+  }
+
+  void _snack(String msg) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  static const _th = TextStyle(
+      fontSize: 10.5,
+      fontWeight: FontWeight.w700,
+      color: AppTheme.textFaint,
+      letterSpacing: .4);
+
+  /// 降水分歧横幅 —— 湿滑研判可不可信，主要看这个
+  Widget _spreadBanner(double spread) {
+    final warn = spread >= 0.5;
+    final c = warn ? AppTheme.orange : AppTheme.green;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+      decoration: BoxDecoration(
+        color: c.withValues(alpha: .10),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: c.withValues(alpha: .40)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(warn ? Icons.warning_amber_rounded : Icons.check_circle_outline,
+              size: 14, color: c),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '降水分歧 ${spread.toStringAsFixed(1)} mm/h —— '
+              '${warn ? "各模式对降水判断不一致，含水与干燥时间的可信度下降，建议以临近实况为准" : "各模式对降水判断接近，湿滑研判较可靠"}',
+              style: TextStyle(fontSize: 11.5, color: c, height: 1.4),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _gripCard(TrackVerdict v) {
     final c = _gripColor(v.grip);
     return PanelCard(
@@ -509,4 +904,21 @@ class _TrackScreenState extends State<TrackScreen> {
     if (t <= 5) return AppTheme.cyan;
     return null;
   }
+}
+
+/// 单个参考模式在目标时刻的值（多源对照用）
+class RefValue {
+  final String name;
+  final double? temperature; // ℃
+  final double? precipitation; // mm/h
+  final int? precipProb; // %
+  final double? windSpeed; // km/h
+
+  const RefValue({
+    required this.name,
+    this.temperature,
+    this.precipitation,
+    this.precipProb,
+    this.windSpeed,
+  });
 }

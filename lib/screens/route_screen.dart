@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:amap_map/amap_map.dart';
 import 'package:flutter/material.dart';
 import 'package:x_amap_base/x_amap_base.dart';
 
 import '../engine/radar_verdict.dart';
 import '../engine/route_analyzer.dart';
+import '../engine/typhoon_verdict.dart';
 import '../models/hourly_weather.dart';
 import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
@@ -13,6 +16,7 @@ import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
+import '../widgets/fade_slide_in.dart';
 import '../widgets/place_search_field.dart';
 import 'home_screen.dart' show ScreenScaffold, PanelCard;
 
@@ -78,6 +82,9 @@ class _RouteScreenState extends State<RouteScreen> {
   List<RouteOption> _options = const [];
   int _selectedIndex = 0;
   RouteAnalysis? _analysis;
+
+  /// 台风 × 路线重叠研判（计划任务 4-1）
+  RouteTyphoonImpact? _typhoonRoute;
 
   /// 当前展开的分段（横向路线条点击切换）
   int _selectedSegment = 0;
@@ -342,6 +349,9 @@ class _RouteScreenState extends State<RouteScreen> {
       _lastWeathers = weathers;
       _lastOpt = opt;
       _runRadarVerdict(samples, multiAtArrival);
+
+      // ===== 台风 × 路线重叠（异步，不阻塞主流程）=====
+      unawaited(_runTyphoonRoute(_analysis));
     } catch (e) {
       setState(() {
         _analyzing = false;
@@ -564,6 +574,10 @@ class _RouteScreenState extends State<RouteScreen> {
           ),
 
         if (_analysis != null) ..._analysisWidgets(_analysis!),
+
+        // ===== 台风 × 路线重叠（沿程逐点比对，异步加载）=====
+        if (_typhoonRoute != null)
+          FadeSlideIn(delayMs: 150, child: _typhoonRouteCard(_typhoonRoute!)),
       ],
     );
   }
@@ -611,6 +625,177 @@ class _RouteScreenState extends State<RouteScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ==================== 台风 × 路线（计划任务 4-1）====================
+
+  /// 把分段结果摊平成台风分析用的采样点（带里程与到达时刻）
+  List<RouteSample> _routeSamples(RouteAnalysis a) {
+    final out = <RouteSample>[];
+    for (final seg in a.segments) {
+      final pts = seg.points;
+      if (pts.isEmpty) continue;
+      final spanMs = seg.endTime.difference(seg.startTime).inMilliseconds;
+      final spanKm = seg.endKm - seg.startKm;
+      for (var i = 0; i < pts.length; i++) {
+        final frac = pts.length == 1 ? 0.0 : i / (pts.length - 1);
+        out.add(RouteSample(
+          km: seg.startKm + spanKm * frac,
+          time: seg.startTime.add(Duration(milliseconds: (spanMs * frac).round())),
+          lat: pts[i].lat,
+          lon: pts[i].lon,
+          label: '${seg.fromName} → ${seg.toName}',
+        ));
+      }
+    }
+    return out;
+  }
+
+  /// 拉当前活跃台风 → 与路线做重叠分析
+  Future<void> _runTyphoonRoute(RouteAnalysis? a) async {
+    if (a == null) return;
+    try {
+      final list = await _nmc.typhoonList();
+      Typhoon? active;
+      for (final t in list) {
+        if (t.isActive) {
+          active = t;
+          break;
+        }
+      }
+      if (active == null) {
+        debugPrint('[台风×路线] 当前无活跃台风');
+        if (mounted) setState(() => _typhoonRoute = null);
+        return;
+      }
+
+      final detail = await _nmc.typhoonTrack(active.id);
+      final impact = TyphoonVerdictEngine.routeImpact(
+        typhoon: detail,
+        samples: _routeSamples(a),
+      );
+      debugPrint('[台风×路线] ${impact.typhoonName} 受影响=${impact.affected} '
+          '最近=${impact.nearestKm?.round()}km 路段=${impact.segments.length} '
+          '机构分歧=${impact.agencySpreadKm.round()}km');
+      if (!mounted) return;
+      setState(() => _typhoonRoute = impact);
+    } catch (e) {
+      debugPrint('[台风×路线] 失败: $e');
+    }
+  }
+
+  /// 台风 × 路线卡片
+  Widget _typhoonRouteCard(RouteTyphoonImpact im) {
+    final risk = im.worstRisk;
+    final c = !im.affected
+        ? AppTheme.green
+        : (risk == '高' ? AppTheme.red : AppTheme.orange);
+
+    return PanelCard(
+      heading: '台风 × 路线 · ${im.typhoonName}',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 结论横幅
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+            decoration: BoxDecoration(
+              color: c.withValues(alpha: .10),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: c.withValues(alpha: .45)),
+            ),
+            child: Row(
+              children: [
+                Icon(im.affected ? Icons.warning_amber_rounded : Icons.check_circle_outline,
+                    size: 17, color: c),
+                const SizedBox(width: 9),
+                Text(
+                  im.affected ? '路线受影响（风险$risk）' : '全程无台风影响',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: c),
+                ),
+                const Spacer(),
+                if (im.nearestKm != null)
+                  Text('最近 ${im.nearestKm!.round()} km',
+                      style: TextStyle(fontSize: 12, color: c.withValues(alpha: .9))),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(im.advice,
+              style: const TextStyle(fontSize: 12.5, color: AppTheme.text, height: 1.55)),
+
+          // 最近点
+          if (im.nearestKm != null) ...[
+            const SizedBox(height: 10),
+            _kv('全程最近', '${im.nearestKm!.round()} km'
+                '${im.nearestKmMark == null ? '' : '（约 ${im.nearestKmMark!.round()} km 处）'}'),
+            if (im.nearestTime != null)
+              _kv('对应时刻', _hhmm(im.nearestTime!)),
+            if (im.nearestLabel != null) _kv('所在路段', im.nearestLabel!),
+          ],
+
+          // 机构分歧
+          const SizedBox(height: 4),
+          _kv('机构分歧',
+              im.agencyCount < 2
+                  ? '仅 ${im.agencyCount} 家机构预报，无法比较'
+                  : '约 ${im.agencySpreadKm.round()} km（${im.agencyCount} 家机构）'),
+
+          // 受影响路段
+          if (im.segments.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const Text('受影响路段',
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: AppTheme.textFaint,
+                    letterSpacing: .6)),
+            const SizedBox(height: 6),
+            ...im.segments.map((s) {
+              final sc = s.risk == '高' ? AppTheme.red : AppTheme.orange;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: sc.withValues(alpha: .15),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: sc.withValues(alpha: .45)),
+                      ),
+                      child: Text(s.risk,
+                          style: TextStyle(
+                              fontSize: 10, fontWeight: FontWeight.w700, color: sc)),
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 62,
+                      child: Text('${s.km.round()} km',
+                          style: const TextStyle(fontSize: 12, color: AppTheme.text)),
+                    ),
+                    Expanded(
+                      child: Text(
+                        '距中心 ${s.distanceKm.round()} km · ${s.levelText}'
+                        '${s.windSpeed == null ? '' : ' · ${s.windSpeed!.round()} m/s'}',
+                        style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ] else ...[
+            const SizedBox(height: 8),
+            Text(
+              '沿路线共比对 ${im.sampleCount} 个采样点，均未进入 7 级风圈。',
+              style: const TextStyle(fontSize: 11.5, color: AppTheme.textFaint),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -1152,6 +1337,9 @@ class _RouteScreenState extends State<RouteScreen> {
       ),
     );
   }
+
+  String _hhmm(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
 
   String _dur(int m) {
     if (m < 60) return '$m 分钟';

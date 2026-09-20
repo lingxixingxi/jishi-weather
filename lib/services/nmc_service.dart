@@ -323,45 +323,58 @@ class NmcService {
       }
     }
 
+    // 先把**所有机构**的预报解析出来（「机构分歧」需要），再挑优先机构作主路径
+    List<TyphoonPoint> parseAgency(dynamic list, String agency) {
+      final out = <TyphoonPoint>[];
+      if (list is! List) return out;
+      for (final f in list) {
+        if (f is! List || f.length < 5) continue;
+        final lead = n(f[0])?.round();
+        // 用「基准时刻 + 时效」推算预报时刻（见上方说明）
+        final t = (attachTime != null && lead != null)
+            ? attachTime.add(Duration(hours: lead))
+            : parseT(f[1]);
+        final lat = n(f[3]);
+        final lon = n(f[2]);
+        if (t == null || lat == null || lon == null) continue;
+        out.add(TyphoonPoint(
+          time: t,
+          lat: lat,
+          lon: lon,
+          pressure: n(f[4]),
+          windSpeed: n(f[5]),
+          levelCode: f.length > 7 ? '${f[7]}' : null,
+          isForecast: true,
+          agency: agency,
+          leadHours: lead,
+        ));
+      }
+      out.sort((a, b) => a.time.compareTo(b.time));
+      return out;
+    }
+
+    final agencyForecasts = <String, List<TyphoonPoint>>{};
+    if (agencies != null) {
+      for (final key in agencies.keys) {
+        final pts = parseAgency(agencies[key], '$key');
+        if (pts.isNotEmpty) agencyForecasts['$key'] = pts;
+      }
+    }
+
     final forecast = <TyphoonPoint>[];
     String? agencyName;
-    if (agencies != null) {
+    if (agencyForecasts.isNotEmpty) {
       const prefer = ['BABJ', 'RJTD', 'KWBC', 'PGTW', 'RKSL', 'VHHH'];
       String? pick;
       for (final a in prefer) {
-        if (agencies.containsKey(a)) {
+        if (agencyForecasts.containsKey(a)) {
           pick = a;
           break;
         }
       }
-      pick ??= '${agencies.keys.first}';
-      final list = agencies[pick];
-      if (list is List) {
-        for (final f in list) {
-          if (f is! List || f.length < 5) continue;
-          final lead = n(f[0])?.round();
-          // 用「基准时刻 + 时效」推算预报时刻（见上方说明）
-          final t = (attachTime != null && lead != null)
-              ? attachTime.add(Duration(hours: lead))
-              : parseT(f[1]);
-          final lat = n(f[3]);
-          final lon = n(f[2]);
-          if (t == null || lat == null || lon == null) continue;
-          forecast.add(TyphoonPoint(
-            time: t,
-            lat: lat,
-            lon: lon,
-            pressure: n(f[4]),
-            windSpeed: n(f[5]),
-            levelCode: f.length > 7 ? '${f[7]}' : null,
-            isForecast: true,
-            agency: pick,
-            leadHours: lead,
-          ));
-        }
-        forecast.sort((a, b) => a.time.compareTo(b.time));
-        agencyName = TyphoonLevel.agencyText(pick);
-      }
+      pick ??= agencyForecasts.keys.first;
+      forecast.addAll(agencyForecasts[pick]!);
+      agencyName = TyphoonLevel.agencyText(pick);
     }
 
     // ===== 更新时间：最后一个实况点的 [12] =====
@@ -383,6 +396,7 @@ class NmcService {
       observed: observed,
       forecast: forecast,
       forecastAgency: agencyName,
+      agencyForecasts: agencyForecasts,
       updatedAt: updated,
     );
   }
