@@ -1288,6 +1288,15 @@ class _LocationScreenState extends State<LocationScreen> {
             if (r.motionSpeedKmh != null && r.motionSpeedKmh! > 1)
               _kvRow('回波移动',
                   '向${r.motionDirection} ${r.motionSpeedKmh!.toStringAsFixed(0)} km/h（${r.framesUsed} 帧追踪）'),
+            // 外推预测：把回波场沿运动矢量整体平移后查目标点
+            // （数值模式对 0~2h 的短临预报很弱，雷达外推恰好擅长这个尺度）
+            if (r.dbzForecast != null)
+              _kvRow(
+                '${r.leadMinutes}分钟后',
+                '${r.forecastText}'
+                '${r.rainForecast != null && r.rainForecast! >= 0.1 ? ' · 约 ${r.rainForecast!.toStringAsFixed(1)} mm/h' : ''}'
+                '（回波外推）',
+              ),
             const Divider(height: 20, color: AppTheme.borderSoft),
           ],
           if (v.scores.isNotEmpty) ...[
