@@ -668,6 +668,18 @@ class _LocationScreenState extends State<LocationScreen> {
         }
         if (src != null) {
           final r = _result!;
+          // ⚠️ 天气现象用**共识判定**，不要直接用最优源的原文。
+          // 原因：中央气象台的 weatherText 是「观测站的天气现象」（可能是几小时前的
+          // 实况，如「少云」），而多源面板的「共识判定」基于**各源预报云量的中位数**
+          // （≥85% 判阴）。两者依据不同，直接混用会出现
+          // 「采样明细写少云、共识判定写阴」的自相矛盾（用户反馈）。
+          // 现在统一：数值取最优源，天气现象取共识判定（有降水时优先用降水文字）。
+          final consensusText = nowMulti.consensusWeatherText;
+          final hasPrecip = (src.precipitation ?? 0) >= 0.1;
+          final effText = hasPrecip
+              ? (src.weatherText ?? consensusText)
+              : (consensusText ?? src.weatherText);
+
           final eff = HourlyWeather(
             place: r.placeName,
             lat: center.lat,
@@ -681,9 +693,9 @@ class _LocationScreenState extends State<LocationScreen> {
             windDirection: src.windDirection,
             windGust: src.windGust,
             visibility: src.visibility,
-            cloudCover: src.cloudCover,
+            cloudCover: nowMulti.consensusCloudCover ?? src.cloudCover,
             weatherCode: src.weatherCode,
-            weatherText: src.weatherText,
+            weatherText: effText,
           );
           setState(() {
             _result = r.copyWithSource(src!.displayName, eff);
@@ -840,6 +852,15 @@ class _LocationScreenState extends State<LocationScreen> {
                   ),
                 ],
               ),
+              // 说明数据性质：数值取最优源，天气现象取多源共识
+              if (r.adoptedSource != null)
+                const Padding(
+                  padding: EdgeInsets.only(top: 5, left: 21),
+                  child: Text(
+                    '数值取自雷达定调最优源；天气现象由各源云量共识判定',
+                    style: TextStyle(fontSize: 10, color: AppTheme.textFaint),
+                  ),
+                ),
             ],
             const SizedBox(height: 14),
             Row(
