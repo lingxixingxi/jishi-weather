@@ -42,11 +42,36 @@ android {
         manifestPlaceholders["AMAP_KEY"] = keyProperties.getProperty("AMAP_KEY") ?: ""
     }
 
+    // ===== 发布签名 =====
+    //
+    // 从 `android/key.properties` 读取（该文件不入库，见 .gitignore）。
+    // **未配置发布密钥时回退到 debug 签名** —— 这样开源 clone 下来不填任何
+    // 密钥也能 `flutter build apk --release`（代价是包用调试签名，仅供本地
+    // 测试，不可上架）。
+    //
+    // 实测（2026-09-20，真机）：高德 Android Key 同时登记了「发布版 SHA1」
+    // 与「调试版 SHA1」，因此改用正式 release.keystore 签名后，地图 SDK 与
+    // 定位 SDK 均可正常使用（已逐项验证瓦片渲染与混合定位）。
+    val hasReleaseKey = !keyProperties.getProperty("storeFile").isNullOrBlank()
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("releaseKey") {
+                storeFile = rootProject.file(keyProperties.getProperty("storeFile"))
+                storePassword = keyProperties.getProperty("storePassword")
+                keyAlias = keyProperties.getProperty("keyAlias")
+                keyPassword = keyProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseKey) {
+                signingConfigs.getByName("releaseKey")
+            } else {
+                signingConfigs.getByName("debug")
+            }
 
             // ⚠️ 必须关闭代码混淆/资源压缩。
             // 高德地图的 native 引擎（libAMapOpenMap.so）在 onSurfaceCreated

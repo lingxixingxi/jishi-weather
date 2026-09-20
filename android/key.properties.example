@@ -6,5 +6,25 @@
 #   发布版安全码 SHA1
 #   调试版安全码 SHA1
 #   PackageName: com.lingxi.jishiweather
+#
+# 提示：同一个 Android 平台 Key 可以**同时登记发布版与调试版 SHA1**，
+#       这样 debug 包与 release 包都能正常使用地图与定位。
 
 AMAP_KEY=你的高德Android平台Key
+
+# ===== 发布签名（可选）=====
+#
+# 不填也能构建 release 包，但会**回退到 debug 签名**（仅供本地测试，
+# 不能上架，也不能给已发布的 App 做升级）。
+#
+# 正式发布流程：
+# 1) 生成密钥库（有效期 30 年）：
+#      keytool -genkey -v -keystore release.keystore -alias jishiweather \
+#        -keyalg RSA -keysize 2048 -validity 10950
+# 2) 查看 SHA1 并填到高德控制台的「发布版安全码」：
+#      keytool -list -v -keystore release.keystore -alias jishiweather
+# 3) 在下面填入路径与口令（路径相对 `android/` 目录）：
+storeFile=../../android-keys/release.keystore
+storePassword=你的密钥库口令
+keyAlias=你的别名
+keyPassword=你的密钥口令

@@ -63,26 +63,52 @@ cp lib/config/secrets.example.dart lib/config/secrets.dart
 
 然后填入你自己的高德 Key：
 
-- `android/key.properties` → `AMAP_KEY=`（Android 平台 Key）
-- `lib/config/secrets.dart` → `amapWebKey`（Web服务 Key）、`amapAndroidKey`
+- `android/key.properties` → `AMAP_KEY=`（**Android 平台** Key，地图 SDK + 定位 SDK）
+- `lib/config/secrets.dart` → `amapWebKey`（**Web服务** Key）、`amapAndroidKey`
 
 **申请 Android 平台 Key 需要**（用 `keytool` 获取 SHA1）：
 
 ```bash
+# 调试签名 SHA1
 keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android
+
+# 发布签名 SHA1（先生成自己的 keystore，见下）
+keytool -list -v -keystore release.keystore -alias jishiweather
 ```
 
 - PackageName：`com.lingxi.jishiweather`
-- 发布版 SHA1：来自你的发布 keystore
-- 调试版 SHA1：来自 `~/.android/debug.keystore`
+- 发布版 SHA1、调试版 SHA1：**同一个 Key 可以同时登记这两个**，
+  这样 debug 与 release 包都能用地图与定位（本项目实测确认）
 
-### 3. 构建
+### 3. 发布签名（可选）
+
+`android/key.properties` 里填入 `storeFile` / `storePassword` / `keyAlias` /
+`keyPassword` 即启用正式签名；**不填则自动回退到 debug 签名**（能构建、
+能自测，但不可上架、也无法给已发布版本做升级）。
+
+```bash
+# 生成密钥库（有效期 30 年）
+keytool -genkey -v -keystore release.keystore -alias jishiweather \
+  -keyalg RSA -keysize 2048 -validity 10950
+```
+
+> 密钥库丢失 = 无法给已上架的 App 发更新（只能换包名重发），请多处备份。
+
+### 4. 构建
 
 ```bash
 flutter pub get
 flutter build apk --debug     # 调试包
-flutter build apk --release   # 发布包（需配置签名）
+flutter build apk --release   # 发布包
+
+# 按架构出包（体积更小、引擎架构匹配）
+flutter build apk --release --target-platform android-arm64   # 64 位（主流）
+flutter build apk --release --target-platform android-arm     # 32 位（老机型）
 ```
+
+> 注：`--target-platform` 只切换 **Flutter 引擎**的架构；第三方插件（如高德）
+> 自带的多 ABI `.so` 仍会全部打进包里，因此两个包体积接近。如需进一步瘦身，
+> 可在 `build.gradle.kts` 里配置 `ndk.abiFilters` 或使用 `--split-per-abi`。
 
 > 国内网络建议配置镜像加速：Gradle 发行包用腾讯云镜像、Maven 用阿里云镜像（见 `android/settings.gradle.kts`）。
 
