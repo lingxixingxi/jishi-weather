@@ -31,6 +31,18 @@ class RadarPointVerdict {
   /// 回波移动去向方位（如「东北」）
   final String? motionDirection;
 
+  /// **外推预测**：目标点在 [leadMinutes] 分钟后的回波强度（dBZ）
+  ///
+  /// 数值模式对 0~2 小时的短临预报很弱，而雷达回波外推恰好擅长这个尺度，
+  /// 因此这份预测是「未来逐小时」展示时的重要补充依据。
+  final int? dbzForecast;
+
+  /// 外推预测的降水强度（mm/h，由 dBZ 经 Z-R 关系反演）
+  final double? rainForecast;
+
+  /// 外推提前量（分钟）
+  final int leadMinutes;
+
   const RadarPointVerdict({
     required this.time,
     this.dbzNow,
@@ -41,13 +53,26 @@ class RadarPointVerdict {
     this.coverage = 0,
     this.motionSpeedKmh,
     this.motionDirection,
+    this.dbzForecast,
+    this.rainForecast,
+    this.leadMinutes = 60,
   });
 
   bool get hasEchoNow => dbzNow != null && dbzNow! >= 5;
 
+  /// 外推预测是否有回波
+  bool get hasEchoForecast => dbzForecast != null && dbzForecast! >= 5;
+
   String get echoText {
     if (!hasEchoNow) return '无回波';
     return '${RadarPalette.dbzLevel(dbzNow!)}（${dbzNow} dBZ）';
+  }
+
+  /// 外推预测的文字描述
+  String get forecastText {
+    if (dbzForecast == null) return '—';
+    if (dbzForecast! < 5) return '无回波';
+    return '${RadarPalette.dbzLevel(dbzForecast!)}（${dbzForecast} dBZ）';
   }
 }
 
@@ -169,17 +194,21 @@ class RadarVerdictEngine {
     final dbz = RadarService.sampleAt(latest, lat, lon);
     final rain = dbz == null ? null : RadarService.dbzToRainRate(dbz);
 
-    // 4. 运动矢量与外推
+    // 4. 运动矢量 + **目标点回波外推预测**
+    //
+    // 旧实现用「外推质心与目标点的距离 < 150km」判断是否可能被影响 ——
+    // 过于粗糙（150km 内的回波未必会飘到目标点，方向不对也没用）。
+    // 现在改为把回波场沿运动矢量整体外推，**直接预测目标点未来的回波强度**：
+    //   目标点 T 在 t 分钟后 ≡ 当前位置 (T − v·t) 处的当前回波
     final motion = RadarService.estimateMotion(analyzed);
+    int? dbzForecast;
+    double? rainForecast;
     var expectedRain = false;
     if (motion != null && latest.hasEcho) {
-      // 简化判断：若目标点在回波主体移动方向的「下游」，则未来可能被覆盖
-      final predicted = RadarService.predictCentroid(latest, motion, horizonMinutes);
-      if (predicted != null) {
-        final p = RadarGeo.latLonToPixel(lat, lon);
-        final dist = _dist(predicted.x, predicted.y, p.x, p.y);
-        // 外推质心与目标点距离 < 一定阈值（约 150km）视为可能被影响
-        expectedRain = dist * motion.kmPerPixel < 150;
+      dbzForecast = RadarService.forecastDbzAt(latest, motion, lat, lon, horizonMinutes);
+      if (dbzForecast != null && dbzForecast >= 5) {
+        rainForecast = RadarService.dbzToRainRate(dbzForecast);
+        expectedRain = true;
       }
     }
 
@@ -193,6 +222,9 @@ class RadarVerdictEngine {
       coverage: latest.coverage,
       motionSpeedKmh: motion?.speedKmh,
       motionDirection: motion?.directionText,
+      dbzForecast: dbzForecast,
+      rainForecast: rainForecast,
+      leadMinutes: horizonMinutes,
     );
 
     // 5. 各模型打分
@@ -287,12 +319,6 @@ class RadarVerdictEngine {
       parts.add('最吻合模型: ${scores.first.modelName}');
     }
     return parts.join(' · ');
-  }
-
-  static double _dist(double x1, double y1, double x2, double y2) {
-    final dx = x1 - x2;
-    final dy = y1 - y2;
-    return (dx * dx + dy * dy) <= 0 ? 0 : _sqrt(dx * dx + dy * dy);
   }
 
   static double _sqrt(double v) {

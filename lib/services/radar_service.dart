@@ -314,6 +314,50 @@ class RadarService {
     );
   }
 
+  /// **目标点回波外推预测** —— 预测 [minutesAhead] 分钟后该点的回波强度
+  ///
+  /// ⚠️ 与 [predictCentroid] 的区别（那个只跟踪回波块的中心，用处有限）：
+  /// 降水预报真正关心的是「**目标点上方未来会不会有回波飘过来**」。
+  ///
+  /// 做法（避免重建整张图）：回波以速度 v 平移，则
+  ///   目标点 T 在 t 分钟后的回波 ≡ 当前位置 **(T − v·t)** 处的当前回波
+  /// 即把目标点沿运动方向**反向平移**后，查当前回波场即可。
+  ///
+  /// 适用尺度：雷达外推在 **0~2 小时**内显著优于数值模式（短临预报），
+  /// 超过 2~3 小时后外推误差迅速增大，应由模式接管。
+  static int? forecastDbzAt(
+    RadarFrame latest,
+    RadarMotion motion,
+    double lat,
+    double lon,
+    int minutesAhead, {
+    int radiusPx = 1,
+  }) {
+    final p = RadarGeo.latLonToPixel(lat, lon);
+    final steps = minutesAhead / motion.frameMinutes;
+    final srcX = p.x - motion.dxPerFrame * steps;
+    final srcY = p.y - motion.dyPerFrame * steps;
+
+    int? best;
+    var bestDist = double.infinity;
+    for (final e in latest.echoes) {
+      final dx = (e.x - srcX).abs();
+      final dy = (e.y - srcY).abs();
+      if (dx > radiusPx || dy > radiusPx) continue;
+      final d = dx + dy;
+      if (d < bestDist) {
+        bestDist = d;
+        best = e.dbz;
+      }
+    }
+    return best;
+  }
+
+  /// 回波外推预测的**有效时限**（分钟）
+  ///
+  /// 实测经验：30~60 分钟外推可信度高；2 小时以上误差明显增大。
+  static const int forecastMaxMinutes = 120;
+
   /// 按运动矢量外推：预测 [minutesAhead] 分钟后回波质心位置
   static ({double x, double y})? predictCentroid(
     RadarFrame last,

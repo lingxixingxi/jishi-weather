@@ -79,6 +79,45 @@ class _AreaResult {
       );
 }
 
+/// 多源聚合出的**逐日**预报（由 5 源逐小时数据本地合成）
+///
+/// 相比 Open-Meteo 的 `daily` 接口（只给 best_match 单模型），
+/// 这里的数据天然带多源交叉验证，且天气现象用共识判定。
+class _DailySummary {
+  final DateTime date;
+  final double? tempMax;
+  final double? tempMin;
+  final double precipitationSum; // mm
+  final int? precipProbMax; // %
+  final String? weatherText; // 共识判定或降水文字
+  final double? cloudMedian; // 各源云量中位数
+  final int sourceCount; // 参与比对的源数
+  final int hours; // 该日覆盖的小时数（首日/末日可能不足 24）
+
+  const _DailySummary({
+    required this.date,
+    this.tempMax,
+    this.tempMin,
+    this.precipitationSum = 0,
+    this.precipProbMax,
+    this.weatherText,
+    this.cloudMedian,
+    this.sourceCount = 0,
+    this.hours = 0,
+  });
+
+  /// 星期几
+  String get weekday {
+    const names = ['一', '二', '三', '四', '五', '六', '日'];
+    return '周${names[date.weekday - 1]}';
+  }
+
+  bool get isToday {
+    final n = DateTime.now();
+    return date.year == n.year && date.month == n.month && date.day == n.day;
+  }
+}
+
 /// 地图叠加图层模式
 enum _LayerMode {
   none,
@@ -155,11 +194,8 @@ class _LocationScreenState extends State<LocationScreen> {
   RadarVerdict? _verdict;
   bool _verdictLoading = false;
 
-  /// 未来逐小时预测（取中心点）
+  /// 未来逐小时预测（取中心点，5 源）
   List<MultiModelHourly> _hourlyForecast = const [];
-
-  /// 未来逐日预测
-  List<DailyWeather> _dailyForecast = const [];
 
   bool _loading = false;
   String? _error;
@@ -219,6 +255,81 @@ class _LocationScreenState extends State<LocationScreen> {
     } catch (e) {
       debugPrint('[叠加] 渲染失败: $e');
     }
+  }
+
+  /// **从多源逐小时数据本地聚合出逐日预报**
+  ///
+  /// ⚠️ 为什么不用 Open-Meteo 的 `daily` 接口：
+  /// 那个接口只返回 **best_match 单模型**的日值，**没有多源交叉验证**。
+  /// 而我们已经有 5 源（ECMWF/GFS/ICON/和风/中央气象台）的逐小时数据，
+  /// 本地聚合即可得到**多源融合**的日最高/最低温、降水总量、降水概率，
+  /// 并能用 `consensusWeatherText`（各源云量中位数）判定天气现象。
+  List<_DailySummary> _dailySummaries() {
+    if (_hourlyForecast.isEmpty) return const [];
+
+    // 按「年-月-日」分组
+    final byDay = <String, List<MultiModelHourly>>{};
+    for (final h in _hourlyForecast) {
+      final k = '${h.time.year}-${h.time.month}-${h.time.day}';
+      byDay.putIfAbsent(k, () => []).add(h);
+    }
+
+    final out = <_DailySummary>[];
+    final keys = byDay.keys.toList()..sort();
+    for (final k in keys) {
+      final list = byDay[k]!..sort((a, b) => a.time.compareTo(b.time));
+
+      // 各源在每个时刻的数值 → 先取该时刻的融合值，再对当天求极值/累计
+      final temps = <double>[];
+      final probs = <int>[];
+      var precipSum = 0.0;
+      final clouds = <double>[];
+
+      for (final m in list) {
+        final t = m.temperature;
+        if (t != null) temps.add(t);
+        final p = m.precipitationProbability;
+        if (p != null) probs.add(p);
+        // ⚠️ 防御性过滤：单小时降水 > 50mm 视为异常数据。
+        // 气象上 50mm/h 已属极端强降水；某些源给的是**日累计值**，
+        // 若被当成小时值累加会出现「日降水上千毫米」的离谱结果
+        // （实测曾遇到中央气象台日累计被逐小时复制，累计达 1185mm）。
+        final rain = m.precipitation ?? 0;
+        if (rain >= 0 && rain <= 50) precipSum += rain;
+        final c = m.cloudCover;
+        if (c != null) clouds.add(c);
+      }
+
+      // 天气现象：优先看当天是否有降水，否则按云量中位数判定
+      final day = list.first.time;
+      final midday = list.firstWhere(
+        (m) => m.time.hour >= 12 && m.time.hour <= 15,
+        orElse: () => list[list.length ~/ 2],
+      );
+      final String? text;
+      final hasRain = precipSum >= 0.5; // 当天累计 >= 0.5mm 视为有降水
+      if (hasRain) {
+        text = midday.toHourlyWeather().weatherText ?? '有雨';
+      } else {
+        text = midday.consensusWeatherText;
+      }
+
+      out.add(_DailySummary(
+        date: day,
+        tempMax: temps.isEmpty ? null : temps.reduce((a, b) => a > b ? a : b),
+        tempMin: temps.isEmpty ? null : temps.reduce((a, b) => a < b ? a : b),
+        precipitationSum: precipSum,
+        precipProbMax: probs.isEmpty ? null : probs.reduce((a, b) => a > b ? a : b),
+        weatherText: text,
+        cloudMedian: midday.consensusCloudCover,
+        sourceCount: midday.sources.length,
+        hours: list.length,
+      ));
+      debugPrint('[逐日聚合] $k 覆盖 ${list.length}h '
+          '降水 ${precipSum.toStringAsFixed(1)}mm '
+          '温度 ${out.last.tempMin?.toStringAsFixed(0)}~${out.last.tempMax?.toStringAsFixed(0)}°');
+    }
+    return out;
   }
 
   /// 加载风云四号卫星云图（看云系，与雷达互补）
@@ -477,7 +588,7 @@ class _LocationScreenState extends State<LocationScreen> {
         lat: center.lat,
         lon: center.lon,
         place: center.name.isEmpty ? '中心' : center.name,
-        forecastDays: 3, // 未来预测需要更多天数
+        forecastDays: 7, // 7 天多源逐小时 → 本地聚合出多源逐日预报
       );
       debugPrint('[多源] 中心点 ${centerMulti.length} 个时刻，'
           '${centerMulti.isEmpty ? 0 : centerMulti.first.sources.length} 源');
@@ -497,17 +608,9 @@ class _LocationScreenState extends State<LocationScreen> {
       debugPrint('[单模型] 方位点失败: $e');
     }
 
-    // 未来逐日预测（7 天）
-    var daily = <DailyWeather>[];
-    try {
-      daily = await _meteo.fetchDaily(
-        lat: center.lat,
-        lon: center.lon,
-        forecastDays: 7,
-      );
-    } catch (e) {
-      debugPrint('[逐日] 失败: $e');
-    }
+    // 注：逐日预报不再调 Open-Meteo 的单源 daily 接口，
+    // 改为从上面的 5 源逐小时数据本地聚合（见 _dailySummaries()），
+    // 这样 7 日预报天然带多源交叉验证。
 
     final now = DateTime.now();
     final samples = <({String label, GeoPoint point, HourlyWeather? weather})>[];
@@ -600,7 +703,6 @@ class _LocationScreenState extends State<LocationScreen> {
       // 多源与未来预测
       _centerMulti = centerMulti.isEmpty ? null : _nearestMulti(centerMulti, now);
       _hourlyForecast = centerMulti;
-      _dailyForecast = daily;
       _verdict = null;
       _result = _AreaResult(
         placeName: center.name.isEmpty ? '所选位置' : center.name,
@@ -787,12 +889,9 @@ class _LocationScreenState extends State<LocationScreen> {
                 (e) => FadeSlideIn(delayMs: e.key * 35, child: e.value),
               ),
 
-        // ===== 未来预测（紧跟地图，便于对着地图看趋势）=====
-        // 面板按 40ms 递增错峰淡入（避免整屏内容同时冒出来）
-        if (_hourlyForecast.isNotEmpty || _dailyForecast.isNotEmpty)
-          FadeSlideIn(delayMs: 40, child: _forecastCard()),
-
         // ===== 多源交叉验证 + 雷达定调（与出行路线页同款逻辑）=====
+        // 注：逐小时预报已并入「区域概览」、7 日逐日已并入「采样点明细」，
+        //     不再单独占一个面板（用户要求把预报分散到这两处）
         if (_centerMulti != null) FadeSlideIn(delayMs: 80, child: _multiSourceCard()),
         if (_verdictLoading || _verdict != null)
           FadeSlideIn(delayMs: 120, child: _radarVerdictCard()),
@@ -870,13 +969,19 @@ class _LocationScreenState extends State<LocationScreen> {
                 _metric('降水概率', r.maxPop == null ? '—' : '${r.maxPop}%'),
               ],
             ),
+            // ===== 未来 12 小时逐小时（多源融合）=====
+            ..._hourlyStrip(),
           ],
         ),
       ),
       PanelCard(
         heading: '采样点明细（中心 + 4 方位）',
         child: Column(
-          children: r.samples.map((s) => _sampleRow(s)).toList(),
+          children: [
+            ...r.samples.map((s) => _sampleRow(s)).toList(),
+            // ===== 未来 7 天逐日（多源聚合，替代原单源 daily 接口）=====
+            ..._dailyStrip(),
+          ],
         ),
       ),
       PanelCard(
@@ -1246,109 +1351,125 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 未来预测面板（逐小时 24h + 逐日 7 天）
-  Widget _forecastCard() {
+  /// 未来 12 小时逐小时条（放进「区域概览」）
+  ///
+  /// 数据来自 5 源多源集合（`_hourlyForecast`），每格显示：
+  /// 时刻 / 天气图标 / 温度 / 降水概率；第一格（当前小时）高亮。
+  List<Widget> _hourlyStrip() {
     final now = DateTime.now();
-    // 只取当前时刻之后的逐小时
-    final hours = _hourlyForecast.where((h) => h.time.isAfter(now.subtract(const Duration(hours: 1)))).toList();
-    final next24 = hours.take(24).toList();
+    final hours = _hourlyForecast
+        .where((h) => h.time.isAfter(now.subtract(const Duration(minutes: 30))))
+        .take(12)
+        .toList();
+    if (hours.isEmpty) return const [];
 
-    return PanelCard(
-      heading: '未来预测 · 逐小时 24h / 逐日 7 天',
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    return [
+      const SizedBox(height: 14),
+      Row(
         children: [
-          // ===== 逐小时（横向滚动）=====
-          if (next24.isNotEmpty) ...[
-            const Text('逐小时',
-                style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 8),
-            SizedBox(
-              height: 108,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: next24.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 6),
-                itemBuilder: (_, i) {
-                  final h = next24[i];
-                  final t = h.temperature;
-                  final pop = h.precipitationProbability;
-                  final rain = h.precipitation ?? 0;
-                  final isNow = i == 0;
-                  return Container(
-                    width: 58,
-                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-                    decoration: BoxDecoration(
-                      color: isNow ? AppTheme.accentDim : AppTheme.bgInset,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: isNow ? AppTheme.accent : AppTheme.borderSoft),
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text('${h.time.hour.toString().padLeft(2, '0')}时',
-                            style: TextStyle(
-                                fontSize: 10.5,
-                                color: isNow ? AppTheme.accent : AppTheme.textFaint,
-                                fontWeight: FontWeight.w600)),
-                        Icon(
-                          rain >= 8
-                              ? Icons.thunderstorm
-                              : (rain >= 2.5
-                                  ? Icons.grain
-                                  : (rain >= 0.1 ? Icons.water_drop_outlined : Icons.cloud_outlined)),
-                          size: 16,
-                          color: rain >= 0.1 ? AppTheme.cyan : AppTheme.textDim,
-                        ),
-                        Text(t == null ? '--' : '${t.round()}°',
-                            style: const TextStyle(
-                                fontSize: 13, color: AppTheme.text, fontWeight: FontWeight.w700)),
-                        Text(pop == null ? '--' : '$pop%',
-                            style: TextStyle(
-                                fontSize: 10,
-                                color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint)),
-                      ],
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
-
-          // ===== 逐日 =====
-          if (_dailyForecast.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            const Text('逐日',
-                style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 6),
-            for (var i = 0; i < _dailyForecast.length; i++) ...[
-              if (i > 0) const Divider(height: 1, color: AppTheme.borderSoft),
-              _dailyRow(_dailyForecast[i], isToday: i == 0),
-            ],
-          ],
+          const Text('未来 12 小时',
+              style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
+          const SizedBox(width: 6),
+          Text('${hours.first.sources.length} 源融合',
+              style: const TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
         ],
       ),
-    );
+      const SizedBox(height: 8),
+      SizedBox(
+        height: 96,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: hours.length,
+          separatorBuilder: (_, __) => const SizedBox(width: 6),
+          itemBuilder: (_, i) {
+            final h = hours[i];
+            final t = h.temperature;
+            final pop = h.precipitationProbability;
+            final rain = h.precipitation ?? 0;
+            final isNow = i == 0;
+            return Container(
+              width: 56,
+              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 3),
+              decoration: BoxDecoration(
+                color: isNow ? AppTheme.accentDim : AppTheme.bgInset,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: isNow ? AppTheme.accent : AppTheme.borderSoft),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('${h.time.hour.toString().padLeft(2, '0')}时',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: isNow ? AppTheme.accent : AppTheme.textFaint,
+                          fontWeight: FontWeight.w600)),
+                  Icon(
+                    rain >= 8
+                        ? Icons.thunderstorm
+                        : (rain >= 2.5
+                            ? Icons.grain
+                            : (rain >= 0.1 ? Icons.water_drop_outlined : Icons.cloud_outlined)),
+                    size: 15,
+                    color: rain >= 0.1 ? AppTheme.cyan : AppTheme.textDim,
+                  ),
+                  Text(t == null ? '--' : '${t.round()}°',
+                      style: const TextStyle(
+                          fontSize: 12.5, color: AppTheme.text, fontWeight: FontWeight.w700)),
+                  Text(pop == null ? '--' : '$pop%',
+                      style: TextStyle(
+                          fontSize: 9.5,
+                          color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint)),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    ];
   }
 
-  Widget _dailyRow(DailyWeather d, {bool isToday = false}) {
-    final dateText = '${d.date.month}/${d.date.day}';
-    final range = '${d.tempMin?.round() ?? '--'}° ~ ${d.tempMax?.round() ?? '--'}°';
-    final pop = d.precipProbabilityMax;
+  /// 未来 7 天逐日条（放进「采样点明细」）
+  ///
+  /// ⚠️ 数据由 [_dailySummaries] **从 5 源逐小时本地聚合**，
+  /// 而非单源的 Open-Meteo `daily` 接口，因此天然带多源交叉验证。
+  List<Widget> _dailyStrip() {
+    final days = _dailySummaries();
+    if (days.isEmpty) return const [];
+
+    return [
+      const Divider(height: 26, color: AppTheme.borderSoft),
+      Row(
+        children: [
+          const Text('未来 7 天',
+              style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
+          const SizedBox(width: 6),
+          Text('${days.first.sourceCount} 源聚合 · 云量共识',
+              style: const TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+        ],
+      ),
+      const SizedBox(height: 4),
+      for (final d in days) _dailyStripRow(d),
+    ];
+  }
+
+  Widget _dailyStripRow(_DailySummary d) {
+    final pop = d.precipProbMax;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 7),
+      padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: [
           SizedBox(
-            width: 66,
+            width: 62,
             child: Row(
               children: [
-                Text(isToday ? '今天' : d.weekday,
+                Text(d.isToday ? '今天' : d.weekday,
                     style: TextStyle(
                         fontSize: 12,
-                        fontWeight: isToday ? FontWeight.w700 : FontWeight.w500,
-                        color: isToday ? AppTheme.accent : AppTheme.text)),
+                        fontWeight: d.isToday ? FontWeight.w700 : FontWeight.w500,
+                        color: d.isToday ? AppTheme.accent : AppTheme.text)),
                 const SizedBox(width: 4),
-                Text(dateText, style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+                Text('${d.date.month}/${d.date.day}',
+                    style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
               ],
             ),
           ),
@@ -1357,28 +1478,38 @@ class _LocationScreenState extends State<LocationScreen> {
                 style: const TextStyle(fontSize: 12, color: AppTheme.textDim),
                 overflow: TextOverflow.ellipsis),
           ),
+          // 日降水总量（有雨才显示）
           SizedBox(
-            width: 40,
-            child: Text(pop == null ? '--' : '$pop%',
+            width: 44,
+            child: Text(
+              d.precipitationSum >= 0.1 ? '${d.precipitationSum.toStringAsFixed(1)}mm' : '',
+              textAlign: TextAlign.right,
+              style: const TextStyle(fontSize: 10, color: AppTheme.cyan),
+            ),
+          ),
+          SizedBox(
+            width: 38,
+            child: Text(pop == null ? '' : '$pop%',
                 textAlign: TextAlign.right,
                 style: TextStyle(
-                    fontSize: 11.5,
+                    fontSize: 11,
                     color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint,
                     fontWeight: FontWeight.w600)),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           SizedBox(
-            width: 78,
-            child: Text(range,
-                textAlign: TextAlign.right,
-                style: const TextStyle(fontSize: 12, color: AppTheme.text, fontWeight: FontWeight.w600)),
+            width: 76,
+            child: Text(
+              '${d.tempMin?.round() ?? '--'}° ~ ${d.tempMax?.round() ?? '--'}°',
+              textAlign: TextAlign.right,
+              style: const TextStyle(fontSize: 12, color: AppTheme.text, fontWeight: FontWeight.w600),
+            ),
           ),
         ],
       ),
     );
   }
 
-  /// 键值行（多源比对用）
   Widget _kvRow(String k, String v) {
     if (v.isEmpty) return const SizedBox.shrink();
     return Padding(

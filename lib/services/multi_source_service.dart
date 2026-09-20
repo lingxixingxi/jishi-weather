@@ -205,6 +205,16 @@ class MultiSourceService {
     // ⚠️ 中央气象台给的是**日最高温 / 夜间最低温**，不是逐小时值，
     // 直接拿最高温去和 Open-Meteo 的逐小时温度比会系统性偏高。
     // 这里按日温变化规律插值到目标时刻（最低 05 时、最高 14 时）。
+    //
+    // ⚠️⚠️ 降水**必须置空**：
+    // `NmcDailyForecast.precipitation` 是**该日的累计降水量**，
+    // 而本函数是「给某一小时生成一条 ModelForecast」——
+    // 若直接透传，同一个日累计值会被复制到 24 个小时上，
+    // 日累加时就变成「日累计 × 24」的爆炸值。
+    // 实测曾出现：中央气象台 1185.6mm/日（= 49.4mm × 24），
+    // 把 7 日预报的降水总量整体拉高近 20 倍。
+    // 中央气象台没有小时粒度的降水预报，因此这里不提供降水，
+    // 逐小时降水交由 Open-Meteo 三源 + 和风负责。
     final f = wx.forecastAt(t);
     final temp = _diurnalTemp(f?.dayTemp, f?.nightTemp, t.hour) ?? wx.temperature;
     final text = (t.hour >= 6 && t.hour < 18) ? f?.dayText : f?.nightText;
@@ -213,7 +223,7 @@ class MultiSourceService {
       displayName: '中央气象台',
       temperature: temp,
       humidity: wx.humidity,
-      precipitation: f?.precipitation,
+      precipitation: null, // ← 日累计值不可当小时值（见上方说明）
       weatherText: text ?? wx.weatherText,
       isObservation: false,
     ).enriched();
