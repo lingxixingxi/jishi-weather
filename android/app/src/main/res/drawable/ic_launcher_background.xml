@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  启动图标背景层
+  与 App 的深色航空底一致：上浅下深的纵向渐变
+  （自适应图标的背景层会被系统裁成圆形 / 圆角方形 / 方形，故用满幅渐变）
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#151C28"
+        android:endColor="#0A0E14"
+        android:type="linear" />
+</shape>

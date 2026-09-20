@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  迹时天气 · 自适应启动图标（Android 8.0+ / minSdk 26 全覆盖）
+  · 前景层：云 + 太阳 + 轨迹（线条已加粗，透明底，内容落在中心安全区内）
+  · 背景层：与 logo-final.svg 一致的纵向渐变 + 太阳处的琥珀光晕（PNG）
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@mipmap/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

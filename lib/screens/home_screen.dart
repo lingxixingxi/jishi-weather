@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
+import '../widgets/app_logo.dart';
 import 'location_screen.dart';
 import 'photo_screen.dart';
 import 'route_screen.dart';
@@ -148,7 +149,7 @@ class ScreenScaffold extends StatelessWidget {
                         border: Border.all(color: AppTheme.accent.withValues(alpha: .55)),
                       ),
                       child: const Text(
-                        '0.1.3 内测 · 禁止外传',
+                        '0.1.4 内测 · 禁止外传',
                         style: TextStyle(
                             fontSize: 9, color: AppTheme.accent, fontWeight: FontWeight.w700),
                       ),
@@ -177,16 +178,7 @@ class _Logo extends StatelessWidget {
   const _Logo();
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 9,
-      height: 9,
-      decoration: BoxDecoration(
-        color: AppTheme.accent,
-        borderRadius: BorderRadius.circular(2),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => const AppLogo(size: 28);
 }
 
 /// 统一的面板卡片
