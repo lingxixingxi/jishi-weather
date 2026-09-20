@@ -197,6 +197,17 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 未来逐小时预测（取中心点，5 源）
   List<MultiModelHourly> _hourlyForecast = const [];
 
+  /// **概览当前选中的时刻**（null = 跟随当前时间）
+  ///
+  /// 点选「未来 12 小时」中的某一格即可切换，此时：
+  /// · 区域概览 → 显示该时刻的中心数值
+  /// · 采样点明细 → 中心与 4 方位都取该时刻
+  /// · 多源研判 → 换到该时刻的 5 源集合
+  DateTime? _selectedTime;
+
+  /// 4 个方位点的逐小时预报（与中心同长度，供采样明细按时刻取值）
+  List<List<HourlyWeather>> _altHourly = const [];
+
   bool _loading = false;
   String? _error;
   _AreaResult? _result;
@@ -330,6 +341,117 @@ class _LocationScreenState extends State<LocationScreen> {
           '温度 ${out.last.tempMin?.toStringAsFixed(0)}~${out.last.tempMax?.toStringAsFixed(0)}°');
     }
     return out;
+  }
+
+  /// 当前生效的**中心多源集合**（选中时刻优先，未选则当前时刻）
+  ///
+  /// 用户在「未来 12 小时」里点选某格后，概览 / 明细 / 多源研判
+  /// 三处都会切到这个时刻，保证数值口径一致。
+  MultiModelHourly? get _activeMulti {
+    final t = _selectedTime;
+    if (t == null || _hourlyForecast.isEmpty) return _centerMulti;
+    MultiModelHourly? best;
+    var bestDiff = const Duration(days: 999).inMinutes;
+    for (final m in _hourlyForecast) {
+      final d = m.time.difference(t).inMinutes.abs();
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = m;
+      }
+    }
+    return best ?? _centerMulti;
+  }
+
+  /// 选中时刻是否就是「当前」（用于决定是否显示定调后的最优源）
+  bool get _isNowSelected => _selectedTime == null;
+
+  /// 取某方位点在给定时刻的预报（无选中时刻则用当前时间）
+  HourlyWeather? _altAt(int index, DateTime t) {
+    if (index < 0 || index >= _altHourly.length) return null;
+    return _nearest(_altHourly[index], t);
+  }
+
+  /// 当前应显示的时间点
+  DateTime get _activeTime => _selectedTime ?? DateTime.now();
+
+  /// 区域概览的「中心天气」块
+  ///
+  /// · 未选未来时刻 → 显示雷达定调最优源的值，并注明数据性质
+  /// · 已选未来时刻 → 显示该时刻的 5 源融合值（与多源研判面板口径一致）
+  Widget? _centerBlock(_AreaResult r) {
+    final sel = _selectedTime;
+    final mm = _activeMulti;
+
+    final HourlyWeather? cw;
+    final String sourceNote;
+    if (sel == null) {
+      cw = r.effectiveCenter;
+      sourceNote = r.adoptedSource == null
+          ? '多源融合'
+          : '数值取自${r.adoptedSource}（雷达定调最优源）；天气现象由各源云量共识判定';
+    } else {
+      cw = mm?.toHourlyWeather(source: '5 源融合');
+      sourceNote = '未来 ${sel.hour.toString().padLeft(2, '0')}:00 · '
+          '${mm?.sources.length ?? 0} 源融合（与多源研判同步）';
+    }
+    if (cw == null) return null;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(sel == null ? Icons.place : Icons.schedule,
+                size: 15, color: sel == null ? AppTheme.cyan : AppTheme.accent),
+            const SizedBox(width: 6),
+            Text(
+              '${sel == null ? '中心' : '${sel.hour.toString().padLeft(2, '0')}时'} '
+              '${cw.weatherText ?? '—'} '
+              '${cw.temperature?.toStringAsFixed(1) ?? '--'}°',
+              style: TextStyle(
+                  fontSize: 13,
+                  color: sel == null ? AppTheme.text : AppTheme.accent,
+                  fontWeight: FontWeight.w600),
+            ),
+            const Spacer(),
+            Text(
+              '降水 ${cw.precipitationProbability ?? '--'}%'
+              '${cw.visibility == null ? '' : ' · 能见度 ${cw.visibility!.toStringAsFixed(1)}km'}',
+              style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim),
+            ),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 5, left: 21),
+          child: Text(sourceNote,
+              style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+        ),
+      ],
+    );
+  }
+
+  /// 选中未来时刻后，把**雷达定调**同步到该时刻
+  ///
+  /// 雷达回波外推的有效时限约 2 小时（[RadarService.forecastMaxMinutes]）：
+  /// · 该时刻在时限内 → 用「距今分钟数」作为外推提前量重跑一次
+  /// · 超出时限       → 不重跑（界面会标注「超出雷达外推范围」，
+  ///                    此时该时段的判断应以数值模式为准）
+  Future<void> _syncRadarToSelected(DateTime? t) async {
+    final center = _result?.center;
+    if (center == null || _hourlyForecast.isEmpty) return;
+
+    if (t == null) {
+      // 回到「当前」→ 恢复默认外推时长
+      await _runLocationVerdict(center, _hourlyForecast);
+      return;
+    }
+    final lead = t.difference(DateTime.now()).inMinutes;
+    if (lead <= 0) {
+      await _runLocationVerdict(center, _hourlyForecast);
+    } else if (lead <= RadarService.forecastMaxMinutes) {
+      await _runLocationVerdict(center, _hourlyForecast, horizonOverride: lead);
+    }
+    // 超出外推时限：保持原结果，由 UI 标注不可用
   }
 
   /// 加载风云四号卫星云图（看云系，与雷达互补）
@@ -597,12 +719,13 @@ class _LocationScreenState extends State<LocationScreen> {
     }
 
     // 四方位点用单模型（省流量，只做方位差异对比）
+    // 注意：也要拉 7 天，这样采样明细能跟随「未来小时」的选择切到同一时刻
     final others = points.where((p) => p.label != '中心').toList();
     var otherForecasts = <List<HourlyWeather>>[];
     try {
       otherForecasts = await _meteo.fetchMany(
         others.map((p) => (lat: p.point.lat, lon: p.point.lon, place: p.label)).toList(),
-        forecastDays: 1,
+        forecastDays: 7,
       );
     } catch (e) {
       debugPrint('[单模型] 方位点失败: $e');
@@ -703,6 +826,8 @@ class _LocationScreenState extends State<LocationScreen> {
       // 多源与未来预测
       _centerMulti = centerMulti.isEmpty ? null : _nearestMulti(centerMulti, now);
       _hourlyForecast = centerMulti;
+      _altHourly = otherForecasts;
+      _selectedTime = null; // 换地点后回到「当前时刻」
       _verdict = null;
       _result = _AreaResult(
         placeName: center.name.isEmpty ? '所选位置' : center.name,
@@ -740,7 +865,17 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 跑雷达定调（用中心点的实况与各源预测比对）
-  Future<void> _runLocationVerdict(GeoPoint center, List<MultiModelHourly> multi) async {
+  /// 跑雷达定调
+  ///
+  /// [horizonOverride] 指定外推提前量（分钟）。用户在「未来 12 小时」里
+  /// 点选某格时会传入「该时刻距今的分钟数」：
+  /// · ≤ [RadarService.forecastMaxMinutes]（120）→ 用该时长做回波外推
+  /// · > 120 → 雷达外推已不可靠，界面会标注「超出雷达外推范围」
+  Future<void> _runLocationVerdict(
+    GeoPoint center,
+    List<MultiModelHourly> multi, {
+    int? horizonOverride,
+  }) async {
     final path = _multi.lastRadarPath;
     final nowMulti = _nearestMulti(multi, DateTime.now());
     if (path == null || nowMulti == null) return;
@@ -752,6 +887,7 @@ class _LocationScreenState extends State<LocationScreen> {
         lon: center.lon,
         models: [nowMulti],
         radarPath: path,
+        horizonOverride: horizonOverride,
       );
       if (!mounted) return;
       setState(() {
@@ -889,9 +1025,13 @@ class _LocationScreenState extends State<LocationScreen> {
                 (e) => FadeSlideIn(delayMs: e.key * 35, child: e.value),
               ),
 
+        // ===== 未来 7 天预报（独立卡片，紧跟地图，便于对着地图看趋势）=====
+        if (_hourlyForecast.isNotEmpty)
+          FadeSlideIn(delayMs: 40, child: _dailyCard()),
+
         // ===== 多源交叉验证 + 雷达定调（与出行路线页同款逻辑）=====
-        // 注：逐小时预报已并入「区域概览」、7 日逐日已并入「采样点明细」，
-        //     不再单独占一个面板（用户要求把预报分散到这两处）
+        // 注：逐小时预报已并入「区域概览」（可点选切换时刻），
+        //     采样点明细与多源研判会跟随该时刻同步切换
         if (_centerMulti != null) FadeSlideIn(delayMs: 80, child: _multiSourceCard()),
         if (_verdictLoading || _verdict != null)
           FadeSlideIn(delayMs: 120, child: _radarVerdictCard()),
@@ -930,36 +1070,12 @@ class _LocationScreenState extends State<LocationScreen> {
             const SizedBox(height: 2),
             Text('${r.center.lat.toStringAsFixed(4)}, ${r.center.lon.toStringAsFixed(4)}',
                 style: const TextStyle(fontSize: 11.5, color: AppTheme.textFaint)),
-            // 中心点实况（雷达定调后改用最优源）
-            if (r.effectiveCenter != null) ...[
+            // 中心点天气
+            // · 未选时刻 → 用雷达定调后的最优源值（r.effectiveCenter）
+            // · 已选未来时刻 → 用该时刻的 5 源融合值（多源研判同步切换）
+            if (_centerBlock(r) != null) ...[
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  const Icon(Icons.place, size: 15, color: AppTheme.cyan),
-                  const SizedBox(width: 6),
-                  Text(
-                    '中心 ${r.effectiveCenter!.weatherText ?? '—'} '
-                    '${r.effectiveCenter!.temperature?.toStringAsFixed(1) ?? '--'}°',
-                    style: const TextStyle(
-                        fontSize: 13, color: AppTheme.text, fontWeight: FontWeight.w600),
-                  ),
-                  const Spacer(),
-                  Text(
-                    '降水 ${r.effectiveCenter!.precipitationProbability ?? '--'}%'
-                    '${r.effectiveCenter!.visibility == null ? '' : ' · 能见度 ${r.effectiveCenter!.visibility!.toStringAsFixed(1)}km'}',
-                    style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim),
-                  ),
-                ],
-              ),
-              // 说明数据性质：数值取最优源，天气现象取多源共识
-              if (r.adoptedSource != null)
-                const Padding(
-                  padding: EdgeInsets.only(top: 5, left: 21),
-                  child: Text(
-                    '数值取自雷达定调最优源；天气现象由各源云量共识判定',
-                    style: TextStyle(fontSize: 10, color: AppTheme.textFaint),
-                  ),
-                ),
+              _centerBlock(r)!,
             ],
             const SizedBox(height: 14),
             Row(
@@ -978,12 +1094,39 @@ class _LocationScreenState extends State<LocationScreen> {
         heading: '采样点明细（中心 + 4 方位）',
         child: Column(
           children: [
-            ...r.samples.map((s) => _sampleRow(s)).toList(),
-            // ===== 未来 7 天逐日（多源聚合，替代原单源 daily 接口）=====
-            ..._dailyStrip(),
+            // 选中的未来时刻提示（明细数据会跟随切换）
+            if (_selectedTime != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  children: [
+                    const Icon(Icons.schedule, size: 13, color: AppTheme.accent),
+                    const SizedBox(width: 5),
+                    Text(
+                      '已同步到 ${_selectedTime!.month}/${_selectedTime!.day} '
+                      '${_selectedTime!.hour.toString().padLeft(2, '0')}:00',
+                      style: const TextStyle(
+                          fontSize: 11, color: AppTheme.accent, fontWeight: FontWeight.w600),
+                    ),
+                    const Spacer(),
+                    GestureDetector(
+                      onTap: () => setState(() => _selectedTime = null),
+                      child: const Text('回到当前',
+                          style: TextStyle(fontSize: 10.5, color: AppTheme.textDim)),
+                    ),
+                  ],
+                ),
+              ),
+            // 索引 0 = 中心；1..4 = 北/南/东/西，对应 _altHourly 的下标
+            ...r.samples.asMap().entries.map((e) {
+              final s = e.value;
+              final altIndex = s.label == '中心' ? -1 : e.key - 1;
+              return _sampleRow(s, altIndex: altIndex);
+            }),
           ],
         ),
       ),
+      // 7 天预报独立成卡片（放在地图下方，见 build 里的 _dailyCard）
       PanelCard(
         heading: '地图 · 天气叠加',
         padding: const EdgeInsets.all(12),
@@ -1201,10 +1344,18 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 多源交叉验证面板（5 源并列 + 一致性评分）
+  ///
+  /// 数据源为 [_activeMulti] —— 会跟随「未来 12 小时」里选中的时刻切换，
+  /// 保证概览 / 明细 / 研判三处口径一致。
   Widget _multiSourceCard() {
-    final mm = _centerMulti!;
+    final mm = _activeMulti;
+    if (mm == null) return const SizedBox.shrink();
+    final isFuture = _selectedTime != null;
     return PanelCard(
-      heading: '多源研判 · ${mm.sources.length} 源交叉验证',
+      heading: isFuture
+          ? '多源研判 · ${mm.time.month}/${mm.time.day} '
+              '${mm.time.hour.toString().padLeft(2, '0')}:00（${mm.sources.length} 源）'
+          : '多源研判 · ${mm.sources.length} 源交叉验证',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1257,11 +1408,34 @@ class _LocationScreenState extends State<LocationScreen> {
     }
     final v = _verdict!;
     final r = v.radar;
+    // 选中的未来时刻是否超出雷达外推时限（约 2 小时）
+    final selLead = _selectedTime?.difference(DateTime.now()).inMinutes;
+    final radarOutOfRange =
+        selLead != null && selLead > RadarService.forecastMaxMinutes;
+
     return PanelCard(
-      heading: '雷达定调 · 真实回波校验',
+      heading: _selectedTime == null
+          ? '雷达定调 · 真实回波校验'
+          : '雷达定调 · ${_selectedTime!.hour.toString().padLeft(2, '0')}:00 外推',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // 选中时刻超出雷达外推能力时的说明
+          if (radarOutOfRange)
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+              decoration: BoxDecoration(
+                color: AppTheme.bgInset,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.textFaint),
+              ),
+              child: const Text(
+                '该时刻距今超过 2 小时，超出雷达回波外推范围（外推在 30~60 分钟最可靠）。'
+                '此时以数值模式的 5 源研判为准。',
+                style: TextStyle(fontSize: 11, color: AppTheme.textDim, height: 1.4),
+              ),
+            ),
           if (v.arbitrationUsed)
             Container(
               margin: const EdgeInsets.only(bottom: 10),
@@ -1362,8 +1536,9 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 未来预测面板（逐小时 24h + 逐日 7 天）
   /// 未来 12 小时逐小时条（放进「区域概览」）
   ///
-  /// 数据来自 5 源多源集合（`_hourlyForecast`），每格显示：
-  /// 时刻 / 天气图标 / 温度 / 降水概率；第一格（当前小时）高亮。
+  /// 数据来自 5 源多源集合（`_hourlyForecast`）。
+  /// **每格可点选**：选中后区域概览、采样点明细、多源研判都会切到该时刻；
+  /// 再次点选同一格可取消（回到「当前」）。
   List<Widget> _hourlyStrip() {
     final now = DateTime.now();
     final hours = _hourlyForecast
@@ -1381,6 +1556,14 @@ class _LocationScreenState extends State<LocationScreen> {
           const SizedBox(width: 6),
           Text('${hours.first.sources.length} 源融合',
               style: const TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+          const Spacer(),
+          Text(
+            _selectedTime == null ? '点选可切换时刻' : '已选 ${_selectedTime!.hour.toString().padLeft(2, '0')}:00 · 再点取消',
+            style: TextStyle(
+                fontSize: 9.5,
+                color: _selectedTime == null ? AppTheme.textFaint : AppTheme.accent,
+                fontWeight: _selectedTime == null ? FontWeight.w400 : FontWeight.w600),
+          ),
         ],
       ),
       const SizedBox(height: 8),
@@ -1396,39 +1579,59 @@ class _LocationScreenState extends State<LocationScreen> {
             final pop = h.precipitationProbability;
             final rain = h.precipitation ?? 0;
             final isNow = i == 0;
-            return Container(
-              width: 56,
-              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 3),
-              decoration: BoxDecoration(
-                color: isNow ? AppTheme.accentDim : AppTheme.bgInset,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: isNow ? AppTheme.accent : AppTheme.borderSoft),
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text('${h.time.hour.toString().padLeft(2, '0')}时',
-                      style: TextStyle(
-                          fontSize: 10,
-                          color: isNow ? AppTheme.accent : AppTheme.textFaint,
-                          fontWeight: FontWeight.w600)),
-                  Icon(
-                    rain >= 8
-                        ? Icons.thunderstorm
-                        : (rain >= 2.5
-                            ? Icons.grain
-                            : (rain >= 0.1 ? Icons.water_drop_outlined : Icons.cloud_outlined)),
-                    size: 15,
-                    color: rain >= 0.1 ? AppTheme.cyan : AppTheme.textDim,
+            // 选中判定：按小时匹配（选中时刻可能带分钟）
+            final selected = _selectedTime != null &&
+                _selectedTime!.year == h.time.year &&
+                _selectedTime!.month == h.time.month &&
+                _selectedTime!.day == h.time.day &&
+                _selectedTime!.hour == h.time.hour;
+            final hl = selected || (isNow && _selectedTime == null);
+
+            return GestureDetector(
+              onTap: () {
+                final next = selected ? null : h.time;
+                setState(() => _selectedTime = next);
+                _syncRadarToSelected(next);
+              },
+              child: Container(
+                width: 56,
+                padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 3),
+                decoration: BoxDecoration(
+                  color: hl ? AppTheme.accentDim : AppTheme.bgInset,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: selected
+                        ? AppTheme.accent
+                        : (isNow && _selectedTime == null ? AppTheme.accent : AppTheme.borderSoft),
+                    width: selected ? 2 : 1,
                   ),
-                  Text(t == null ? '--' : '${t.round()}°',
-                      style: const TextStyle(
-                          fontSize: 12.5, color: AppTheme.text, fontWeight: FontWeight.w700)),
-                  Text(pop == null ? '--' : '$pop%',
-                      style: TextStyle(
-                          fontSize: 9.5,
-                          color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint)),
-                ],
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('${h.time.hour.toString().padLeft(2, '0')}时',
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: hl ? AppTheme.accent : AppTheme.textFaint,
+                            fontWeight: FontWeight.w600)),
+                    Icon(
+                      rain >= 8
+                          ? Icons.thunderstorm
+                          : (rain >= 2.5
+                              ? Icons.grain
+                              : (rain >= 0.1 ? Icons.water_drop_outlined : Icons.cloud_outlined)),
+                      size: 15,
+                      color: rain >= 0.1 ? AppTheme.cyan : AppTheme.textDim,
+                    ),
+                    Text(t == null ? '--' : '${t.round()}°',
+                        style: const TextStyle(
+                            fontSize: 12.5, color: AppTheme.text, fontWeight: FontWeight.w700)),
+                    Text(pop == null ? '--' : '$pop%',
+                        style: TextStyle(
+                            fontSize: 9.5,
+                            color: (pop ?? 0) >= 50 ? AppTheme.cyan : AppTheme.textFaint)),
+                  ],
+                ),
               ),
             );
           },
@@ -1437,28 +1640,33 @@ class _LocationScreenState extends State<LocationScreen> {
     ];
   }
 
-  /// 未来 7 天逐日条（放进「采样点明细」）
+  /// 未来 7 天逐日（**独立卡片**，放在地图下方）
   ///
   /// ⚠️ 数据由 [_dailySummaries] **从 5 源逐小时本地聚合**，
   /// 而非单源的 Open-Meteo `daily` 接口，因此天然带多源交叉验证。
-  List<Widget> _dailyStrip() {
+  Widget _dailyCard() {
     final days = _dailySummaries();
-    if (days.isEmpty) return const [];
+    if (days.isEmpty) return const SizedBox.shrink();
 
-    return [
-      const Divider(height: 26, color: AppTheme.borderSoft),
-      Row(
+    return PanelCard(
+      heading: '未来 7 天预报',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('未来 7 天',
-              style: TextStyle(fontSize: 11, color: AppTheme.textFaint, fontWeight: FontWeight.w700)),
-          const SizedBox(width: 6),
-          Text('${days.first.sourceCount} 源聚合 · 云量共识',
-              style: const TextStyle(fontSize: 9.5, color: AppTheme.textFaint)),
+          Row(
+            children: [
+              Text('${days.first.sourceCount} 源聚合',
+                  style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+              const SizedBox(width: 8),
+              const Text('天气现象由各源云量共识判定',
+                  style: TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          for (final d in days) _dailyStripRow(d),
         ],
       ),
-      const SizedBox(height: 4),
-      for (final d in days) _dailyStripRow(d),
-    ];
+    );
   }
 
   Widget _dailyStripRow(_DailySummary d) {
@@ -1874,12 +2082,24 @@ class _LocationScreenState extends State<LocationScreen> {
     }
   }
 
-  Widget _sampleRow(({String label, GeoPoint point, HourlyWeather? weather}) s) {
-    // 中心行：雷达定调判出最优源后，改用该源的值（与区域概览一致）
+  Widget _sampleRow(
+    ({String label, GeoPoint point, HourlyWeather? weather}) s, {
+    int altIndex = -1,
+  }) {
     final isCenter = s.label == '中心';
+    final sel = _selectedTime;
     final adopted = _result?.adoptedSource;
-    final useAdopted = isCenter && adopted != null && _result?.effectiveCenter != null;
-    final w = useAdopted ? _result!.effectiveCenter : s.weather;
+    // 只有「当前时刻」才用雷达定调的最优源；选了未来时刻则改用该时刻的融合值
+    final useAdopted =
+        sel == null && isCenter && adopted != null && _result?.effectiveCenter != null;
+
+    final HourlyWeather? w;
+    if (sel != null) {
+      // 已选未来时刻：中心取 5 源融合，4 个方位取各自单模型同时刻
+      w = isCenter ? _activeMulti?.toHourlyWeather(source: '5 源融合') : _altAt(altIndex, sel);
+    } else {
+      w = useAdopted ? _result!.effectiveCenter : s.weather;
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),

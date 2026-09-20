@@ -133,10 +133,14 @@ class RadarVerdict {
 class RadarVerdictEngine {
   RadarVerdictEngine._();
 
-  /// 外推时间窗（分钟）
+  /// 默认外推时间窗（分钟）
   static const int horizonMinutes = 60;
 
   /// 综合判定
+  ///
+  /// [horizonOverride] 可指定外推提前量（分钟）。用户在地点查询页
+  /// 点选「未来 12 小时」中的某一格时，会传入「该时刻距今的分钟数」，
+  /// 从而给出**对应那个时刻**的回波外推预测。
   static Future<RadarVerdict> judge({
     required double lat,
     required double lon,
@@ -144,6 +148,7 @@ class RadarVerdictEngine {
     String? radarPath,
     int frameCount = 3,
     Duration timeout = const Duration(seconds: 25),
+    int? horizonOverride,
   }) async {
     if (radarPath == null || radarPath.isEmpty) {
       return const RadarVerdict(summary: '无雷达数据');
@@ -156,6 +161,7 @@ class RadarVerdictEngine {
         models: models,
         radarPath: radarPath,
         frameCount: frameCount,
+        horizonMinutes: horizonOverride ?? horizonMinutes,
       ).timeout(timeout);
     } catch (e) {
       return RadarVerdict(summary: '雷达分析失败: $e');
@@ -168,6 +174,7 @@ class RadarVerdictEngine {
     required List<MultiModelHourly> models,
     required String radarPath,
     required int frameCount,
+    required int horizonMinutes,
   }) async {
     // 1. 拉最近几帧
     final frames = await RadarService.fetchRecentFrames(
