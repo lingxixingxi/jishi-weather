@@ -3,7 +3,9 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
-/// 台风信息
+import '../models/typhoon_track.dart';
+
+/// 台风信息（列表项，仅摘要；完整路径见 [TyphoonDetail]）
 class Typhoon {
   final String id;
   final String nameEn;
@@ -198,29 +200,191 @@ class NmcService {
   // ==================== 台风 ====================
 
   /// 台风列表
+  ///
+  /// ⚠️ 实测列表项 8 字段（2026-09-20 抓取）：
+  /// `[id, nameEn, nameCn, number, number, null|编号, 名字含义, status]`
+  ///
+  /// - `status` 在 **index 7**；早期代码取 index 6（「名字含义」，如「杜鹃花」）
+  ///   导致 `isActive` **恒为 false**，活跃台风被当成停编。
+  /// - 列表**不含**独立强度等级字段；无名台风（nameless）会把等级直接写在
+  ///   `nameCn`（如「热带低压」），此时视为等级。
   Future<List<Typhoon>> typhoonList() async {
     final body = await _get(_typhoonList);
     final json = _stripJsonp(body, doubleParen: true);
     final list = (json['typhoonList'] as List?) ?? const [];
     final out = <Typhoon>[];
     for (final item in list) {
-      if (item is! List || item.length < 6) continue;
+      if (item is! List || item.length < 8) continue;
+      final nameCn = '${item[2]}';
       out.add(Typhoon(
         id: '${item[0]}',
         nameEn: '${item[1]}',
-        nameCn: '${item[2]}',
+        nameCn: nameCn,
         number: '${item[3]}',
-        status: '${item[6] ?? ''}',
-        level: item.length > 4 ? '${item[4]}' : null,
+        status: '${item[7] ?? ''}',
+        level: TyphoonLevel.isLevelText(nameCn) ? nameCn : null,
       ));
     }
     return out;
   }
 
-  /// 台风详情（含路径点与多机构预报）
+  /// 台风详情原始 JSON（含路径点与多机构预报）
   Future<Map<String, dynamic>> typhoonDetail(String id) async {
     final body = await _get('$_typhoonView$id');
     return _stripJsonp(body, doubleParen: false);
+  }
+
+  /// 台风完整路径（实况 + 预报），已解析为模型
+  ///
+  /// 预报取**多机构**中的优先级最高者（BABJ 中央气象台 > RJTD 日本 >
+  /// KWBC 美国 > …），挂在最后一个实况点的 `[11]` 字段上。
+  Future<TyphoonDetail> typhoonTrack(String id) async {
+    final json = await typhoonDetail(id);
+    final arr = json['typhoon'];
+    if (arr is! List || arr.length < 9) {
+      throw Exception('台风详情结构异常（id=$id）');
+    }
+
+    double? n(dynamic v) {
+      if (v == null) return null;
+      if (v is num) return v.toDouble();
+      return double.tryParse('$v');
+    }
+
+    // "202609200300" → DateTime(2026,9,20,3,0)
+    DateTime? parseT(dynamic v) {
+      final s = '$v'.trim();
+      if (s.length < 12) return null;
+      final y = int.tryParse(s.substring(0, 4));
+      final mo = int.tryParse(s.substring(4, 6));
+      final d = int.tryParse(s.substring(6, 8));
+      final h = int.tryParse(s.substring(8, 10));
+      final mi = int.tryParse(s.substring(10, 12));
+      if (y == null || mo == null || d == null || h == null || mi == null) return null;
+      return DateTime(y, mo, d, h, mi);
+    }
+
+    List<TyphoonWindCircle> circles(dynamic raw) {
+      final out = <TyphoonWindCircle>[];
+      if (raw is! List) return out;
+      for (final w in raw) {
+        if (w is! List || w.length < 5) continue;
+        out.add(TyphoonWindCircle(
+          name: '${w[0]}',
+          ne: n(w[1]) ?? 0,
+          se: n(w[2]) ?? 0,
+          sw: n(w[3]) ?? 0,
+          nw: n(w[4]) ?? 0,
+        ));
+      }
+      return out;
+    }
+
+    // ===== 实况路径 =====
+    final observed = <TyphoonPoint>[];
+    final rawPts = arr[8];
+    if (rawPts is List) {
+      for (final p in rawPts) {
+        if (p is! List || p.length < 6) continue;
+        final t = parseT(p[1]);
+        final lat = n(p[5]);
+        final lon = n(p[4]);
+        if (t == null || lat == null || lon == null) continue;
+        observed.add(TyphoonPoint(
+          time: t,
+          lat: lat,
+          lon: lon,
+          pressure: n(p[6]),
+          windSpeed: n(p[7]),
+          levelCode: p.length > 3 ? '${p[3]}' : null,
+          moveDir: p.length > 8 ? '${p[8]}' : null,
+          moveSpeed: n(p.length > 9 ? p[9] : null),
+          windCircles: circles(p.length > 10 ? p[10] : null),
+        ));
+      }
+      observed.sort((a, b) => a.time.compareTo(b.time));
+    }
+
+    // ===== 预报路径（回溯找最后一个带预报的实况点）=====
+    //
+    // ⚠️ 实测坑：预报点数组里 **f[1] 是所有预报点共用的「基准时刻」**
+    // （等于挂载实况点的时刻），真正的外推时刻 = 基准时刻 + f[0]（时效小时）。
+    // 早期直接用 f[1] 会让 5 个预报点全部显示成同一时间。
+    Map<dynamic, dynamic>? agencies;
+    DateTime? attachTime;
+    if (rawPts is List) {
+      for (var i = rawPts.length - 1; i >= 0; i--) {
+        final p = rawPts[i];
+        if (p is List && p.length > 11 && p[11] is Map && (p[11] as Map).isNotEmpty) {
+          agencies = p[11] as Map;
+          attachTime = parseT(p[1]);
+          break;
+        }
+      }
+    }
+
+    final forecast = <TyphoonPoint>[];
+    String? agencyName;
+    if (agencies != null) {
+      const prefer = ['BABJ', 'RJTD', 'KWBC', 'PGTW', 'RKSL', 'VHHH'];
+      String? pick;
+      for (final a in prefer) {
+        if (agencies.containsKey(a)) {
+          pick = a;
+          break;
+        }
+      }
+      pick ??= '${agencies.keys.first}';
+      final list = agencies[pick];
+      if (list is List) {
+        for (final f in list) {
+          if (f is! List || f.length < 5) continue;
+          final lead = n(f[0])?.round();
+          // 用「基准时刻 + 时效」推算预报时刻（见上方说明）
+          final t = (attachTime != null && lead != null)
+              ? attachTime.add(Duration(hours: lead))
+              : parseT(f[1]);
+          final lat = n(f[3]);
+          final lon = n(f[2]);
+          if (t == null || lat == null || lon == null) continue;
+          forecast.add(TyphoonPoint(
+            time: t,
+            lat: lat,
+            lon: lon,
+            pressure: n(f[4]),
+            windSpeed: n(f[5]),
+            levelCode: f.length > 7 ? '${f[7]}' : null,
+            isForecast: true,
+            agency: pick,
+            leadHours: lead,
+          ));
+        }
+        forecast.sort((a, b) => a.time.compareTo(b.time));
+        agencyName = TyphoonLevel.agencyText(pick);
+      }
+    }
+
+    // ===== 更新时间：最后一个实况点的 [12] =====
+    String? updated;
+    if (rawPts is List && rawPts.isNotEmpty) {
+      final last = rawPts.last;
+      if (last is List && last.length > 12 && last[12] is List) {
+        final u = last[12] as List;
+        if (u.length > 1) updated = '${u[1]}';
+      }
+    }
+
+    return TyphoonDetail(
+      id: '${arr[0]}',
+      nameEn: '${arr[1]}',
+      nameCn: '${arr[2]}',
+      number: '${arr[3]}',
+      status: '${arr.length > 7 ? arr[7] : ''}',
+      observed: observed,
+      forecast: forecast,
+      forecastAgency: agencyName,
+      updatedAt: updated,
+    );
   }
 
   // ==================== 城市 ====================

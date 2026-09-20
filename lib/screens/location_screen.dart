@@ -8,10 +8,10 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:x_amap_base/x_amap_base.dart';
 
-import '../models/hourly_weather.dart';
-import '../services/amap_location_service.dart';
 import '../engine/radar_verdict.dart';
 import '../models/hourly_weather.dart';
+import '../models/weather_warning.dart';
+import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
 import '../services/multi_source_service.dart';
 import '../services/nmc_city_repository.dart';
@@ -20,6 +20,7 @@ import '../services/open_meteo.dart';
 import '../services/radar_service.dart';
 import '../services/rainviewer_service.dart';
 import '../services/satellite_service.dart';
+import '../services/warning_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
 import '../widgets/fade_slide_in.dart';
@@ -44,6 +45,10 @@ class _AreaResult {
   /// 中心点最终采用的天气（最优源的值；null 表示用多源融合值）
   final HourlyWeather? centerWeather;
 
+  /// 中心点所在**行政区划码**（6 位，高德逆地理编码所得）
+  /// 气象预警按它做前缀匹配过滤
+  final String? adcode;
+
   const _AreaResult({
     required this.placeName,
     required this.center,
@@ -54,6 +59,7 @@ class _AreaResult {
     this.maxPop,
     this.adoptedSource,
     this.centerWeather,
+    this.adcode,
   });
 
   /// 中心点生效的天气（优先最优源，否则取 samples 里的中心）
@@ -76,6 +82,7 @@ class _AreaResult {
         maxPop: maxPop,
         adoptedSource: source,
         centerWeather: weather,
+        adcode: adcode,
       );
 }
 
@@ -241,6 +248,12 @@ class _LocationScreenState extends State<LocationScreen> {
   String? _satelliteInfo;
   bool _satelliteLoading = false;
 
+  /// 气象预警（中央气象台 findAlarm，按 adcode 过滤）
+  final _warnings = WarningService();
+  List<WeatherWarning> _warningList = const [];
+  bool _warningLoading = false;
+  String? _warningAdcode;
+
   /// 当前地图缩放级别（由地图回调更新）
   ///
   /// RainViewer 免费版**最大只到 zoom 7**（z≥8 返回「Zoom Level Not
@@ -362,17 +375,11 @@ class _LocationScreenState extends State<LocationScreen> {
     return best ?? _centerMulti;
   }
 
-  /// 选中时刻是否就是「当前」（用于决定是否显示定调后的最优源）
-  bool get _isNowSelected => _selectedTime == null;
-
   /// 取某方位点在给定时刻的预报（无选中时刻则用当前时间）
   HourlyWeather? _altAt(int index, DateTime t) {
     if (index < 0 || index >= _altHourly.length) return null;
     return _nearest(_altHourly[index], t);
   }
-
-  /// 当前应显示的时间点
-  DateTime get _activeTime => _selectedTime ?? DateTime.now();
 
   /// 区域概览的「中心天气」块
   ///
@@ -568,6 +575,7 @@ class _LocationScreenState extends State<LocationScreen> {
     _nmc.dispose();
     _rainViewer.dispose();
     _satellite.dispose();
+    _warnings.dispose();
     super.dispose();
   }
 
@@ -703,6 +711,10 @@ class _LocationScreenState extends State<LocationScreen> {
       (label: '西 5km', point: GeoPoint(lat: center.lat, lon: center.lon - dLon)),
     ];
 
+    // 行政区划码（气象预警按 6 位 adcode 前缀匹配）——与下面的多源请求**并行**，
+    // 走城市仓库的逆地理缓存，不会多花一次请求
+    final addrFuture = _cityRepo.addressAt(center.lat, center.lon);
+
     // 中心点走**多源融合**（5 源交叉验证 + 雷达定调），保留完整多源集合
     List<MultiModelHourly> centerMulti = const [];
     try {
@@ -816,6 +828,14 @@ class _LocationScreenState extends State<LocationScreen> {
       startIdx = idx >= 0 ? idx : (24 + now.hour).clamp(0, math.max(0, times.length - 1));
     }
 
+    String? adcode;
+    try {
+      adcode = (await addrFuture)?.adcode;
+      debugPrint('[预警] adcode=${adcode ?? "未知"}');
+    } catch (e) {
+      debugPrint('[预警] 取 adcode 失败: $e');
+    }
+
     setState(() {
       _grid = grid;
       _timeIndex = startIdx;
@@ -837,8 +857,12 @@ class _LocationScreenState extends State<LocationScreen> {
         minTemp: temps.isEmpty ? null : temps.reduce((a, b) => a < b ? a : b),
         maxTemp: temps.isEmpty ? null : temps.reduce((a, b) => a > b ? a : b),
         maxPop: maxPop,
+        adcode: adcode,
       );
     });
+
+    // 气象预警（异步，不阻塞主流程）
+    unawaited(_loadWarnings(adcode));
 
     // 雷达定调（异步，不阻塞）
     _runLocationVerdict(center, centerMulti);
@@ -846,6 +870,47 @@ class _LocationScreenState extends State<LocationScreen> {
     // 生成叠加位图（异步，不阻塞 UI）
     if (_layerMode != _LayerMode.none && grid.isNotEmpty) {
       _regenerateOverlay();
+    }
+  }
+
+  /// 拉取与当前地点相关的气象预警（本区县 + 本市）
+  ///
+  /// 数据源是**全国全量**（约 209 条），本地按 adcode 前缀过滤，
+  /// 服务侧有 10 分钟缓存，所以同一地点反复查询不会重复拉取。
+  Future<void> _loadWarnings(String? adcode) async {
+    setState(() {
+      _warningLoading = true;
+      _warningAdcode = adcode;
+      _warningList = const [];
+    });
+    try {
+      final list = await _warnings.forAdcode(adcode);
+      if (!mounted) return;
+      setState(() {
+        _warningList = list;
+        _warningLoading = false;
+      });
+      debugPrint('[预警] 相关 ${list.length} 条（adcode=${adcode ?? "无"}）');
+    } catch (e) {
+      debugPrint('[预警] 拉取失败: $e');
+      if (!mounted) return;
+      setState(() => _warningLoading = false);
+    }
+  }
+
+  /// 预警等级 → 颜色
+  Color _warnColor(WarningSeverity? s) {
+    switch (s) {
+      case WarningSeverity.red:
+        return AppTheme.red;
+      case WarningSeverity.orange:
+        return AppTheme.orange;
+      case WarningSeverity.yellow:
+        return AppTheme.yellow;
+      case WarningSeverity.blue:
+        return AppTheme.cyan;
+      case null:
+        return AppTheme.textDim;
     }
   }
 
@@ -1019,6 +1084,10 @@ class _LocationScreenState extends State<LocationScreen> {
             ],
           ),
         ),
+        // ===== 气象预警（置顶：最需要立刻知道的信息）=====
+        // 注：拿不到 adcode 时 _warningCard() 自行返回空块，不会误报「无预警」
+        if (_result != null) FadeSlideIn(delayMs: 0, child: _warningCard()),
+
         // 结果面板按 35ms 递增错峰淡入（区域概览 → 采样明细 → 地图）
         if (_result != null)
           ..._resultWidgets(_result!).asMap().entries.map(
@@ -1347,6 +1416,137 @@ class _LocationScreenState extends State<LocationScreen> {
   ///
   /// 数据源为 [_activeMulti] —— 会跟随「未来 12 小时」里选中的时刻切换，
   /// 保证概览 / 明细 / 研判三处口径一致。
+  /// 气象预警卡片（置顶）
+  ///
+  /// · 未拿到 adcode（定位/逆地理失败）→ 整块不渲染，避免误报「无预警」
+  /// · 有预警 → 按危险度倒序列出，红色/橙色用醒目底色
+  /// · 无预警 → 一句绿色确认
+  Widget _warningCard() {
+    if (_warningAdcode == null || _warningAdcode!.length < 6) {
+      return const SizedBox.shrink();
+    }
+
+    if (_warningLoading) {
+      return PanelCard(
+        heading: '气象预警',
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 13,
+              height: 13,
+              child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.accent),
+            ),
+            const SizedBox(width: 10),
+            const Text('正在核对该地区预警…',
+                style: TextStyle(fontSize: 12.5, color: AppTheme.textDim)),
+          ],
+        ),
+      );
+    }
+
+    final list = _warningList;
+    if (list.isEmpty) {
+      return const PanelCard(
+        heading: '气象预警',
+        child: Row(
+          children: [
+            Icon(Icons.verified_outlined, size: 15, color: AppTheme.green),
+            SizedBox(width: 8),
+            Text('当前无生效的气象预警',
+                style: TextStyle(fontSize: 12.5, color: AppTheme.textDim)),
+          ],
+        ),
+      );
+    }
+
+    return PanelCard(
+      heading: '气象预警 · ${list.length} 条',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (var i = 0; i < list.length; i++) ...[
+            if (i > 0) const SizedBox(height: 8),
+            _warningRow(list[i]),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 单条预警行
+  Widget _warningRow(WeatherWarning w) {
+    final c = _warnColor(w.severity);
+    final scope = w.scopeFor(_warningAdcode);
+    final t = w.issueTime;
+    final timeText = t == null
+        ? ''
+        : '${t.month}/${t.day} '
+            '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')} 发布';
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+      decoration: BoxDecoration(
+        color: c.withValues(alpha: .09),
+        borderRadius: BorderRadius.circular(9),
+        border: Border.all(color: c.withValues(alpha: .40)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            margin: const EdgeInsets.only(top: 1),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(color: c, borderRadius: BorderRadius.circular(4)),
+            child: Text(
+              w.severity?.label ?? '预警',
+              style: const TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF10151F),
+              ),
+            ),
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        w.type.isEmpty ? '气象预警' : w.type,
+                        style: TextStyle(
+                            fontSize: 13.5, fontWeight: FontWeight.w700, color: c),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (scope != null) ...[
+                      const SizedBox(width: 6),
+                      Text('· ${scope.label}',
+                          style: const TextStyle(fontSize: 11, color: AppTheme.textFaint)),
+                    ],
+                  ],
+                ),
+                if (w.region.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(w.region,
+                      style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim),
+                      overflow: TextOverflow.ellipsis),
+                ],
+                if (timeText.isNotEmpty) ...[
+                  const SizedBox(height: 1),
+                  Text(timeText,
+                      style: const TextStyle(fontSize: 10.5, color: AppTheme.textFaint)),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _multiSourceCard() {
     final mm = _activeMulti;
     if (mm == null) return const SizedBox.shrink();
@@ -2121,7 +2321,7 @@ class _LocationScreenState extends State<LocationScreen> {
                         color: AppTheme.green.withValues(alpha: .15),
                         borderRadius: BorderRadius.circular(3),
                       ),
-                      child: Text(_shortSource(adopted!),
+                      child: Text(_shortSource(adopted),
                           maxLines: 1,
                           overflow: TextOverflow.clip,
                           softWrap: false,

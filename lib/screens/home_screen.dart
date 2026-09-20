@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
 import 'location_screen.dart';
+import 'photo_screen.dart';
 import 'route_screen.dart';
+import 'track_screen.dart';
+import 'typhoon_screen.dart';
 
 /// 主页：底部导航（试点版先做「地点查询」+「出行路线」两个功能）
 class HomeScreen extends StatefulWidget {
@@ -19,6 +22,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final _pages = const [
     LocationScreen(),
     RouteScreen(),
+    TrackScreen(),
+    TyphoonScreen(),
+    PhotoScreen(),
   ];
 
   @override
@@ -58,6 +64,9 @@ class _BottomNav extends StatelessWidget {
             children: [
               _item(0, '地点查询', Icons.location_on_outlined),
               _item(1, '出行路线', Icons.navigation_outlined),
+              _item(2, '赛道研判', Icons.flag_outlined),
+              _item(3, '台风研判', Icons.cyclone_outlined),
+              _item(4, '摄影指数', Icons.camera_alt_outlined),
             ],
           ),
         ),
@@ -139,7 +148,7 @@ class ScreenScaffold extends StatelessWidget {
                         border: Border.all(color: AppTheme.accent.withValues(alpha: .55)),
                       ),
                       child: const Text(
-                        '0.1.1 内测 · 禁止外传',
+                        '0.1.2 内测 · 禁止外传',
                         style: TextStyle(
                             fontSize: 9, color: AppTheme.accent, fontWeight: FontWeight.w700),
                       ),

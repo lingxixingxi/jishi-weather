@@ -327,13 +327,4 @@ class RadarVerdictEngine {
     }
     return parts.join(' · ');
   }
-
-  static double _sqrt(double v) {
-    var x = v;
-    var y = 1.0;
-    for (var i = 0; i < 12; i++) {
-      y = (y + x / y) / 2;
-    }
-    return y;
-  }
 }

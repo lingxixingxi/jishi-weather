@@ -38,7 +38,6 @@ class FadeSlideIn extends StatelessWidget {
     // 无障碍：减少动画时保留淡入（帮助理解内容变化），去掉位移
     final reduce = MediaQuery.maybeOf(context)?.disableAnimations ?? false;
     final dy = reduce ? 0.0 : offsetY;
-    final dur = reduce ? const Duration(milliseconds: 120) : duration;
 
     return TweenAnimationBuilder<double>(
       // 总时长 = 延迟 + 动画（延迟期间进度保持 0，即「先不动，再淡入」）

@@ -130,5 +130,10 @@ class NmcCityRepository {
     return addr;
   }
 
+  /// 对外暴露逆地理编码结果（复用同一份缓存，不重复请求）
+  ///
+  /// 气象预警按 **6 位行政区划码**（adcode）过滤，需要它。
+  Future<AmapAddress?> addressAt(double lat, double lon) => _regeo(lat, lon);
+
   void clearLocateCache() => _locateCache.clear();
 }
