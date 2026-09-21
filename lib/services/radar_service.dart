@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../engine/weather_estimator.dart';
@@ -98,23 +99,38 @@ class RadarPalette {
 /// ✅ 交叉验证：台北市 (121.57°E, 25.03°N) → 图上 (529, 949)，
 ///    与图中「台北」标注圆点 (528, 948) 吻合。
 ///
-/// ⚠️ 注意 x / y 方向的 °/px 不同（1.854 倍），说明该拼图的
-///    经纬度比例并非 1:1，因此**不能**用单一比例换算。
+/// ⚠️ 注意 x / y 方向的 °/px 不同，说明该拼图的经纬度比例并非 1:1，
+///    因此**不能**用单一比例换算。
+///
+/// **参数校准（2026-09-21，自动拟合）**：
+/// 该拼图自带地理底图（省界/海岸线/城市标注），于是用 cv2 检测出图上
+/// 每个城市标注旁的小圆点，与 70 个已知城市经纬度做迭代最小二乘拟合
+/// （残差中位 13.7px，全图 774×1326）。
+///
+/// 旧值 kLon=0.02627 / lonMin=107.68 是把经度跨度估计得过大，
+/// 导致叠加层整体向右上方偏移 —— 这正是「大丰区跑到海上、叠加图与底图对不上」的原因。
 class RadarGeo {
   /// 经度：每像素度数
-  static const double kLon = 0.02627;
+  static const double kLon = 0.019867;
 
   /// 经度起点（x=0）
-  static const double lonMin = 107.68;
+  static const double lonMin = 111.710;
 
   /// 纬度：每像素度数
-  static const double kLat = 0.01417;
+  static const double kLat = 0.016279;
 
   /// 纬度起点（y=0）
-  static const double latMax = 38.48;
+  static const double latMax = 39.205;
 
-  /// 地图区占整图的高度比例（底部 12% 是标题与色标）
-  static const double mapHeightRatio = 0.88;
+  /// 地图区占整图的高度比例
+  ///
+  /// **实测校准（2026-09-21，774×1326 原图）**：底部图例（产品标题 + dBZ 色标 +
+  /// 审图号）的**色带从 y≈1251 开始**，即约 5.7%。
+  ///
+  /// 取 0.942（= y 1250）而不是 0.95：色标的颜色和回波色完全一样，
+  /// 若只裁到 y=1259 会留下一条彩色色带，被回波提取判为回波留在图上
+  /// （实测在「泰国」上方出现一条彩色横条）。多裁几像素把它切干净。
+  static const double mapHeightRatio = 0.942;
 
   RadarGeo._();
 
@@ -358,6 +374,15 @@ class RadarService {
   /// 实测经验：30~60 分钟外推可信度高；2 小时以上误差明显增大。
   static const int forecastMaxMinutes = 120;
 
+  /// 雷达拼图的**产品生成延迟**（分钟）
+  ///
+  /// 拼图每 6 分钟一张，但从观测到出图有几分钟滞后。取帧时以
+  /// 「当前时间 − 该延迟」再对齐到 6 分钟网格作为起点，避免总是先撞 404。
+  static const int radarGenerationLagMinutes = 6;
+
+  /// 雷达拼图的标称时间间隔（分钟）
+  static const int radarFrameMinutes = 6;
+
   /// 按运动矢量外推：预测 [minutesAhead] 分钟后回波质心位置
   static ({double x, double y})? predictCentroid(
     RadarFrame last,
@@ -376,55 +401,68 @@ class RadarService {
   ///
   /// [radarPath] 来自 `NmcService.weather()` 的 `radarImagePath`，
   /// 形如 `/product/2026/09/19/RDCP/SEVP_..._PI_20260919073600000.PNG`。
-  /// 时间戳与日期目录都会按帧时间重写。
+  /// **这里只用它取「文件名模板」**（产品名与区域码），时间戳一律按当前时间重算。
+  ///
+  /// ⚠️ **为什么不能用 radarPath 里的时间戳**（这是个实际踩过的坑）：
+  /// 那个 path 是上一次调央台接口时拿到的。若 App 在后台挂了几小时，
+  /// 缓存的 path 就指向几小时前的时刻 —— 而央台会清理过期产品，
+  /// 于是构造出的 URL 全部 404，表现为**「雷达图获取不到」**，
+  /// 重启 App 重新拉接口后才恢复。
   static Future<List<({DateTime time, Uint8List bytes})>> fetchRecentFrames({
     required String radarPath,
     int count = 3,
     http.Client? client,
+    DateTime? now,
   }) async {
     final own = client == null;
     final c = client ?? http.Client();
     try {
-      final m = RegExp(r'PI_(\d{14})').firstMatch(radarPath);
-      if (m == null) return const [];
-      final ts = m.group(1)!;
-      final baseTime = DateTime(
-        int.parse(ts.substring(0, 4)),
-        int.parse(ts.substring(4, 6)),
-        int.parse(ts.substring(6, 8)),
-        int.parse(ts.substring(8, 10)),
-        int.parse(ts.substring(10, 12)),
-        int.parse(ts.substring(12, 14)),
-      );
+      final fileName = radarPath.split('/').last;
+      final piIdx = fileName.indexOf('PI_');
+      if (piIdx < 0) return const [];
+      final namePrefix = fileName.substring(0, piIdx);
+
+      // ⚠️ 文件名里的时间戳是 **UTC**，不是北京时间！
+      // 实测：央台页面显示「制作时间 09/21 20:36」，而该帧的文件名是
+      // `..._PI_20260921123600000.PNG` —— 正好差 8 小时。
+      // 用本地时间去拼会一直去查 8 小时后的未来文件，全部 404。
+      final base = (now ?? DateTime.now()).toUtc();
+      var t = DateTime.utc(base.year, base.month, base.day, base.hour, base.minute)
+          .subtract(const Duration(minutes: radarGenerationLagMinutes));
+      t = DateTime.utc(t.year, t.month, t.day, t.hour,
+          (t.minute ~/ radarFrameMinutes) * radarFrameMinutes);
 
       final out = <({DateTime time, Uint8List bytes})>[];
-      for (var i = 0; i < count; i++) {
-        final t = baseTime.subtract(Duration(minutes: 6 * i));
+      var attempts = 0;
+      final maxAttempts = count + 6; // 允许最新几帧尚未生成完
+      while (out.length < count && attempts < maxAttempts) {
+        // ⚠️ 时间戳是 17 位：`YYYYMMDDHHMM` + `00000`
+        // （例：2026-09-21 20:48 北京 → `20260921124800000`）
+        // 少写尾部 3 个 0 会全部 404 —— 这是实际踩过的坑。
         final stamp = '${t.year}${_p2(t.month)}${_p2(t.day)}'
-            '${_p2(t.hour)}${_p2(t.minute)}00';
-        // 同时替换日期目录与文件名时间戳
-        var url = radarPath.replaceFirst(RegExp(r'PI_\d{14}'), 'PI_$stamp');
-        url = url.replaceFirst(
-          RegExp(r'/product/\d{4}/\d{2}/\d{2}/'),
-          '/product/${t.year}/${_p2(t.month)}/${_p2(t.day)}/',
-        );
-        // 去掉可能的 ?v= 缓存参数
-        url = url.split('?').first;
+            '${_p2(t.hour)}${_p2(t.minute)}00000';
+        final url = '/product/${t.year}/${_p2(t.month)}/${_p2(t.day)}/RDCP/'
+            '${namePrefix}PI_$stamp.PNG';
         try {
           final resp = await c
-              .get(Uri.parse('http://www.nmc.cn$url'), headers: {
+              .get(Uri.parse('https://image.nmc.cn$url'), headers: {
             'User-Agent': 'Mozilla/5.0 (Linux; Android 13)',
             'Referer': 'http://www.nmc.cn/',
           })
               .timeout(const Duration(seconds: 20));
           if (resp.statusCode == 200 && resp.bodyBytes.length > 10000) {
-            out.add((time: t, bytes: resp.bodyBytes));
+            // 对外仍按北京时间上报，避免后续时刻显示差 8 小时
+            out.add((time: t.toLocal(), bytes: resp.bodyBytes));
           }
         } catch (_) {
-          // 单帧失败跳过
+          // 单帧失败跳过，继续往前找
         }
+        t = t.subtract(const Duration(minutes: radarFrameMinutes));
+        attempts++;
       }
       out.sort((a, b) => a.time.compareTo(b.time));
+      debugPrint('[雷达] 取帧 ${out.length}/$count'
+          '（模板 ${namePrefix}PI_*.PNG，最新帧 ${out.isEmpty ? "无" : out.last.time}）');
       return out;
     } finally {
       if (own) c.close();
@@ -433,10 +471,14 @@ class RadarService {
 
   static String _p2(int v) => v.toString().padLeft(2, '0');
 
-  /// 裁掉雷达图底部的标题与色标，只保留地图区
+  /// 裁掉底部图例，并**把非回波像素设为透明**（只留回波）
   ///
-  /// 中央气象台拼图底部约 12% 是「产品标题 / dBZ 色标 / 审图号」，
-  /// 直接叠加到地图上会很难看，这里按行截断后重新编码 PNG。
+  /// 两件事：
+  /// 1. 中央气象台拼图底部约 5% 是「产品标题 / dBZ 色标 / 审图号」，直接叠加很难看；
+  /// 2. ⚠️ **该拼图是自带地理底图的成品图**（省界、海岸线、城市名、海洋底色）。
+  ///    直接贴到高德地图上会形成「双重地图」—— 两张地图的城市标注位置不一致，
+  ///    看起来就是「叠加图和正式地图对不上」。所以这里按 dBZ 色标逐像素过滤，
+  ///    **只保留回波色、其余全部透明**，顺带把颜色标准化成色标原色。
   static Future<Uint8List?> cropToMapArea(Uint8List pngBytes) async {
     final codec = await ui.instantiateImageCodec(pngBytes);
     final frame = await codec.getNextFrame();
@@ -450,6 +492,26 @@ class RadarService {
     final stride = src.width * 4;
     final cropped = Uint8List(stride * newH);
     cropped.setRange(0, stride * newH, px);
+
+    // ---- 只留回波：非回波像素透明化，回波像素标准化为色标原色 ----
+    var echoes = 0;
+    for (var i = 0; i < cropped.length; i += 4) {
+      final dbz = RadarPalette.rgbToDbz(cropped[i], cropped[i + 1], cropped[i + 2]);
+      if (dbz == null) {
+        cropped[i + 3] = 0;
+        continue;
+      }
+      final c = RadarPalette.dbzToRgb(dbz);
+      if (c != null) {
+        cropped[i] = c.r;
+        cropped[i + 1] = c.g;
+        cropped[i + 2] = c.b;
+      }
+      cropped[i + 3] = 255;
+      echoes++;
+    }
+    debugPrint('[雷达] 回波提取：${cropped.length ~/ 4} 像素中 $echoes 个回波'
+        '（${(echoes / (cropped.length / 4) * 100).toStringAsFixed(2)}%），其余已透明化');
 
     final completer = Completer<ui.Image>();
     ui.decodeImageFromPixels(

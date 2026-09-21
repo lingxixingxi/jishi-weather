@@ -45,6 +45,12 @@ class PlaceSearchField extends StatefulWidget {
   /// 输入框辅助文字（如「出发时间」那种副标题）
   final String? subtitle;
 
+  /// 传入后，输入框右侧会出现一个「定位」按钮，点击即用当前位置
+  ///
+  /// 出行路线页的起点常用「我的位置」，但之前的组件只能手输/联想，
+  /// 用户没法一键填入。
+  final VoidCallback? onUseCurrentLocation;
+
   const PlaceSearchField({
     super.key,
     required this.controller,
@@ -55,6 +61,7 @@ class PlaceSearchField extends StatefulWidget {
     this.near,
     this.icon = Icons.search,
     this.subtitle,
+    this.onUseCurrentLocation,
   });
 
   @override
@@ -186,6 +193,17 @@ class _PlaceSearchFieldState extends State<PlaceSearchField> {
                   child: const Padding(
                     padding: EdgeInsets.only(right: 12),
                     child: Icon(Icons.close, size: 15, color: AppTheme.textFaint),
+                  ),
+                ),
+
+              // 「用当前位置」按钮（出行路线页的起点常用）
+              if (widget.onUseCurrentLocation != null)
+                GestureDetector(
+                  onTap: widget.onUseCurrentLocation,
+                  behavior: HitTestBehavior.opaque,
+                  child: const Padding(
+                    padding: EdgeInsets.only(left: 2, right: 12),
+                    child: Icon(Icons.my_location, size: 17, color: AppTheme.accent),
                   ),
                 ),
             ],

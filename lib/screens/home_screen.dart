@@ -149,7 +149,7 @@ class ScreenScaffold extends StatelessWidget {
                         border: Border.all(color: AppTheme.accent.withValues(alpha: .55)),
                       ),
                       child: const Text(
-                        '0.1.4 内测 · 禁止外传',
+                        '0.1.5 内测 · 禁止外传',
                         style: TextStyle(
                             fontSize: 9, color: AppTheme.accent, fontWeight: FontWeight.w700),
                       ),

@@ -1270,14 +1270,19 @@ class _LocationScreenState extends State<LocationScreen> {
                       overlayNortheast: _layerMode == _LayerMode.satellite
                           ? const LatLng(SatelliteGeo.latMax, SatelliteGeo.lonMax)
                           : (_layerMode == _LayerMode.radar ? _radarNe : _overlayBounds()?.ne),
-                      // 雷达拼图半透明；卫星云图已在像素层处理过透明度，这里不再叠加
-                      overlayTransparency: _layerMode == _LayerMode.radar ? 0.45 : 0.0,
+                      // 雷达回波已在像素层透明化（只留回波），
+                      // 这里只需很小的透明度让底图路网透出来即可
+                      overlayTransparency: _layerMode == _LayerMode.radar ? 0.15 : 0.0,
                       // 瓦片式雷达（RainViewer）：仅 zoom ≤ 7 有效
                       tileOverlayUrl:
                           _layerMode == _LayerMode.radarTile && _tileUsable
                               ? _rainTile?.urlTemplate
                               : null,
                       tileTransparency: 0.25,
+                      // 切到雷达/卫星图层时自动把镜头缩放到该图层的覆盖范围
+                      // （这两个图层动辄 20°~95° 跨度，默认 10km 视野下
+                      //   用户得连点很多次缩小才找得到图）
+                      fitPoints: _mapFitPoints(),
                       onCameraMoveEnd: (target, zoom) {
                         if ((zoom - _currentZoom).abs() > 0.01) {
                           setState(() => _currentZoom = zoom);
@@ -2195,6 +2200,42 @@ class _LocationScreenState extends State<LocationScreen> {
       sw: LatLng(sw.lat, sw.lon),
       ne: LatLng(ne.lat, ne.lon),
     );
+  }
+
+  /// 当前图层对应的「自动适配视野」点集
+  ///
+  /// [AmapView] 检测到 fitPoints 变化会把镜头缩放到恰好框住这些点的范围。
+  /// 雷达拼图覆盖华东（约 20°×17°）、卫星云图覆盖整个东亚（约 95°×58°），
+  /// 都远大于默认 10km 视野 —— 不自动适配的话，用户得手动连点很多次缩小
+  /// 才能找到叠加图落在哪。
+  ///
+  /// 云量 / 雨量 / 关闭 返回空数组：这两种是围绕中心点的 24km 网格，
+  /// 本就在视野内，不需要动镜头（也避免把用户自己的缩放操作顶掉）。
+  List<LatLng> _mapFitPoints() {
+    switch (_layerMode) {
+      case _LayerMode.radar:
+      case _LayerMode.radarTile:
+        final sw = _radarSw;
+        final ne = _radarNe;
+        if (sw == null || ne == null) {
+          // 雷达尚未加载完 → 先用参数推算的覆盖范围；加载完会再触发一次
+          final b = RadarService.overlayBounds();
+          return [
+            LatLng(b.swLat, b.swLon),
+            LatLng(b.neLat, b.neLon),
+          ];
+        }
+        return [sw, ne];
+      case _LayerMode.satellite:
+        return const [
+          LatLng(SatelliteGeo.latMin, SatelliteGeo.lonMin),
+          LatLng(SatelliteGeo.latMax, SatelliteGeo.lonMax),
+        ];
+      case _LayerMode.cloud:
+      case _LayerMode.rain:
+      case _LayerMode.none:
+        return const [];
+    }
   }
 
   /// 云量(0-100) → 颜色：灰蓝渐变（少云淡、厚云深灰蓝），在浅色地图上对比明显

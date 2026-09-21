@@ -14,6 +14,7 @@ import '../services/multi_source_service.dart';
 import '../services/nmc_city_repository.dart';
 import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
+import '../services/radar_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/amap_view.dart';
 import '../widgets/fade_slide_in.dart';
@@ -54,6 +55,94 @@ class _RouteScreenState extends State<RouteScreen> {
   final _origin = TextEditingController(text: '上海虹桥站');
   final _dest = TextEditingController(text: '苏州工业园区');
 
+  /// 用当前位置填写起点或终点
+  ///
+  /// 每次点击都**重新定位**，而不是复用启动时缓存的 `_myLocation` ——
+  /// 用户可能已经移动了（这个 App 的使用场景就是出门前/在路上）。
+  Future<void> _applyCurrentLocation(
+    TextEditingController ctrl,
+    void Function(GeoPoint) assign,
+    String fieldLabel,
+  ) async {
+    try {
+      final GeoPoint? located =
+          await AmapLocationService.locate(timeout: const Duration(seconds: 8));
+      final GeoPoint? p = located ?? await _amap.ipLocation(); // 真实定位失败时用 IP 兜底
+      if (!mounted) return;
+      if (p == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('定位失败，请确认已开启定位权限')),
+        );
+        return;
+      }
+      // 反地理编码取一个可读名字；失败则退化为坐标文本
+      var name = '当前位置 ${p.lat.toStringAsFixed(3)},${p.lon.toStringAsFixed(3)}';
+      try {
+        final addr = await _cityRepo.addressAt(p.lat, p.lon);
+        if (addr != null && addr.formatted.isNotEmpty) name = addr.formatted;
+      } catch (_) {
+        // 反查失败不影响填入坐标
+      }
+      if (!mounted) return;
+      setState(() {
+        ctrl.text = name;
+        assign(p);
+        _myLocation = p;
+      });
+      debugPrint('[路线] $fieldLabel 已填入当前位置「$name」-> ${p.lat},${p.lon}');
+    } catch (e) {
+      debugPrint('[路线] $fieldLabel 定位失败: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('定位失败，请稍后重试')),
+        );
+      }
+    }
+  }
+
+  /// 交换起点与终点（含已选中的精确坐标）
+  void _swapEndpoints() {
+    final oName = _origin.text;
+    final dName = _dest.text;
+    final oPt = _originPoint;
+    final dPt = _destPoint;
+    setState(() {
+      _origin.text = dName;
+      _dest.text = oName;
+      _originPoint = dPt;
+      _destPoint = oPt;
+      // 起终点变了，上一次的规划结果不再适用
+      _options = const [];
+      _analysis = null;
+      _from = dPt;
+      _to = oPt;
+      _error = null;
+    });
+    debugPrint('[路线] 已交换起终点：「$oName」⇄「$dName」');
+  }
+
+  /// 交换按钮（与两个输入框的中线对齐）
+  Widget _swapButton() {
+    return Semantics(
+      label: '交换起点与终点',
+      button: true,
+      child: GestureDetector(
+        onTap: _swapEndpoints,
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(
+            color: AppTheme.bgInset,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(color: AppTheme.borderSoft),
+          ),
+          child: const Icon(Icons.swap_vert, size: 20, color: AppTheme.accent),
+        ),
+      ),
+    );
+  }
+
   /// 联想搜索选中的精确坐标（优先于纯文本地理编码）
   GeoPoint? _originPoint;
   GeoPoint? _destPoint;
@@ -91,6 +180,11 @@ class _RouteScreenState extends State<RouteScreen> {
 
   /// 雷达定调结果（用真实雷达回波裁决模型分歧）
   RadarVerdict? _verdict;
+
+  /// 出发时刻距今的分钟数（负数=已过去）
+  ///
+  /// 用来区分雷达该怎么用：≤2h 走外推，>2h 以多源融合为准。
+  int? _verdictLeadMinutes;
   bool _verdictLoading = false;
 
   /// 保存最近一次研判的原始数据，用于雷达定调后按最优源重建分段
@@ -363,6 +457,12 @@ class _RouteScreenState extends State<RouteScreen> {
   /// 异步跑雷达定调：用真实雷达回波裁决各模型分歧
   ///
   /// 取路线中点做代表点（雷达图覆盖范围内最可能被关注的区域）。
+  ///
+  /// **出发时刻决定雷达怎么用**（与地点查询页点选未来时刻是同一套逻辑）：
+  /// - 距现在 ≤ [RadarService.forecastMaxMinutes]（2h）：把外推提前量设为
+  ///   「距现在多少分钟」，给出**那一刻**的回波预测；
+  /// - > 2h：雷达外推误差已经很大、不该再外推，此时仍做一次定调用以裁决
+  ///   「哪个源此刻最可信」，但 UI 上会明确标注以多源融合为准。
   Future<void> _runRadarVerdict(
     List<({GeoPoint point, double kmFromStart})> samples,
     List<MultiModelHourly?> multiAtArrival,
@@ -374,19 +474,30 @@ class _RouteScreenState extends State<RouteScreen> {
     final models = mid < multiAtArrival.length ? multiAtArrival[mid] : null;
     if (models == null) return;
 
-    setState(() => _verdictLoading = true);
+    // 出发时刻距今多少分钟
+    final leadMin = _departAt.difference(DateTime.now()).inMinutes;
+    final withinNowcast =
+        leadMin > 0 && leadMin <= RadarService.forecastMaxMinutes;
+
+    setState(() {
+      _verdictLoading = true;
+      _verdictLeadMinutes = leadMin;
+    });
     try {
       final v = await RadarVerdictEngine.judge(
         lat: samples[mid].point.lat,
         lon: samples[mid].point.lon,
         models: [models],
         radarPath: path,
+        horizonOverride: withinNowcast ? leadMin : null,
       );
       if (!mounted) return;
       setState(() {
         _verdict = v;
         _verdictLoading = false;
       });
+      debugPrint('[雷达定调] 出发距今 ${leadMin}min → '
+          '${withinNowcast ? "雷达外推 $leadMin 分钟" : "超出外推范围(>${RadarService.forecastMaxMinutes}min)，以多源融合为准"}');
 
       // 雷达定调判出了最吻合的源 → 用它重建分段详情
       // （各要素取自该源；「多源验证」信息依然保留）
@@ -444,28 +555,53 @@ class _RouteScreenState extends State<RouteScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              PlaceSearchField(
-                controller: _origin,
-                amap: _amap,
-                icon: Icons.trip_origin,
-                hint: '起点',
-                near: _myLocation,
-                onSelected: (p, tip) {
-                  _originPoint = p;
-                  debugPrint('[路线] 起点选中「${tip.name}」-> ${p.lat},${p.lon}');
-                },
-              ),
-              const SizedBox(height: 9),
-              PlaceSearchField(
-                controller: _dest,
-                amap: _amap,
-                icon: Icons.place,
-                hint: '终点',
-                near: _myLocation,
-                onSelected: (p, tip) {
-                  _destPoint = p;
-                  debugPrint('[路线] 终点选中「${tip.name}」-> ${p.lat},${p.lon}');
-                },
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        PlaceSearchField(
+                          controller: _origin,
+                          amap: _amap,
+                          icon: Icons.trip_origin,
+                          hint: '起点',
+                          near: _myLocation,
+                          onSelected: (p, tip) {
+                            _originPoint = p;
+                            debugPrint('[路线] 起点选中「${tip.name}」-> ${p.lat},${p.lon}');
+                          },
+                          onUseCurrentLocation: () => _applyCurrentLocation(
+                            _origin,
+                            (p) => _originPoint = p,
+                            '起点',
+                          ),
+                        ),
+                        const SizedBox(height: 9),
+                        PlaceSearchField(
+                          controller: _dest,
+                          amap: _amap,
+                          icon: Icons.place,
+                          hint: '终点',
+                          near: _myLocation,
+                          onSelected: (p, tip) {
+                            _destPoint = p;
+                            debugPrint('[路线] 终点选中「${tip.name}」-> ${p.lat},${p.lon}');
+                          },
+                          onUseCurrentLocation: () => _applyCurrentLocation(
+                            _dest,
+                            (p) => _destPoint = p,
+                            '终点',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // 交换起终点（Row 的 center 对齐 = 两个输入框的中线）
+                  _swapButton(),
+                ],
               ),
               const SizedBox(height: 9),
               OutlinedButton.icon(
@@ -900,6 +1036,9 @@ class _RouteScreenState extends State<RouteScreen> {
     }
     final v = _verdict!;
     final r = v.radar;
+    final lead = _verdictLeadMinutes ?? 0;
+    final nowcastWindow = RadarService.forecastMaxMinutes;
+    final withinNowcast = lead > 0 && lead <= nowcastWindow;
     return PanelCard(
       heading: '雷达定调 · 真实回波校验',
       child: Column(
@@ -933,8 +1072,21 @@ class _RouteScreenState extends State<RouteScreen> {
             if (r.motionSpeedKmh != null && r.motionSpeedKmh! > 1)
               _kv('回波移动',
                   '向${r.motionDirection} ${r.motionSpeedKmh!.toStringAsFixed(0)} km/h（${r.framesUsed} 帧追踪）'),
-            if (r.expectedRainAhead)
-              _kv('外推预警', '未来 ${RadarVerdictEngine.horizonMinutes} 分钟该区域可能受影响'),
+
+            // 出发时刻决定雷达的使用方式（与地点页点选未来时刻同一套逻辑）
+            if (withinNowcast)
+              _kv('外推时距', '出发距今 $lead 分钟，回波按此时距外推')
+            else if (lead > nowcastWindow)
+              _kv(
+                '时距提示',
+                '出发距今 ${(lead / 60).toStringAsFixed(1)} 小时，已超出雷达外推'
+                '有效范围（${nowcastWindow ~/ 60}h）→ 以多源融合为准',
+              )
+            else if (lead <= 0)
+              _kv('时距提示', '出发时刻已过，按当前实况研判'),
+
+            if (r.expectedRainAhead && withinNowcast)
+              _kv('外推预警', '未来 $lead 分钟该区域可能受影响'),
             const Divider(height: 20, color: AppTheme.borderSoft),
           ],
           if (v.scores.isNotEmpty) ...[
