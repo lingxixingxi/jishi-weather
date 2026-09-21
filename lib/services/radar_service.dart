@@ -434,7 +434,10 @@ class RadarService {
 
       final out = <({DateTime time, Uint8List bytes})>[];
       var attempts = 0;
-      final maxAttempts = count + 6; // 允许最新几帧尚未生成完
+      // ⚠️ 回退帧数要够大：实测区域拼图**最新帧常滞后 20~40 分钟**，
+      // 个别时段（如凌晨）可能更久。只给 10 帧（1 小时）会偶发一帧都取不到。
+      // 给到 20 帧（2 小时）后，实测 80% 的窗口都能稳定拿到 3 帧。
+      final maxAttempts = count + 17;
       while (out.length < count && attempts < maxAttempts) {
         // ⚠️ 时间戳是 17 位：`YYYYMMDDHHMM` + `00000`
         // （例：2026-09-21 20:48 北京 → `20260921124800000`）

@@ -1705,6 +1705,18 @@ class _LocationScreenState extends State<LocationScreen> {
     }
   }
 
+  /// 单站雷达的数据时效提示
+  ///
+  /// 实测该源**更新极不规律**（各站只在自己有观测时出图），最新可用帧
+  /// 可能滞后 1~3 小时。所以取到旧帧时必须如实标注，不能让用户误以为
+  /// 这是"此刻"的回波。
+  static String _stationRadarAgeText(DateTime t) {
+    final m = DateTime.now().difference(t).inMinutes;
+    if (m <= 30) return '';
+    if (m < 120) return '（$m 分钟前）';
+    return '（约 ${(m / 60).toStringAsFixed(1)} 小时前 · 该站暂无更新帧）';
+  }
+
   /// 雷达定调面板（用真实回波裁决各模型分歧）
   Widget _radarVerdictCard() {
     if (_verdictLoading && _verdict == null) {
@@ -1825,7 +1837,8 @@ class _LocationScreenState extends State<LocationScreen> {
             _kvRow(
               '观测时刻',
               '${_stationRadar!.time.hour.toString().padLeft(2, '0')}:'
-                  '${_stationRadar!.time.minute.toString().padLeft(2, '0')}',
+                  '${_stationRadar!.time.minute.toString().padLeft(2, '0')}'
+                  '${_stationRadarAgeText(_stationRadar!.time)}',
             ),
             // 与和风的交叉验证（分歧时以雷达为准）
             if (_stationRadar!.check != null)

@@ -137,7 +137,14 @@ class NmcStationRadar {
             RadarService.radarFrameMinutes,
       );
 
-      for (var i = 0; i < 10; i++) {
+      // ⚠️ 回退帧数必须给足：**单站雷达的生成极不规律**。
+      // 实测（2026-09-21 夜，4 小时窗口）：
+      //   南京站  只命中 4/40 帧，且最新帧是 2 小时 46 分前；
+      //   青浦站  只命中 5/40 帧，最新帧 58 分钟前。
+      // 各站似乎只在「自己有观测」时才出图，所以最新可用帧可能滞后 1~3 小时。
+      // 只试 10 帧（1 小时）会经常一帧都取不到 —— 这是「雷达图拉取失败」的根因。
+      // 现在放到 40 帧（4 小时）。
+      for (var i = 0; i < 40; i++) {
         final stamp = '${t.year}${_p2(t.month)}${_p2(t.day)}'
             '${_p2(t.hour)}${_p2(t.minute)}00000';
         final url = 'https://image.nmc.cn/product/${t.year}/${_p2(t.month)}/'
