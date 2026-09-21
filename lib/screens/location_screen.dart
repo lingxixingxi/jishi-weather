@@ -163,8 +163,21 @@ class StationRadarReading {
   /// 实测回波强度（dBZ）；null 表示该像素无回波
   final int? dbz;
 
-  /// 观测时刻（已换算为本地时间）
+  /// 实际读数的观测时刻（已换算为本地时间）
+  ///
+  /// 若 [fromStation] 为 false，这是**区域拼图**的观测时刻。
   final DateTime time;
+
+  /// 读数是否来自单站雷达
+  ///
+  /// false 表示「单站当前小时没有更新」，已退回区域拼图兜底
+  /// （精度从 0.68 km/像素降到 2.6 km/像素，但至少不会没数据）。
+  final bool fromStation;
+
+  /// 单站雷达**最近一次**有帧的时间（即使它不属于当前小时）
+  ///
+  /// 兜底时用它告诉用户「单站上次更新是几点」。
+  final DateTime? stationLastTime;
 
   /// 与和风的交叉验证结果
   final RadarCrossCheck? check;
@@ -174,6 +187,8 @@ class StationRadarReading {
     required this.distanceKm,
     required this.dbz,
     required this.time,
+    this.fromStation = true,
+    this.stationLastTime,
     this.check,
   });
 }
@@ -1641,7 +1656,12 @@ class _LocationScreenState extends State<LocationScreen> {
   ///
   /// 单站雷达覆盖半径 256 km、约 0.68 km/像素（区域拼图是 2.6 km/像素），
   /// 用它回答「目标点这一格到底有没有雨」比拼图精确约 4 倍。
-  /// 若最近站点距离已超出覆盖范围，说明该位置没有单站雷达覆盖，直接跳过。
+  ///
+  /// **兜底**：单站雷达更新极不规律（实测 4 小时窗口只命中约 10%），
+  /// 经常出现「最近一帧已是 1~3 小时前」。那种数据用来回答"此刻有没有雨"
+  /// 已不可信，所以**当前小时没有更新时退回区域拼图**
+  /// （精度降到 2.6 km/像素，但实测 80% 的时候有数据），
+  /// 并把「单站上次更新是什么时候」如实告诉用户。
   Future<void> _runStationRadar(double lat, double lon) async {
     try {
       final st = nearestRadarStation(lat, lon);
@@ -1652,16 +1672,40 @@ class _LocationScreenState extends State<LocationScreen> {
         if (mounted) setState(() => _stationRadar = null);
         return;
       }
+
+      // ---- 1) 单站雷达 ----
       final frame = await NmcStationRadar.fetchLatest(stationCode: st.code);
-      if (frame == null || !mounted) return;
-      final s = await NmcStationRadar.sample(
-        frame.bytes,
-        lat,
-        lon,
-        st.lat,
-        st.lon,
-      );
-      final stationRain = RadarCrossCheck.rainFromDbz(s?.dbz);
+      final stationLast = frame?.time;
+      final stationAgeMin = stationLast == null
+          ? null
+          : DateTime.now().difference(stationLast).inMinutes;
+      // 「当前小时」= 最近一帧不超过 60 分钟
+      final useStation = frame != null && stationAgeMin! <= 60;
+
+      // ---- 2) 取值 ----
+      int? dbz;
+      DateTime obsTime;
+      if (useStation) {
+        final s = await NmcStationRadar.sample(
+          frame.bytes,
+          lat,
+          lon,
+          st.lat,
+          st.lon,
+        );
+        dbz = s?.dbz;
+        obsTime = frame.time;
+      } else {
+        // 兜底：区域拼图
+        final m = await _mapRadarDbz(lat, lon);
+        dbz = m?.dbz;
+        obsTime = m?.time ?? DateTime.now();
+        debugPrint('[单站雷达] ${st.name} 当前小时无更新'
+            '（上次 ${stationLast ?? "无记录"}），改用区域拼图兜底'
+            ' → ${dbz == null ? "无回波" : "$dbz dBZ"}');
+      }
+
+      final stationRain = RadarCrossCheck.rainFromDbz(dbz);
 
       // 和风降水（用于交叉验证；未配置 Key 或失败则为 null）
       double? qwRain;
@@ -1680,7 +1724,7 @@ class _LocationScreenState extends State<LocationScreen> {
       }
 
       final check = RadarCrossCheck(
-        stationDbz: s?.dbz,
+        stationDbz: dbz,
         stationRainMmh: stationRain,
         qweatherRainMmh: qwRain,
         stationName: st.name,
@@ -1692,16 +1736,47 @@ class _LocationScreenState extends State<LocationScreen> {
         _stationRadar = StationRadarReading(
           station: st,
           distanceKm: dist,
-          dbz: s?.dbz,
-          time: frame.time,
+          dbz: dbz,
+          time: obsTime,
+          fromStation: useStation,
+          stationLastTime: stationLast,
           check: check,
         );
       });
       debugPrint('[单站雷达] ${st.name}(${st.code}) 距 ${dist.toStringAsFixed(0)}km '
-          '→ ${s?.dbz == null ? "无回波" : "${s!.dbz} dBZ"}'
+          '${useStation ? "单站" : "拼图兜底"}'
+          ' → ${dbz == null ? "无回波" : "$dbz dBZ"}'
           '；${check.conclusion}');
     } catch (e) {
       debugPrint('[单站雷达] 失败: $e');
+    }
+  }
+
+  /// 用**区域拼图**取某点的 dBZ（单站雷达当前小时没更新时的兜底）
+  ///
+  /// 拼图覆盖华东（约 2.6 km/像素），虽然比单站粗 4 倍，但实测 80% 的
+  /// 6 分钟窗口都有帧，比单站（约 10%）可靠得多。
+  Future<({int? dbz, DateTime time})?> _mapRadarDbz(double lat, double lon) async {
+    try {
+      // 用 `_multi` 拿到的路径取其「文件名模板」；没有就用内置的华东模板
+      const fallbackPath = '/product/2026/01/01/RDCP/'
+          'SEVP_AOC_RDCP_SLDAS3_ECREF_AECN_L88_PI_20260101000000000.PNG';
+      final path = _multi.lastRadarPath ?? fallbackPath;
+      final frames = await RadarService.fetchRecentFrames(
+        radarPath: path,
+        count: 1,
+      );
+      if (frames.isEmpty) return null;
+      final f = frames.last;
+      final parsed = await RadarService.analyze(f.bytes, f.time);
+      if (parsed == null) return null;
+      return (
+        dbz: RadarService.sampleAt(parsed, lat, lon),
+        time: f.time,
+      );
+    } catch (e) {
+      debugPrint('[单站雷达] 区域拼图兜底失败: $e');
+      return null;
     }
   }
 
@@ -1714,7 +1789,7 @@ class _LocationScreenState extends State<LocationScreen> {
     final m = DateTime.now().difference(t).inMinutes;
     if (m <= 30) return '';
     if (m < 120) return '（$m 分钟前）';
-    return '（约 ${(m / 60).toStringAsFixed(1)} 小时前 · 该站暂无更新帧）';
+    return '（约 ${(m / 60).toStringAsFixed(1)} 小时前）';
   }
 
   /// 雷达定调面板（用真实回波裁决各模型分歧）
@@ -1802,22 +1877,34 @@ class _LocationScreenState extends State<LocationScreen> {
               ),
             const Divider(height: 20, color: AppTheme.borderSoft),
           ],
-          // ===== 单站雷达实测 =====
-          // 区域拼图看全貌，单站雷达（0.68 km/像素、覆盖 256 km）看脚下这一格
+          // ===== 雷达实测 =====
+          // 区域拼图看全貌，单站雷达（0.68 km/像素、覆盖 256 km）看脚下这一格。
+          // 单站当前小时没更新时退回拼图（见 _runStationRadar）。
           if (_stationRadar != null) ...[
             const Divider(height: 20, color: AppTheme.borderSoft),
             Row(
               children: [
-                const Icon(Icons.radar, size: 13, color: AppTheme.cyan),
+                Icon(
+                  _stationRadar!.fromStation ? Icons.radar : Icons.public,
+                  size: 13,
+                  color: _stationRadar!.fromStation
+                      ? AppTheme.cyan
+                      : AppTheme.orange,
+                ),
                 const SizedBox(width: 5),
-                const Text('单站雷达实测',
-                    style: TextStyle(
-                        fontSize: 11,
-                        color: AppTheme.textFaint,
-                        fontWeight: FontWeight.w700)),
+                Text(
+                  _stationRadar!.fromStation ? '单站雷达实测' : '雷达实测（拼图兜底）',
+                  style: const TextStyle(
+                      fontSize: 11,
+                      color: AppTheme.textFaint,
+                      fontWeight: FontWeight.w700),
+                ),
                 const Spacer(),
-                const Text('约 0.68 km/像素',
-                    style: TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+                Text(
+                  _stationRadar!.fromStation ? '约 0.68 km/像素' : '约 2.6 km/像素',
+                  style: const TextStyle(
+                      fontSize: 10, color: AppTheme.textFaint),
+                ),
               ],
             ),
             const SizedBox(height: 6),
@@ -1840,6 +1927,43 @@ class _LocationScreenState extends State<LocationScreen> {
                   '${_stationRadar!.time.minute.toString().padLeft(2, '0')}'
                   '${_stationRadarAgeText(_stationRadar!.time)}',
             ),
+            // 兜底说明：单站当前小时无更新，改用拼图，并列出单站上次更新时间
+            if (!_stationRadar!.fromStation)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: AppTheme.orange.withValues(alpha: .10),
+                    borderRadius: BorderRadius.circular(7),
+                    border:
+                        Border.all(color: AppTheme.orange.withValues(alpha: .40)),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.info_outline,
+                          size: 13, color: AppTheme.orange),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '单站雷达当前小时无更新'
+                          '${_stationRadar!.stationLastTime == null ? "（暂无记录）" : '，上次更新 '
+                              '${_stationRadar!.stationLastTime!.hour.toString().padLeft(2, '0')}:'
+                              '${_stationRadar!.stationLastTime!.minute.toString().padLeft(2, '0')}'
+                              '${_stationRadarAgeText(_stationRadar!.stationLastTime!)}'}'
+                          '；已改用区域拼图（精度约 2.6 km/像素）',
+                          style: const TextStyle(
+                              fontSize: 11,
+                              height: 1.4,
+                              color: AppTheme.orange),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             // 与和风的交叉验证（分歧时以雷达为准）
             if (_stationRadar!.check != null)
               Padding(
