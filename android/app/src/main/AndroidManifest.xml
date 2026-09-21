@@ -10,6 +10,13 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
 
+    <!-- ===== 天气变化提醒 / 每日预报推送 =====
+         Android 13+ 发通知需要运行时权限，否则通知会被静默丢弃 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- 后台按小时检查天气（WorkManager 在低电耗模式下仍需唤醒） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
     <application
         android:label="迹时天气·内测"
         android:name="${applicationName}"

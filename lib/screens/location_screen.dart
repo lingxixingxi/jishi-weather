@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:x_amap_base/x_amap_base.dart';
 
+import '../data/radar_stations.dart';
+import '../engine/radar_cross_check.dart';
 import '../engine/radar_verdict.dart';
 import '../models/hourly_weather.dart';
 import '../models/weather_warning.dart';
@@ -15,6 +17,8 @@ import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
 import '../services/multi_source_service.dart';
 import '../services/nmc_city_repository.dart';
+import '../services/nmc_station_radar.dart';
+import '../services/qweather_service.dart';
 import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../services/radar_service.dart';
@@ -145,6 +149,35 @@ enum _LayerMode {
   satellite,
 }
 
+/// 单站雷达的一次实测结果
+///
+/// 区域拼图（华东全境、2.6 km/像素）回答「这片区域有没有雨」，
+/// 单站雷达（覆盖 256 km、0.68 km/像素）回答「我脚下这一格有没有雨」。
+class StationRadarReading {
+  /// 命中的雷达站
+  final RadarStation station;
+
+  /// 目标点到该站的距离（km）
+  final double distanceKm;
+
+  /// 实测回波强度（dBZ）；null 表示该像素无回波
+  final int? dbz;
+
+  /// 观测时刻（已换算为本地时间）
+  final DateTime time;
+
+  /// 与和风的交叉验证结果
+  final RadarCrossCheck? check;
+
+  const StationRadarReading({
+    required this.station,
+    required this.distanceKm,
+    required this.dbz,
+    required this.time,
+    this.check,
+  });
+}
+
 /// 地点查询页 —— 方圆 10km 区域天气
 class LocationScreen extends StatefulWidget {
   const LocationScreen({super.key});
@@ -194,12 +227,20 @@ class _LocationScreenState extends State<LocationScreen> {
     cityRepo: _cityRepo,
   );
 
+  /// 和风服务（单站雷达的交叉验证用）
+  final _qweather = QWeatherService();
+
   /// 中心点的多源集合（5 源比对 + 雷达定调用）
   MultiModelHourly? _centerMulti;
 
   /// 雷达定调结果
   RadarVerdict? _verdict;
   bool _verdictLoading = false;
+
+  /// 单站雷达实测（高精度：约 0.68 km/像素、覆盖半径 256 km）
+  ///
+  /// 区域拼图回答「这片区域有没有雨」，单站雷达回答「我脚下这一格有没有雨」。
+  StationRadarReading? _stationRadar;
 
   /// 未来逐小时预测（取中心点，5 源）
   List<MultiModelHourly> _hourlyForecast = const [];
@@ -576,6 +617,7 @@ class _LocationScreenState extends State<LocationScreen> {
     _rainViewer.dispose();
     _satellite.dispose();
     _warnings.dispose();
+    _qweather.dispose();
     super.dispose();
   }
 
@@ -866,6 +908,9 @@ class _LocationScreenState extends State<LocationScreen> {
 
     // 雷达定调（异步，不阻塞）
     _runLocationVerdict(center, centerMulti);
+
+    // 单站雷达实测（异步，不阻塞）—— 高精度版本，回答「这一格有没有雨」
+    unawaited(_runStationRadar(center.lat, center.lon));
 
     // 生成叠加位图（异步，不阻塞 UI）
     if (_layerMode != _LayerMode.none && grid.isNotEmpty) {
@@ -1279,10 +1324,9 @@ class _LocationScreenState extends State<LocationScreen> {
                               ? _rainTile?.urlTemplate
                               : null,
                       tileTransparency: 0.25,
-                      // 切到雷达/卫星图层时自动把镜头缩放到该图层的覆盖范围
-                      // （这两个图层动辄 20°~95° 跨度，默认 10km 视野下
-                      //   用户得连点很多次缩小才找得到图）
-                      fitPoints: _mapFitPoints(),
+                      // 切到雷达/卫星图层时自动把镜头缩放到中心点周边合适范围
+                      // （贴近定位所在地，而不是拉到图层的整个覆盖范围）
+                      fitPoints: _mapFitPoints(LatLng(r.center.lat, r.center.lon)),
                       onCameraMoveEnd: (target, zoom) {
                         if ((zoom - _currentZoom).abs() > 0.01) {
                           setState(() => _currentZoom = zoom);
@@ -1593,6 +1637,74 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
+  /// 跑单站雷达实测：定位 → 最近站点 → 按像素取 dBZ
+  ///
+  /// 单站雷达覆盖半径 256 km、约 0.68 km/像素（区域拼图是 2.6 km/像素），
+  /// 用它回答「目标点这一格到底有没有雨」比拼图精确约 4 倍。
+  /// 若最近站点距离已超出覆盖范围，说明该位置没有单站雷达覆盖，直接跳过。
+  Future<void> _runStationRadar(double lat, double lon) async {
+    try {
+      final st = nearestRadarStation(lat, lon);
+      final dist = NmcStationRadar.distanceKm(lat, lon, st.lat, st.lon);
+      if (dist > NmcStationRadar.coverageKm) {
+        debugPrint('[单站雷达] 最近站点 ${st.name} 距 ${dist.toStringAsFixed(0)}km，'
+            '超出 ${NmcStationRadar.coverageKm.toInt()}km 覆盖，跳过');
+        if (mounted) setState(() => _stationRadar = null);
+        return;
+      }
+      final frame = await NmcStationRadar.fetchLatest(stationCode: st.code);
+      if (frame == null || !mounted) return;
+      final s = await NmcStationRadar.sample(
+        frame.bytes,
+        lat,
+        lon,
+        st.lat,
+        st.lon,
+      );
+      final stationRain = RadarCrossCheck.rainFromDbz(s?.dbz);
+
+      // 和风降水（用于交叉验证；未配置 Key 或失败则为 null）
+      double? qwRain;
+      var qwAvailable = false;
+      try {
+        if (_qweather.isConfigured) {
+          final list = await _qweather.hourly(lat, lon, hours: 3);
+          final h = QWeatherService.nearest(list, DateTime.now());
+          if (h != null) {
+            qwRain = h.precipitation;
+            qwAvailable = true;
+          }
+        }
+      } catch (e) {
+        debugPrint('[单站雷达] 和风降水获取失败（不影响雷达读数）: $e');
+      }
+
+      final check = RadarCrossCheck(
+        stationDbz: s?.dbz,
+        stationRainMmh: stationRain,
+        qweatherRainMmh: qwRain,
+        stationName: st.name,
+        qweatherAvailable: qwAvailable,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _stationRadar = StationRadarReading(
+          station: st,
+          distanceKm: dist,
+          dbz: s?.dbz,
+          time: frame.time,
+          check: check,
+        );
+      });
+      debugPrint('[单站雷达] ${st.name}(${st.code}) 距 ${dist.toStringAsFixed(0)}km '
+          '→ ${s?.dbz == null ? "无回波" : "${s!.dbz} dBZ"}'
+          '；${check.conclusion}');
+    } catch (e) {
+      debugPrint('[单站雷达] 失败: $e');
+    }
+  }
+
   /// 雷达定调面板（用真实回波裁决各模型分歧）
   Widget _radarVerdictCard() {
     if (_verdictLoading && _verdict == null) {
@@ -1677,6 +1789,93 @@ class _LocationScreenState extends State<LocationScreen> {
                 '（回波外推）',
               ),
             const Divider(height: 20, color: AppTheme.borderSoft),
+          ],
+          // ===== 单站雷达实测 =====
+          // 区域拼图看全貌，单站雷达（0.68 km/像素、覆盖 256 km）看脚下这一格
+          if (_stationRadar != null) ...[
+            const Divider(height: 20, color: AppTheme.borderSoft),
+            Row(
+              children: [
+                const Icon(Icons.radar, size: 13, color: AppTheme.cyan),
+                const SizedBox(width: 5),
+                const Text('单站雷达实测',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: AppTheme.textFaint,
+                        fontWeight: FontWeight.w700)),
+                const Spacer(),
+                const Text('约 0.68 km/像素',
+                    style: TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            _kvRow(
+              '站点',
+              '${_stationRadar!.station.name}站'
+              '（${_stationRadar!.station.code}）· '
+              '距 ${_stationRadar!.distanceKm.toStringAsFixed(0)} km',
+            ),
+            _kvRow(
+              '实测回波',
+              _stationRadar!.dbz == null
+                  ? '无回波（这一格没有雨）'
+                  : '${_stationRadar!.dbz} dBZ · '
+                      '${RadarPalette.dbzLevel(_stationRadar!.dbz!)}',
+            ),
+            _kvRow(
+              '观测时刻',
+              '${_stationRadar!.time.hour.toString().padLeft(2, '0')}:'
+                  '${_stationRadar!.time.minute.toString().padLeft(2, '0')}',
+            ),
+            // 与和风的交叉验证（分歧时以雷达为准）
+            if (_stationRadar!.check != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: (_stationRadar!.check!.diverged
+                            ? AppTheme.orange
+                            : AppTheme.green)
+                        .withValues(alpha: .10),
+                    borderRadius: BorderRadius.circular(7),
+                    border: Border.all(
+                      color: (_stationRadar!.check!.diverged
+                              ? AppTheme.orange
+                              : AppTheme.green)
+                          .withValues(alpha: .40),
+                    ),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        _stationRadar!.check!.diverged
+                            ? Icons.compare_arrows
+                            : Icons.check_circle_outline,
+                        size: 13,
+                        color: _stationRadar!.check!.diverged
+                            ? AppTheme.orange
+                            : AppTheme.green,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _stationRadar!.check!.conclusion,
+                          style: TextStyle(
+                            fontSize: 11,
+                            height: 1.4,
+                            color: _stationRadar!.check!.diverged
+                                ? AppTheme.orange
+                                : AppTheme.green,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
           ],
           if (v.scores.isNotEmpty) ...[
             const Text('各源与雷达吻合度',
@@ -2205,37 +2404,38 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 当前图层对应的「自动适配视野」点集
   ///
   /// [AmapView] 检测到 fitPoints 变化会把镜头缩放到恰好框住这些点的范围。
-  /// 雷达拼图覆盖华东（约 20°×17°）、卫星云图覆盖整个东亚（约 95°×58°），
-  /// 都远大于默认 10km 视野 —— 不自动适配的话，用户得手动连点很多次缩小
-  /// 才能找到叠加图落在哪。
+  ///
+  /// ⚠️ 这里**不套用图层的完整覆盖范围**（用户反馈「雷达图缩放的好大，
+  /// 1000km，能不能贴近定位所在地」）：华东雷达拼图跨 20°×20°（约 2000km），
+  /// 拉到全图时定位点只剩一个像素。改为以中心点为基准给一个**合理半径**：
+  ///   · 雷达   → ±150km，本地回波看得清，又不会偏出雷达图覆盖
+  ///   · 卫星   → ±800km，卫星云图约 11km/像素，范围太小看不出云系
   ///
   /// 云量 / 雨量 / 关闭 返回空数组：这两种是围绕中心点的 24km 网格，
   /// 本就在视野内，不需要动镜头（也避免把用户自己的缩放操作顶掉）。
-  List<LatLng> _mapFitPoints() {
+  List<LatLng> _mapFitPoints(LatLng center) {
     switch (_layerMode) {
       case _LayerMode.radar:
       case _LayerMode.radarTile:
-        final sw = _radarSw;
-        final ne = _radarNe;
-        if (sw == null || ne == null) {
-          // 雷达尚未加载完 → 先用参数推算的覆盖范围；加载完会再触发一次
-          final b = RadarService.overlayBounds();
-          return [
-            LatLng(b.swLat, b.swLon),
-            LatLng(b.neLat, b.neLon),
-          ];
-        }
-        return [sw, ne];
+        return _boxAround(center, 150);
       case _LayerMode.satellite:
-        return const [
-          LatLng(SatelliteGeo.latMin, SatelliteGeo.lonMin),
-          LatLng(SatelliteGeo.latMax, SatelliteGeo.lonMax),
-        ];
+        return _boxAround(center, 800);
       case _LayerMode.cloud:
       case _LayerMode.rain:
       case _LayerMode.none:
         return const [];
     }
+  }
+
+  /// 以 [c] 为中心、半径 [halfKm] 公里的方框（返回西南、东北两角）
+  static List<LatLng> _boxAround(LatLng c, double halfKm) {
+    final dLat = halfKm / 110.57;
+    final cosLat = math.cos(c.latitude * math.pi / 180).abs().clamp(0.2, 1.0);
+    final dLon = halfKm / (111.32 * cosLat);
+    return [
+      LatLng(c.latitude - dLat, c.longitude - dLon),
+      LatLng(c.latitude + dLat, c.longitude + dLon),
+    ];
   }
 
   /// 云量(0-100) → 颜色：灰蓝渐变（少云淡、厚云深灰蓝），在浅色地图上对比明显

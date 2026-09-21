@@ -22,6 +22,13 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+
+        // ⚠️ flutter_local_notifications 需要 Java 8+ 的日期时间 API
+        // （java.time 等），Android 低版本没有这些类，必须靠 desugaring 补齐。
+        // 不开会直接构建失败：
+        //   Dependency ':flutter_local_notifications' requires
+        //   core library desugaring to be enabled
+        isCoreLibraryDesugaringEnabled = true
     }
 
     defaultConfig {
@@ -98,6 +105,11 @@ kotlin {
 
 // 注：高德定位类（com.amap.api.location.*）已由 amap_map 插件依赖的
 // 3dmap-location-search 提供，无需再加 com.amap.api:location（否则类重复）。
+
+dependencies {
+    // core library desugaring 的实现（配合上面 compileOptions 里的开关）
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+}
 
 flutter {
     source = "../.."

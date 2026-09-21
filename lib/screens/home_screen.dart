@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
 import 'location_screen.dart';
+import 'settings_screen.dart';
 import 'photo_screen.dart';
 import 'route_screen.dart';
 import 'track_screen.dart';
@@ -119,57 +120,140 @@ class ScreenScaffold extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return CustomScrollView(
-      slivers: [
-        SliverToBoxAdapter(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(18, 18, 18, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const _Logo(),
-                    const SizedBox(width: 9),
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w700,
-                        color: AppTheme.text,
+    // ⚠️ 兜底：显式清掉可能被继承的文本装饰（下划线）。
+    // 背景：Text(style:) 是 **merge** 语义 —— style 里没写 decoration 时，
+    // 会保留 DefaultTextStyle 中的 decoration。若某一层把默认样式设成了
+    // underline，页面上所有「只指定了 fontSize/color 的 Text」都会带上一条
+    // 琥珀色下划线（实测在设置页出现过，连标题与副标题都有；而按钮内的文字
+    // 因为自带完整 ButtonStyle 反而正常）。
+    // 这里统一兜一层，确保任何页面都不会继承到装饰。
+    //
+    // ⚠️ SafeArea 也是必须的：设置页是 Navigator.push 出来的，外面没有
+    // Scaffold，若不处理安全区，顶栏会**和系统状态栏（通知栏）重叠**
+    // （用户反馈「顶部和通知栏撞在一起」）。
+    return DefaultTextStyle(
+      style: const TextStyle(
+        decoration: TextDecoration.none,
+        color: AppTheme.text,
+      ),
+      child: SafeArea(
+        child: CustomScrollView(
+        slivers: [
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(18, 18, 18, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const _Logo(),
+                      const SizedBox(width: 9),
+                      // 左侧组（标题 + 徽章）：放在 Expanded 里自适应收缩，
+                      // 这样长标题会省略号而不是把右侧齿轮挤出屏幕
+                      Expanded(
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppTheme.text,
+                                  decoration: TextDecoration.none,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            // 内测版标识（内测，禁止外传）
+                            Flexible(
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.accent.withValues(alpha: .15),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(
+                                      color:
+                                          AppTheme.accent.withValues(alpha: .55)),
+                                ),
+                                child: const Text(
+                                  '0.1.6 内测 · 禁止外传',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 9,
+                                    color: AppTheme.accent,
+                                    fontWeight: FontWeight.w700,
+                                    decoration: TextDecoration.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
+                      const SizedBox(width: 8),
+                      // 设置入口（提醒开关 / 提醒地点 / 公测 API Key）
+                      const _SettingsButton(),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: AppTheme.textDim,
+                      decoration: TextDecoration.none,
                     ),
-                    const SizedBox(width: 8),
-                    // 内测版标识（0.1.0 内测，禁止外传）
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: AppTheme.accent.withValues(alpha: .15),
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: AppTheme.accent.withValues(alpha: .55)),
-                      ),
-                      child: const Text(
-                        '0.1.5 内测 · 禁止外传',
-                        style: TextStyle(
-                            fontSize: 9, color: AppTheme.accent, fontWeight: FontWeight.w700),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  subtitle,
-                  style: const TextStyle(fontSize: 12.5, color: AppTheme.textDim),
-                ),
-              ],
+                  ),
+                ],
+              ),
             ),
           ),
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(18, 8, 18, 24),
+            sliver: SliverList(delegate: SliverChildListDelegate(children)),
+          ),
+        ],
         ),
-        SliverPadding(
-          padding: const EdgeInsets.fromLTRB(18, 8, 18, 24),
-          sliver: SliverList(delegate: SliverChildListDelegate(children)),
+      ),
+    );
+  }
+}
+
+/// 顶栏右上角的设置入口
+///
+/// 放在 [ScreenScaffold] 里，所以每个功能页右上角都能进设置，
+/// 用户不必先回到某处再找入口。
+class _SettingsButton extends StatelessWidget {
+  const _SettingsButton();
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: '设置',
+      button: true,
+      child: GestureDetector(
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const SettingsScreen()),
         ),
-      ],
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          padding: const EdgeInsets.all(7),
+          decoration: BoxDecoration(
+            color: AppTheme.bgInset,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: AppTheme.borderSoft),
+          ),
+          child: const Icon(Icons.settings_outlined,
+              size: 17, color: AppTheme.accent),
+        ),
+      ),
     );
   }
 }
