@@ -1843,7 +1843,9 @@ class _LocationScreenState extends State<LocationScreen> {
             // 与和风的交叉验证（分歧时以雷达为准）
             if (_stationRadar!.check != null)
               Padding(
-                padding: const EdgeInsets.only(top: 6),
+                // 上下留等量间距：之前只有 top，导致下方与「各源与雷达吻合度」
+                // 标题贴在一起（用户反馈）
+                padding: const EdgeInsets.symmetric(vertical: 6),
                 child: Container(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 9, vertical: 7),

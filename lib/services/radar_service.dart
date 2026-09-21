@@ -420,7 +420,25 @@ class RadarService {
       final fileName = radarPath.split('/').last;
       final piIdx = fileName.indexOf('PI_');
       if (piIdx < 0) return const [];
-      final namePrefix = fileName.substring(0, piIdx);
+      var namePrefix = fileName.substring(0, piIdx);
+
+      // ⚠️ **央台按城市返回不同的雷达图**（实测 2026-09-22）：
+      //   · 上海 → 区域拼图 `AECN`（774×1326）
+      //   · 南京 → 最近的**单站**雷达 `AZ9250`（924×734）
+      // 两者的尺寸与投影完全不同：单站图喂给 `RadarService.analyze`
+      // 会按拼图的 kLon/kLat 去换算，坐标全错；而且单站图更新极不规律
+      // （实测 4 小时窗口只命中 10%），经常一帧都取不到。
+      // 所以这里**统一替换为区域拼图码**，保证定调用的图与标定参数匹配。
+      final codeMatch = RegExp(r'ECREF_([A-Z0-9]+)_L88').firstMatch(namePrefix);
+      final rawCode = codeMatch?.group(1) ?? '';
+      if (rawCode.isEmpty || rawCode.startsWith('AZ')) {
+        namePrefix = namePrefix.replaceFirst(
+          RegExp(r'ECREF_[A-Z0-9]+_L88'),
+          'ECREF_AECN_L88',
+        );
+        debugPrint('[雷达] 接口给的是单站码「$rawCode」，'
+            '定调改用区域拼图 AECN（单站图尺寸/投影与拼图不兼容）');
+      }
 
       // ⚠️ 文件名里的时间戳是 **UTC**，不是北京时间！
       // 实测：央台页面显示「制作时间 09/21 20:36」，而该帧的文件名是

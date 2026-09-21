@@ -122,16 +122,35 @@ class WeatherAlertService {
 
   /// 拉一次天气并视情况发通知
   ///
+  /// [alsoDaily] 为 true 时会**强制**额外推一条次日预报 ——
+  /// 设置页的「立即检查一次」用它来验证推送通道是否正常，
+  /// 不必等到 24:00。
+  ///
   /// 返回一段说明文字（供设置页展示"上次检查"的结果）。
-  static Future<String> checkAndNotify({bool force = false}) async {
+  static Future<String> checkAndNotify({
+    bool force = false,
+    bool alsoDaily = false,
+  }) async {
     final loc = await AppSettings.alertLocation();
     if (loc == null) return '尚未设置提醒地点';
+
+    final now = DateTime.now();
+
+    // ---- 手动触发：把每日推送也跑一遍（便于验证）----
+    if (alsoDaily) {
+      final txt = await _pushDailyForecast(loc.lat, loc.lon, loc.name);
+      await AppSettings.setLastDailyPush(now);
+      // 顺带也做一次变化检查（不强制，遵守 55 分钟节流）
+      final hourlyOn = await AppSettings.hourlyAlertEnabled();
+      if (hourlyOn) {
+        await checkAndNotify(force: force);
+      }
+      return txt;
+    }
 
     final hourlyOn = await AppSettings.hourlyAlertEnabled();
     final dailyOn = await AppSettings.dailyAlertEnabled();
     if (!hourlyOn && !dailyOn) return '提醒均已关闭';
-
-    final now = DateTime.now();
 
     // ---- 每日次日预报（约 24:00；这里取 23:00 之后触发，且当天只发一次）----
     if (dailyOn) {
@@ -267,8 +286,22 @@ class WeatherAlertService {
     return best;
   }
 
+  /// 地名缩短（通知标题用）
+  ///
+  /// 定位反查出来的是完整地址（如「江苏省南京市江宁区东山街道上元大街164号武夷花园」），
+  /// 整串塞进通知标题会长得看不清。这里取最有辨识度的一段（区/县/市/镇/街道）。
+  static String _shortPlace(String name) {
+    if (name.length <= 12) return name;
+    final matches =
+        RegExp(r'([\u4e00-\u9fa5]{2,8}(?:区|县|市|镇|街道))').allMatches(name);
+    if (matches.isNotEmpty) return matches.first.group(1)!;
+    return '${name.substring(0, 10)}…';
+  }
+
   /// 次日预报推送
-  static Future<String> _pushDailyForecast(double lat, double lon, String name) async {
+  static Future<String> _pushDailyForecast(
+      double lat, double lon, String name) async {
+    final short = _shortPlace(name);
     try {
       final daily = await _meteo.fetchDaily(
         lat: lat,
@@ -292,7 +325,7 @@ class WeatherAlertService {
         id: _dailyId,
         channelId: _channelDaily,
         channelName: '每日天气',
-        title: '$name 明日天气',
+        title: '$short 明日天气',
         body: body,
       );
       return '已推送次日预报：$body';

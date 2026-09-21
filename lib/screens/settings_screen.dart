@@ -173,7 +173,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _runCheckNow() async {
     setState(() => _busy = true);
-    final msg = await WeatherAlertService.checkAndNotify(force: true);
+    // alsoDaily: 顺手把每日推送也发一条，方便验证推送通道
+    final msg = await WeatherAlertService.checkAndNotify(
+      force: true,
+      alsoDaily: true,
+    );
     if (!mounted) return;
     setState(() {
       _busy = false;
@@ -240,10 +244,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   children: [
                     const Text('提醒地点',
                         style: TextStyle(fontSize: 13, color: AppTheme.text)),
-                    const Spacer(),
-                    Text(
-                      _loc == null ? '未设置' : _loc!.name,
-                      style: const TextStyle(fontSize: 12.5, color: AppTheme.accent),
+                    const SizedBox(width: 10),
+                    // 地名可能很长（如「江苏省南京市江宁区东山街道上元大街164号武夷花园」），
+                    // 必须给 Flexible + 省略号，否则会把标签挤没并顶出容器
+                    Expanded(
+                      child: Text(
+                        _loc == null ? '未设置' : _loc!.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.right,
+                        style: const TextStyle(
+                            fontSize: 12.5, color: AppTheme.accent),
+                      ),
                     ),
                   ],
                 ),
@@ -255,9 +267,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     return Padding(
                       padding: const EdgeInsets.only(top: 4),
                       child: Text(
-                        '${_loc!.lat.toStringAsFixed(3)}, ${_loc!.lon.toStringAsFixed(3)}'
-                        '　最近雷达站 ${st.name}（${st.code}）· 距 ${dist.toStringAsFixed(0)} km'
-                        '${dist > NmcStationRadar.coverageKm ? '（超出单站覆盖）' : ''}',
+                        // 控制长度：之前带站点码 + 3 位小数会超出容器宽度
+                        '${_loc!.lat.toStringAsFixed(2)}, '
+                        '${_loc!.lon.toStringAsFixed(2)}　'
+                        '最近站 ${st.name} · ${dist.toStringAsFixed(0)} km'
+                        '${dist > NmcStationRadar.coverageKm ? '（超出覆盖）' : ''}',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                             fontSize: 10.5, color: AppTheme.textFaint, height: 1.4),
                       ),
