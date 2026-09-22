@@ -217,6 +217,14 @@ class _AmapViewState extends State<AmapView> {
     }
   }
 
+  /// 是否正在由 `fitPoints` 驱动相机移动
+  ///
+  /// 这段窗口内的相机回调**不转发给外部**（见 [onCameraMoveEnd] 处的说明）：
+  /// 否则会形成正反馈 —— fitPoints（由网格范围算出）→ moveCamera →
+  /// zoom 变化 → 外部按新 zoom 重采网格 → 网格范围变 → fitPoints 变 →
+  /// 再 moveCamera …（实测把 zoom 从 11.5 一路发散到 7.7）。
+  bool _autoFitting = false;
+
   /// 延迟执行 fitBounds：地图刚创建时立即调用常不生效，多试几次
   void _scheduleFit() {    WidgetsBinding.instance.addPostFrameCallback((_) => _applyFit());
     for (final ms in [600, 1500, 3000]) {
@@ -229,6 +237,13 @@ class _AmapViewState extends State<AmapView> {
     final pts = widget.fitPoints;
     debugPrint('[AmapView] _applyFit controller=${c != null} points=${pts.length}');
     if (c == null || !mounted || pts.isEmpty) return;
+
+    // 标记「接下来这段相机变化是程序驱动的」，外部据此跳过重采等响应
+    _autoFitting = true;
+    Future.delayed(const Duration(milliseconds: 1200), () {
+      if (mounted) _autoFitting = false;
+    });
+
     if (pts.length == 1) {
       c.moveCamera(CameraUpdate.newLatLngZoom(pts.first, 13));
       return;
@@ -312,7 +327,14 @@ class _AmapViewState extends State<AmapView> {
         _applyTileOverlay(); // 应用瓦片叠加
         widget.onMapCreated?.call(c);
       },
-      onCameraMoveEnd: (pos) => widget.onCameraMoveEnd?.call(pos.target, pos.zoom),
+      // ⚠️ 由 fitPoints 程序驱动的镜头移动**不转发给外部**，否则会形成正反馈：
+      // fitPoints（由网格范围算出）→ moveCamera → zoom 变化 →
+      // 外部按新 zoom 重采网格 → 网格范围变 → fitPoints 变 → 再 moveCamera …
+      // 实测该循环会让 zoom 从 11.5 一路发散到 7.7，越缩越小。
+      onCameraMoveEnd: (pos) {
+        if (_autoFitting) return;
+        widget.onCameraMoveEnd?.call(pos.target, pos.zoom);
+      },
       // 手势：仅在激活时独占，保证页面能正常滚动
       zoomGesturesEnabled: true,
       scrollGesturesEnabled: true,

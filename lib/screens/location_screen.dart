@@ -882,10 +882,14 @@ class _LocationScreenState extends State<LocationScreen> {
     // 网格数据（云量+雨量逐小时，用于叠加图层与时间轴动画）
     var grid = const <GridPoint>[];
     try {
+      // 网格跨度跟着地图缩放走（见 [_spanKmForZoom]）：视野大时覆盖更大范围，
+      // 缩小时才看得到周边云量/雨量分布，而不是永远只有中心那一小块
+      _gridSpanKm = _spanKmForZoom(_currentZoom);
+      _fitSpanKm = _gridSpanKm; // 换地点：适配视野也跟着新网格走
       grid = await _meteo.fetchGrid(
         centerLat: center.lat,
         centerLon: center.lon,
-        spanKm: 24,
+        spanKm: _gridSpanKm,
         n: _gridN,
       );
       debugPrint('[网格] 点数=${grid.length} 时刻数=${grid.isEmpty ? 0 : grid.first.length}');
@@ -1364,6 +1368,11 @@ class _LocationScreenState extends State<LocationScreen> {
                       onCameraMoveEnd: (target, zoom) {
                         if ((zoom - _currentZoom).abs() > 0.01) {
                           setState(() => _currentZoom = zoom);
+                          // 缩放跨越档位时，按新视野重采云量 / 雨量网格 ——
+                          // 这是「缩小地图能看到更大范围云量」的关键。
+                          // 网格是一次请求取回 N×N 个点（逗号分隔多坐标），
+                          // 所以**不增加请求数**，只改变覆盖范围与分辨率。
+                          unawaited(_resampleGridForZoom());
                         }
                       },
                       interactive: true,
@@ -2277,6 +2286,10 @@ class _LocationScreenState extends State<LocationScreen> {
           // 风云四号卫星云图（看云系）
           _loadSatellite();
         } else {
+          // 切到云量 / 雨量：把「适配视野」的跨度快照更新为当前网格档，
+          // 这样从雷达 / 卫星的大范围切回来时会**缩放到网格范围**
+          // （用户反馈「从雷达图切回云量不会放大到最近尺寸」）。
+          _fitSpanKm = _gridSpanKm;
           _regenerateOverlay();
         }
       },
@@ -2508,6 +2521,83 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
+  /// 当前云量 / 雨量网格的覆盖跨度（km）
+  ///
+  /// 由地图缩放级别决定（见 [_spanKmForZoom]）：视野大时网格也放大。
+  /// 这样缩小地图能看到更大范围的云量分布，而不是永远只有中心那一小块。
+  double _gridSpanKm = 24;
+
+  /// 网格重采是否进行中（防止连续捏合触发并发请求）
+  bool _gridResampling = false;
+
+  /// 按地图缩放级别给出合适的网格覆盖跨度（km）
+  ///
+  /// 高德（Web Mercator）下 `米/像素 = 156543 × cos(lat) / 2^zoom`。
+  /// ⚠️ 地图卡片是 `SizedBox(height: 300)`，即 **300 逻辑像素**高，所以
+  /// 视野跨度 ≈ 300 × 156543 × cos(32°) / 2^zoom / 1000 ≈ **39.8 / 2^zoom 公里**
+  ///   · zoom 11 → 约 19 km     · zoom 10 → 约 39 km
+  ///   · zoom 9  → 约 78 km     · zoom 8  → 约 156 km
+  /// 网格跨度取与之相当的值，缩小地图就能看到更大范围的云量。
+  ///
+  /// ⚠️ 必须**用离散档位而不是连续跟随**：连续计算会让每一次捏合都触发重新
+  /// 采样（抖动且浪费），而网格本来就是固定的 9×9 个点，按档位整体换一档即可。
+  ///
+  /// ⚠️ 早先这里误用了 745px 作为地图高度，算出偏大一倍的跨度，配合
+  /// 「程序移动也重采」曾形成正反馈（zoom 从 11.5 一路发散到 7.7）。
+  double _spanKmForZoom(double z) {
+    if (z >= 12.0) return 12; // 视野 ≤ 10 km
+    if (z >= 11.0) return 24; // 默认档（初始 zoom 11.5 落这里，与原 24km 行为一致）
+    if (z >= 10.0) return 48;
+    if (z >= 9.0) return 96;
+    if (z >= 8.0) return 192;
+    return 384; // 省域级
+  }
+
+  /// 地图缩放跨越档位后，按新视野重新采样云量 / 雨量网格
+  ///
+  /// 这是「缩小地图能看到更大范围云量」的实现：网格覆盖范围跟着视野走。
+  /// **不增加请求数** —— `OpenMeteoService.fetchGrid` 用逗号分隔的多坐标
+  /// 一次取回 N×N 个点，只改变覆盖范围与分辨率。
+  Future<void> _resampleGridForZoom() async {
+    final c = _result?.center;
+    if (c == null || _gridResampling) return;
+
+    final span = _spanKmForZoom(_currentZoom);
+    if (span == _gridSpanKm) return; // 档位没变，不重采
+
+    _gridResampling = true;
+    try {
+      final grid = await _meteo.fetchGrid(
+        centerLat: c.lat,
+        centerLon: c.lon,
+        spanKm: span,
+        n: _gridN,
+      );
+      if (!mounted) return;
+      debugPrint('[网格] 缩放档位变化 zoom=$_currentZoom → spanKm=$span'
+          '（${grid.length} 点）');
+      setState(() {
+        _grid = grid;
+        _gridSpanKm = span;
+        _overlayPng = null; // 强制重渲染叠加位图
+      });
+      await _regenerateOverlay();
+    } catch (e) {
+      debugPrint('[网格] 按缩放重采失败: $e');
+    } finally {
+      _gridResampling = false;
+    }
+  }
+
+  /// 云量 / 雨量图层的「适配视野」跨度快照（km）
+  ///
+  /// ⚠️ **刻意与 [_gridSpanKm] 分开**：网格会随用户缩放重新采样，若 fitPoints
+  /// 也跟着变，就会在每次重采后强行把镜头拉回网格范围 —— 等于**和用户抢缩放**
+  /// （用户缩到 z10，程序又 fit 回 z9.4，永远缩不到位）。
+  /// 这里只在**图层切换 / 换地点时**取一次快照，保证「切回云量时缩放到当前
+  /// 网格范围」只发生一次，之后用户的缩放完全自主。
+  double _fitSpanKm = 24;
+
   /// 当前图层对应的「自动适配视野」点集
   ///
   /// [AmapView] 检测到 fitPoints 变化会把镜头缩放到恰好框住这些点的范围。
@@ -2517,9 +2607,12 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 拉到全图时定位点只剩一个像素。改为以中心点为基准给一个**合理半径**：
   ///   · 雷达   → ±150km，本地回波看得清，又不会偏出雷达图覆盖
   ///   · 卫星   → ±800km，卫星云图约 11km/像素，范围太小看不出云系
+  ///   · 云量 / 雨量 → 框住切换那一刻的网格范围（略留边）
   ///
-  /// 云量 / 雨量 / 关闭 返回空数组：这两种是围绕中心点的 24km 网格，
-  /// 本就在视野内，不需要动镜头（也避免把用户自己的缩放操作顶掉）。
+  /// ⚠️ 云量 / 雨量**必须返回非空**：早先这里返回空数组，理由写的是
+  /// 「网格本就在视野内，不需要动镜头」—— 但那只在「视野本来就小」时成立。
+  /// 从雷达（±150km）或卫星（±800km）切回来时视野仍是大范围，网格叠加图
+  /// 会缩成中间一小块（用户反馈「切回云量不会放大到最近尺寸」）。
   List<LatLng> _mapFitPoints(LatLng center) {
     switch (_layerMode) {
       case _LayerMode.radar:
@@ -2529,6 +2622,8 @@ class _LocationScreenState extends State<LocationScreen> {
         return _boxAround(center, 800);
       case _LayerMode.cloud:
       case _LayerMode.rain:
+        // 1.25 倍留边，避免叠加图正好贴住屏幕边缘
+        return _boxAround(center, _fitSpanKm / 2 * 1.25);
       case _LayerMode.none:
         return const [];
     }
