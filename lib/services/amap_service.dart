@@ -147,6 +147,9 @@ class AmapService {
   static const String _driveUrl = 'https://restapi.amap.com/v3/direction/driving';
   static const String _tipUrl = 'https://restapi.amap.com/v3/assistant/inputtips';
 
+  /// POI **关键字检索**（与 [_tipUrl] 的输入提示不同：这是「找地点」的正式接口）
+  static const String _placeUrl = 'https://restapi.amap.com/v3/place/text';
+
   final http.Client _client;
   AmapService({http.Client? client}) : _client = client ?? http.Client();
 
@@ -242,6 +245,125 @@ class AmapService {
     final loc = (list.first as Map)['location'] as String; // "经度,纬度"
     final parts = loc.split(',');
     return GeoPoint(lon: double.parse(parts[0]), lat: double.parse(parts[1]), name: address);
+  }
+
+  /// **POI 关键字检索**（`v3/place/text`）
+  ///
+  /// 与 [geocode]（地址解析）不同，这是**找地点**的接口：
+  /// 输入「北京金港国际赛车场」会返回该 POI 本身，而 geocode 会返回一个
+  /// 叫「金港国际」的住宅小区。**文本兜底应该先走这里。**
+  ///
+  /// [city] 限定城市可显著提高精度（配合 `citylimit=true`）；
+  /// [near] 传 `经度,纬度` 时按距离排序。
+  Future<List<PoiTip>> placeText(
+    String keyword, {
+    String? city,
+    String? near,
+    int max = 8,
+  }) async {
+    _ensureKey();
+    final kw = keyword.trim();
+    if (kw.isEmpty) return const [];
+
+    final params = <String, String>{
+      'keywords': kw,
+      'key': Secrets.amapWebKey,
+      'offset': '$max',
+      'page': '1',
+      'extensions': 'base',
+    };
+    if (city != null && city.isNotEmpty) {
+      params['city'] = city;
+      params['citylimit'] = 'true';
+    }
+    if (near != null && near.isNotEmpty) {
+      params['location'] = near;
+      params['sortrule'] = 'distance';
+    }
+
+    try {
+      final uri = Uri.parse(_placeUrl).replace(queryParameters: params);
+      final resp = await _client.get(uri).timeout(const Duration(seconds: 12));
+      final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
+      if (data['status'] != '1') {
+        debugPrint('[POI 检索] 失败: ${data['info']}');
+        return const [];
+      }
+      final list = data['pois'] as List?;
+      if (list == null) return const [];
+
+      final out = <PoiTip>[];
+      for (final e in list) {
+        final m = e as Map;
+        final name = '${m['name'] ?? ''}';
+        if (name.isEmpty) continue;
+        final loc = '${m['location'] ?? ''}';
+        String? lat, lon;
+        if (loc.contains(',')) {
+          final p = loc.split(',');
+          if (p.length == 2 && p[0].isNotEmpty && p[1].isNotEmpty) {
+            lon = p[0];
+            lat = p[1];
+          }
+        }
+        out.add(PoiTip(
+          name: name,
+          district: '${m['adname'] ?? ''}',
+          address: '${m['address'] ?? ''}',
+          lat: lat,
+          lon: lon,
+          adcode: '${m['adcode'] ?? ''}',
+          type: '${m['typecode'] ?? ''}',
+        ));
+      }
+      debugPrint('[POI 检索] "$kw"${city == null ? "" : " @$city"} -> ${out.length} 条候选');
+      return out;
+    } catch (e) {
+      debugPrint('[POI 检索] 异常: $e');
+      return const [];
+    }
+  }
+
+  /// **智能地理编码**：POI 检索优先，失败才退回地址解析
+  ///
+  /// ⚠️ 为什么不能直接用 [geocode]（实测结论，2026-09-22）：
+  /// `v3/geocode/geo` 是**地址解析**，对 POI 名（尤其非标准地名）极不可靠 ——
+  ///
+  /// | 输入 | geocode 返回 | 实际位置 |
+  /// |---|---|---|
+  /// | 鄂尔多斯国际赛车场 | 珠海市香洲区 | 鄂尔多斯康巴什 |
+  /// | 北京金港国际赛车场 | 朝阳区「金港国际」**住宅小区** | 朝阳区金盏乡 |
+  /// | 南京万驰国际赛车场 | 南京市中心（level=市） | 溧水区柘塘 |
+  /// | 纽博格林北环赛道 | 张家港万达广场 | 德国 |
+  ///
+  /// 而 `v3/place/text` 对同样的词全部命中正确位置。因此凡是要把
+  /// **用户输入的文本**变成坐标的地方（地点查询、出行路线起终点兜底），
+  /// 都必须走本方法，而不是直接 [geocode]。
+  ///
+  /// 标准地址（如「上海市嘉定区伊宁路2000号」）仍会由 ② 的地址解析兜住。
+  Future<GeoPoint?> geocodeSmart(
+    String text, {
+    String? city,
+    String? near,
+  }) async {
+    final kw = text.trim();
+    if (kw.isEmpty) return null;
+
+    // ① POI 检索优先（找地点）
+    final pois = await placeText(kw, city: city, near: near, max: 5);
+    for (final p in pois) {
+      final pt = p.point;
+      if (pt != null) return pt;
+    }
+
+    // ② 退回地址解析（标准地址用它更准）
+    try {
+      final g = await geocode(kw);
+      if (g != null) return g;
+    } catch (e) {
+      debugPrint('[地理编码] 地址解析也失败: $e');
+    }
+    return null;
   }
 
   /// **逆地理编码**：坐标 → 行政区（用于匹配中央气象台城市）

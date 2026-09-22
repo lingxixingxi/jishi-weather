@@ -1,18 +1,25 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../engine/weather_estimator.dart';
+import 'radar_projection.dart';
 
-/// 雷达拼图的 dBZ 色标（从中央气象台华东雷达拼图**实测提取**）
+/// 一帧雷达原始数据（时间 + PNG 字节）
+typedef RadarRawFrame = ({DateTime time, Uint8List bytes});
+
+/// 雷达图的 dBZ 色标（从中央气象台华东雷达拼图**实测提取**）
 ///
 /// 色带位于图片底部 y≈1251~1263，每段约 45.6px，
 /// 起点 x=33 对应 5 dBZ，公式 `dBZ = 5 + (x-33)/45.6*5`。
 /// 颜色定义对应中央气象台 [组合反射率] 标准色标。
+///
+/// ⚠️ 单站雷达图（924×734）用的是**同一套色标**，只是位置不同
+/// （印在右侧信息面板里，y≈240~590）—— 这也是必须把面板排除在
+/// 回波统计之外的原因：色标色与回波色完全相同。
 class RadarPalette {
   RadarPalette._();
 
@@ -33,6 +40,9 @@ class RadarPalette {
   ];
 
   /// 背景色（海洋/陆地/边界），这些不算回波
+  ///
+  /// 拼图底图（浅绿陆地 + 浅蓝海洋 + 白色）与单站图底图（灰白地形晕渲 +
+  /// 蓝色水系 + 黑色标注）都靠这一组 + 容差判据排掉。
   static const List<({int r, int g, int b})> backgrounds = [
     (r: 179, g: 230, b: 255), // 海洋浅蓝
     (r: 255, g: 255, b: 255), // 白
@@ -44,17 +54,43 @@ class RadarPalette {
     (r: 204, g: 204, b: 204),
   ];
 
+  /// 最近邻颜色距离上限
+  ///
+  /// ⚠️ 原实现用 `tolerance * 3 = 96`，过宽。实测单站图上一批
+  /// `RGB(187,187,255)` 浅紫像素到 65 dBZ 紫色 `(173,144,240)` 的距离
+  /// 只有 72，会被判成 **65 dBZ** —— 而 65 dBZ 在 [dbzLevel] 里是
+  /// 「强降水/冰雹」，属严重误报（当时上海/南京并无强对流）。
+  /// 收到 60 后单站图的 11 个假强回波全部消失。
+  static const int maxColorDistance = 60;
+
+  /// 饱和度门槛（`max(r,g,b) - min(r,g,b)`）
+  ///
+  /// 雷达色标**全部是高饱和颜色**（最低的 65 dBZ 紫色也有 96 的饱和度），
+  /// 而地图底图上易被误判的像素（水系边缘、城市标注抗锯齿、灰度地形晕渲）
+  /// 饱和度都很低。实测拼图/单站图加此门槛后，40 dBZ 以上的**真实强回波
+  /// 计数一个没少**，只滤掉了弱回波的抗锯齿边缘。
+  static const int minSaturation = 80;
+
   /// RGB → dBZ（容差匹配，找不到回波返回 null）
   ///
   /// 雷达图经缩放/压缩后颜色会有偏移，所以用最近邻 + 容差判断。
+  ///
+  /// **三道防线**（后两道为 2026-09-22 实测补上）：
+  /// 1. 背景色排除（海洋浅蓝 / 白 / 浅绿陆地 / 黑灰标注）；
+  /// 2. [minSaturation] 饱和度门槛；
+  /// 3. [maxColorDistance] 最近邻距离上限。
   static int? rgbToDbz(int r, int g, int b, {int tolerance = 32}) {
-    // 先排除背景
+    // ① 先排除背景
     for (final bg in backgrounds) {
       if ((r - bg.r).abs() + (g - bg.g).abs() + (b - bg.b).abs() < tolerance) {
         return null;
       }
     }
-    // 找最近色标
+    // ② 饱和度门槛：滤掉灰 / 浅灰紫这类底图元素
+    final mx = math.max(r, math.max(g, b));
+    final mn = math.min(r, math.min(g, b));
+    if (mx - mn < minSaturation) return null;
+    // ③ 找最近色标
     int bestDbz = 0;
     var bestDist = 1 << 30;
     for (final e in entries) {
@@ -64,7 +100,7 @@ class RadarPalette {
         bestDbz = e.dbz;
       }
     }
-    if (bestDist > tolerance * 3) return null;
+    if (bestDist > maxColorDistance) return null;
     return bestDbz;
   }
 
@@ -88,76 +124,18 @@ class RadarPalette {
   }
 }
 
-/// 雷达拼图的经纬度标定（华东区域）
-///
-/// 参数由**图上地理特征反演**得到（中央气象台未公开投影参数）：
-/// · 经度：台湾本岛最西 120.03°E @x=470，最东 121.99°E @x=545
-///   → kLon = 0.02627 °/px，lonMin(x=0) = 107.68
-/// · 纬度：台湾本岛最南 21.90°N @y=1170，最北 25.30°N @y=930
-///   → kLat = 0.01417 °/px，latMax(y=0) = 38.48
-///
-/// ✅ 交叉验证：台北市 (121.57°E, 25.03°N) → 图上 (529, 949)，
-///    与图中「台北」标注圆点 (528, 948) 吻合。
-///
-/// ⚠️ 注意 x / y 方向的 °/px 不同，说明该拼图的经纬度比例并非 1:1，
-///    因此**不能**用单一比例换算。
-///
-/// **参数校准（2026-09-21，自动拟合）**：
-/// 该拼图自带地理底图（省界/海岸线/城市标注），于是用 cv2 检测出图上
-/// 每个城市标注旁的小圆点，与 70 个已知城市经纬度做迭代最小二乘拟合
-/// （残差中位 13.7px，全图 774×1326）。
-///
-/// 旧值 kLon=0.02627 / lonMin=107.68 是把经度跨度估计得过大，
-/// 导致叠加层整体向右上方偏移 —— 这正是「大丰区跑到海上、叠加图与底图对不上」的原因。
-class RadarGeo {
-  /// 经度：每像素度数
-  static const double kLon = 0.019867;
-
-  /// 经度起点（x=0）
-  static const double lonMin = 111.710;
-
-  /// 纬度：每像素度数
-  static const double kLat = 0.016279;
-
-  /// 纬度起点（y=0）
-  static const double latMax = 39.205;
-
-  /// 地图区占整图的高度比例
-  ///
-  /// **实测校准（2026-09-21，774×1326 原图）**：底部图例（产品标题 + dBZ 色标 +
-  /// 审图号）的**色带从 y≈1251 开始**，即约 5.7%。
-  ///
-  /// 取 0.942（= y 1250）而不是 0.95：色标的颜色和回波色完全一样，
-  /// 若只裁到 y=1259 会留下一条彩色色带，被回波提取判为回波留在图上
-  /// （实测在「泰国」上方出现一条彩色横条）。多裁几像素把它切干净。
-  static const double mapHeightRatio = 0.942;
-
-  RadarGeo._();
-
-  /// 像素 → 经纬度
-  static ({double lat, double lon}) pixelToLatLon(double x, double y) => (
-        lat: latMax - y * kLat,
-        lon: lonMin + x * kLon,
-      );
-
-  /// 经纬度 → 像素
-  static ({double x, double y}) latLonToPixel(double lat, double lon) => (
-        x: (lon - lonMin) / kLon,
-        y: (latMax - lat) / kLat,
-      );
-
-  /// 该坐标是否落在雷达图覆盖范围内
-  static bool covers(double lat, double lon, {int width = 774, int height = 1326}) {
-    final p = latLonToPixel(lat, lon);
-    return p.x >= 0 && p.x < width && p.y >= 0 && p.y < height * mapHeightRatio;
-  }
-}
-
 /// 单帧雷达分析结果
 class RadarFrame {
   final DateTime time;
   final int width;
   final int height;
+
+  /// 该帧所属的**投影** —— 所有经纬度↔像素换算都以它为准
+  ///
+  /// 这是本轮重构的核心：拼图（[EastChinaProjection]，2.6 km/px）与
+  /// 单站图（[StationProjection]，0.68 km/px）几何完全不同，把投影挂在帧上
+  /// 之后，取样/外推/边界判断就能共用一套代码，无需再靠「换成拼图」绕开。
+  final RadarProjection projection;
 
   /// 回波格点（稀疏：只存有回波的）
   final List<({int x, int y, int dbz})> echoes;
@@ -179,6 +157,7 @@ class RadarFrame {
     required this.time,
     required this.width,
     required this.height,
+    this.projection = const EastChinaProjection(),
     required this.echoes,
     this.centroidX,
     this.centroidY,
@@ -232,7 +211,7 @@ class RadarMotion {
 
 /// 雷达图像分析与回波外推服务
 ///
-/// 中央气象台只提供**栅格拼图 PNG**（无原始 dBZ 数据），
+/// 中央气象台只提供**栅格 PNG**（无原始 dBZ 数据），
 /// 所以这里走「图像级」分析路线：
 ///   1. 按色标把像素反演为 dBZ
 ///   2. 提取回波区、算质心与强度分布
@@ -240,15 +219,25 @@ class RadarMotion {
 ///   4. 按运动矢量外推 → 判断某点未来是否有降水
 ///
 /// 参考：Z-R 关系 Marshall-Palmer(1948) 在 [WeatherEstimator] 中实现。
+///
+/// **两类产品**（URL 结构相同，仅产品码不同）：
+/// · 区域拼图 `AECN`：774×1326，覆盖华东，2.6 km/px，底部有同色色标
+/// · 单站雷达 `AZ####`：924×734，以站点为中心 256km，0.68 km/px，右侧面板有同色色标
+/// 两者由 [RadarProjection] 区分，分析链路完全共用。
 class RadarService {
   RadarService._();
 
   /// 解码 PNG 并分析回波
   ///
+  /// [projection] 决定**地图区范围**与后续所有坐标换算：
+  /// · 拼图：排除底部图例（色标与回波同色，不排除会凭空多出一条彩色横带）
+  /// · 单站：排除右侧信息面板（内含 dBZ 色标条，实测含面板时 60/65 dBZ 各多 260+ 像素）
+  ///
   /// [sampleStep] 采样步长（1=全像素，2=隔一个取一个，用于提速）
   static Future<RadarFrame?> analyze(
     Uint8List pngBytes,
     DateTime time, {
+    RadarProjection projection = const EastChinaProjection(),
     int sampleStep = 2,
     int minDbz = 5,
   }) async {
@@ -263,15 +252,16 @@ class RadarService {
     final h = image.height;
     final pixels = byteData.buffer.asUint8List();
 
-    // 只分析地图区域（去掉底部色标与标题：下 12% 不分析）
-    final mapBottom = (h * 0.88).round();
+    // 只在**地图区**内提取回波（右边界与下边界都由投影给出）
+    final mapRight = math.min(w, projection.mapWidthPx);
+    final mapBottom = math.min(h, projection.mapHeightPx);
 
     final echoes = <({int x, int y, int dbz})>[];
     var sumX = 0.0, sumY = 0.0, sumDbz = 0.0;
     var maxDbz = 0;
 
     for (var y = 0; y < mapBottom; y += sampleStep) {
-      for (var x = 0; x < w; x += sampleStep) {
+      for (var x = 0; x < mapRight; x += sampleStep) {
         final i = (y * w + x) * 4;
         final r = pixels[i];
         final g = pixels[i + 1];
@@ -288,11 +278,13 @@ class RadarService {
       }
     }
 
-    final total = (mapBottom / sampleStep).round() * (w / sampleStep).round();
+    final total = (mapBottom / sampleStep).round() *
+        (mapRight / sampleStep).round();
     return RadarFrame(
       time: time,
       width: w,
       height: h,
+      projection: projection,
       echoes: echoes,
       centroidX: echoes.isEmpty ? null : sumX / echoes.length,
       centroidY: echoes.isEmpty ? null : sumY / echoes.length,
@@ -305,9 +297,12 @@ class RadarService {
   /// 由多帧质心位移估算回波运动矢量（简易光流）
   ///
   /// 帧按时间**正序**传入（旧 → 新）。
+  ///
+  /// [kmPerPixel] 省略时取帧自带投影的比例（单站图 0.68 km/px 与
+  /// 拼图 2.6 km/px 差近 4 倍，写死会导致速度算错 4 倍）。
   static RadarMotion? estimateMotion(
     List<RadarFrame> frames, {
-    double kmPerPixel = 2.0,
+    double? kmPerPixel,
   }) {
     final valid = frames.where((f) => f.hasEcho && f.centroidX != null).toList();
     if (valid.length < 2) return null;
@@ -326,7 +321,7 @@ class RadarService {
       dxPerFrame: totalDx / frameCount,
       dyPerFrame: totalDy / frameCount,
       frameMinutes: dtMin ~/ frameCount,
-      kmPerPixel: kmPerPixel,
+      kmPerPixel: kmPerPixel ?? last.projection.kmPerPixel,
     );
   }
 
@@ -349,7 +344,7 @@ class RadarService {
     int minutesAhead, {
     int radiusPx = 1,
   }) {
-    final p = RadarGeo.latLonToPixel(lat, lon);
+    final p = latest.projection.latLonToPixel(lat, lon);
     final steps = minutesAhead / motion.frameMinutes;
     final srcX = p.x - motion.dxPerFrame * steps;
     final srcY = p.y - motion.dyPerFrame * steps;
@@ -374,14 +369,24 @@ class RadarService {
   /// 实测经验：30~60 分钟外推可信度高；2 小时以上误差明显增大。
   static const int forecastMaxMinutes = 120;
 
-  /// 雷达拼图的**产品生成延迟**（分钟）
+  /// 雷达产品（拼图与单站共用）的**生成延迟**（分钟）
   ///
-  /// 拼图每 6 分钟一张，但从观测到出图有几分钟滞后。取帧时以
+  /// 每 6 分钟一张，但从观测到出图有几分钟滞后。取帧时以
   /// 「当前时间 − 该延迟」再对齐到 6 分钟网格作为起点，避免总是先撞 404。
   static const int radarGenerationLagMinutes = 6;
 
-  /// 雷达拼图的标称时间间隔（分钟）
+  /// 雷达产品的标称时间间隔（分钟）
   static const int radarFrameMinutes = 6;
+
+  /// **单站雷达的新鲜度阈值**（分钟）
+  ///
+  /// 单站雷达更新极不规律（实测 4 小时窗口仅约 10% 命中），所以判据是
+  /// 「最近一帧距今 ≤ 60 分钟」→ 认为能代表「此刻」，用高精度的单站图定调；
+  /// 超过则视为过期，**回退**到区域拼图（精度降到 2.6 km/px，但 80% 有数据）。
+  ///
+  /// 这正是用户要求的口径：**先查单站，查过且过期才回退拼图**，
+  /// 而不是无条件用拼图。
+  static const int stationFreshMinutes = 60;
 
   /// 按运动矢量外推：预测 [minutesAhead] 分钟后回波质心位置
   static ({double x, double y})? predictCentroid(
@@ -397,22 +402,46 @@ class RadarService {
     );
   }
 
+  // ==================== 产品码 ====================
+
+  /// 从 URL 或文件名模板里取产品码（区域码如 `AECN`，站点码如 `AZ9250`）
+  static String? productCode(String radarPathOrTemplate) {
+    final m = RegExp(r'ECREF_([A-Z0-9]+)_L88').firstMatch(radarPathOrTemplate);
+    return m?.group(1);
+  }
+
+  /// 是否为**单站**产品码（中央气象台的站点码一律以 `AZ` 开头）
+  static bool isStationCode(String? code) =>
+      code != null && code.startsWith('AZ');
+
+  /// 把任意产品模板改写成**华东拼图** `AECN`
+  static String asMosaicTemplate(String template) =>
+      template.contains('ECREF_AECN_')
+          ? template
+          : template.replaceFirst(
+              RegExp(r'ECREF_[A-Z0-9]+_L88'), 'ECREF_AECN_L88');
+
   /// 拉取最近 N 帧雷达图（间隔 6 分钟，按时间正序返回）
   ///
   /// [radarPath] 来自 `NmcService.weather()` 的 `radarImagePath`，
   /// 形如 `/product/2026/09/19/RDCP/SEVP_..._PI_20260919073600000.PNG`。
-  /// **这里只用它取「文件名模板」**（产品名与区域码），时间戳一律按当前时间重算。
+  /// **这里只用它取「文件名模板」**（产品名与区域/站点码），时间戳一律按当前时间重算。
   ///
   /// ⚠️ **为什么不能用 radarPath 里的时间戳**（这是个实际踩过的坑）：
   /// 那个 path 是上一次调央台接口时拿到的。若 App 在后台挂了几小时，
   /// 缓存的 path 就指向几小时前的时刻 —— 而央台会清理过期产品，
   /// 于是构造出的 URL 全部 404，表现为**「雷达图获取不到」**，
   /// 重启 App 重新拉接口后才恢复。
-  static Future<List<({DateTime time, Uint8List bytes})>> fetchRecentFrames({
+  ///
+  /// [forceMosaic] 为 true 时把产品码强制换成华东拼图 —— **仅用于地图叠加层**
+  /// （叠加需要固定投影与固定经纬度范围）。用于「定调」的取样请走
+  /// `RadarSourcePicker.pick()`，它会按「单站优先、过期回退拼图」选源。
+  static Future<List<RadarRawFrame>> fetchRecentFrames({
     required String radarPath,
     int count = 3,
     http.Client? client,
     DateTime? now,
+    bool forceMosaic = false,
   }) async {
     final own = client == null;
     final c = client ?? http.Client();
@@ -421,24 +450,7 @@ class RadarService {
       final piIdx = fileName.indexOf('PI_');
       if (piIdx < 0) return const [];
       var namePrefix = fileName.substring(0, piIdx);
-
-      // ⚠️ **央台按城市返回不同的雷达图**（实测 2026-09-22）：
-      //   · 上海 → 区域拼图 `AECN`（774×1326）
-      //   · 南京 → 最近的**单站**雷达 `AZ9250`（924×734）
-      // 两者的尺寸与投影完全不同：单站图喂给 `RadarService.analyze`
-      // 会按拼图的 kLon/kLat 去换算，坐标全错；而且单站图更新极不规律
-      // （实测 4 小时窗口只命中 10%），经常一帧都取不到。
-      // 所以这里**统一替换为区域拼图码**，保证定调用的图与标定参数匹配。
-      final codeMatch = RegExp(r'ECREF_([A-Z0-9]+)_L88').firstMatch(namePrefix);
-      final rawCode = codeMatch?.group(1) ?? '';
-      if (rawCode.isEmpty || rawCode.startsWith('AZ')) {
-        namePrefix = namePrefix.replaceFirst(
-          RegExp(r'ECREF_[A-Z0-9]+_L88'),
-          'ECREF_AECN_L88',
-        );
-        debugPrint('[雷达] 接口给的是单站码「$rawCode」，'
-            '定调改用区域拼图 AECN（单站图尺寸/投影与拼图不兼容）');
-      }
+      if (forceMosaic) namePrefix = asMosaicTemplate(namePrefix);
 
       // ⚠️ 文件名里的时间戳是 **UTC**，不是北京时间！
       // 实测：央台页面显示「制作时间 09/21 20:36」，而该帧的文件名是
@@ -450,7 +462,7 @@ class RadarService {
       t = DateTime.utc(t.year, t.month, t.day, t.hour,
           (t.minute ~/ radarFrameMinutes) * radarFrameMinutes);
 
-      final out = <({DateTime time, Uint8List bytes})>[];
+      final out = <RadarRawFrame>[];
       var attempts = 0;
       // ⚠️ 回退帧数要够大：实测区域拼图**最新帧常滞后 20~40 分钟**，
       // 个别时段（如凌晨）可能更久。只给 10 帧（1 小时）会偶发一帧都取不到。
@@ -500,19 +512,27 @@ class RadarService {
   ///    直接贴到高德地图上会形成「双重地图」—— 两张地图的城市标注位置不一致，
   ///    看起来就是「叠加图和正式地图对不上」。所以这里按 dBZ 色标逐像素过滤，
   ///    **只保留回波色、其余全部透明**，顺带把颜色标准化成色标原色。
-  static Future<Uint8List?> cropToMapArea(Uint8List pngBytes) async {
+  static Future<Uint8List?> cropToMapArea(
+    Uint8List pngBytes, {
+    RadarProjection projection = const EastChinaProjection(),
+  }) async {
     final codec = await ui.instantiateImageCodec(pngBytes);
     final frame = await codec.getNextFrame();
     final src = frame.image;
-    final newH = (src.height * RadarGeo.mapHeightRatio).round();
+    final newW = math.min(src.width, projection.mapWidthPx);
+    final newH = math.min(src.height, projection.mapHeightPx);
 
     final bd = await src.toByteData(format: ui.ImageByteFormat.rawRgba);
     if (bd == null) return null;
     final px = bd.buffer.asUint8List();
 
-    final stride = src.width * 4;
-    final cropped = Uint8List(stride * newH);
-    cropped.setRange(0, stride * newH, px);
+    final srcStride = src.width * 4;
+    final dstStride = newW * 4;
+    final cropped = Uint8List(dstStride * newH);
+    for (var y = 0; y < newH; y++) {
+      cropped.setRange(y * dstStride, y * dstStride + dstStride,
+          px, y * srcStride);
+    }
 
     // ---- 只留回波：非回波像素透明化，回波像素标准化为色标原色 ----
     var echoes = 0;
@@ -537,7 +557,7 @@ class RadarService {
     final completer = Completer<ui.Image>();
     ui.decodeImageFromPixels(
       cropped,
-      src.width,
+      newW,
       newH,
       ui.PixelFormat.rgba8888,
       completer.complete,
@@ -551,12 +571,10 @@ class RadarService {
   ///
   /// 返回 (西南角, 东北角) 供 GroundOverlay 使用。
   static ({double swLat, double swLon, double neLat, double neLon}) overlayBounds({
-    int width = 774,
-    double mapHeightRatio = RadarGeo.mapHeightRatio,
-    int height = 1326,
+    RadarProjection projection = const EastChinaProjection(),
   }) {
-    final sw = RadarGeo.pixelToLatLon(0, height * mapHeightRatio);
-    final ne = RadarGeo.pixelToLatLon(width.toDouble(), 0);
+    final sw = projection.pixelToLatLon(0, projection.mapHeightPx.toDouble());
+    final ne = projection.pixelToLatLon(projection.mapWidthPx.toDouble(), 0);
     return (swLat: sw.lat, swLon: sw.lon, neLat: ne.lat, neLon: ne.lon);
   }
 
@@ -568,7 +586,7 @@ class RadarService {
   /// ⚠️ 两个关键点（之前实现有误，导致误报）：
   /// 1. **半径要小**：拼图分辨率 1px ≈ 2.6km，之前默认 8px ≈ **21km**，
   ///    会把 20km 外的回波算到目标点头上 → 明明是阴天却报「中到大雨」。
-  ///    现在默认 1px（≈2.6km），与数据源本身的空间精度匹配。
+  ///    现在默认 1px，与数据源本身的空间精度匹配（单站图 1px ≈ 0.68km）。
   /// 2. **取最近点而非最大值**：目标点是否有雨取决于**它自己**的回波，
   ///    而不是附近最强的回波。
   static int? sampleAt(
@@ -577,7 +595,7 @@ class RadarService {
     double lon, {
     int radiusPx = 1,
   }) {
-    final p = RadarGeo.latLonToPixel(lat, lon);
+    final p = frame.projection.latLonToPixel(lat, lon);
     int? best;
     var bestDist = double.infinity;
     for (final e in frame.echoes) {
@@ -595,14 +613,14 @@ class RadarService {
 
   /// 目标点**及其周边**的最大回波（用于判断「附近有雨」而不是「正上方有雨」）
   ///
-  /// [radiusPx] 建议不超过 3（≈8km），过大会把远处回波算进来。
+  /// [radiusPx] 建议不超过 3（拼图上 ≈8km），过大会把远处回波算进来。
   static int? maxEchoNear(
     RadarFrame frame,
     double lat,
     double lon, {
     int radiusPx = 3,
   }) {
-    final p = RadarGeo.latLonToPixel(lat, lon);
+    final p = frame.projection.latLonToPixel(lat, lon);
     int? best;
     for (final e in frame.echoes) {
       if ((e.x - p.x).abs() <= radiusPx && (e.y - p.y).abs() <= radiusPx) {
@@ -626,8 +644,8 @@ class RadarService {
     required double latMax,
     required double lonMax,
   }) {
-    final p1 = RadarGeo.latLonToPixel(latMin, lonMin);
-    final p2 = RadarGeo.latLonToPixel(latMax, lonMax);
+    final p1 = frame.projection.latLonToPixel(latMin, lonMin);
+    final p2 = frame.projection.latLonToPixel(latMax, lonMax);
     final x0 = math.min(p1.x, p2.x), x1 = math.max(p1.x, p2.x);
     final y0 = math.min(p1.y, p2.y), y1 = math.max(p1.y, p2.y);
     for (final e in frame.echoes) {

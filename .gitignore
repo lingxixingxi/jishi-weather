@@ -58,3 +58,9 @@ android/local.properties
 key.properties
 android-keys/
 lib/config/secrets.dart
+
+# ===== 研究 / 探测脚本（不入库）=====
+# ⚠️ 这些脚本为了能直接 `python xxx.py` 跑，**硬编码了高德 Web 服务 Key**，
+# 且会生成大量临时样本图。只作本地研究用（标定雷达投影、验证回波判据、
+# 核对赛道坐标），**绝不提交**。
+_research/

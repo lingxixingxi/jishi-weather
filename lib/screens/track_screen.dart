@@ -243,40 +243,62 @@ class _TrackScreenState extends State<TrackScreen> {
     );
   }
 
+  /// 弹出赛道选择面板
+  ///
+  /// ⚠️ **为什么不用 `DropdownButton`**（实测结论）：
+  /// 它的菜单项被 Material 强制 `minHeight: kMinInteractiveDimension`（48dp，
+  /// 见 Flutter 源码 `_DropdownMenuItemContainer`），无论怎么设 `itemHeight`
+  /// 还是压缩 padding 都压不下去。19 条赛道 + 5 个分组共 24 项 ≈ 1160dp，
+  /// 展开后直接吃掉整屏、每行还很空。
+  /// 底部面板的行高完全自己控制，且手机上拇指更好点。
+  Future<void> _pickTrack() async {
+    if (_loading) return;
+    final picked = await showModalBottomSheet<TrackCircuit>(
+      context: context,
+      backgroundColor: AppTheme.bgInset,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _TrackPickerSheet(current: _track),
+    );
+    if (picked != null) _pick(picked);
+  }
+
   Widget _trackPicker() => PanelCard(
         heading: '选择赛道',
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: kTrackCircuits.map((t) {
-                final on = t.name == _track.name;
-                return GestureDetector(
-                  onTap: _loading ? null : () => _pick(t),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 120),
-                    padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
-                    decoration: BoxDecoration(
-                      color: on ? AppTheme.accent.withValues(alpha: .15) : AppTheme.bgInset,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: on ? AppTheme.accent : AppTheme.border,
-                        width: on ? 1.5 : 1,
+            // 19 条赛道（国内 11 + 海外 8）：平铺标签会挤成好几行且难找，
+            // 而下拉菜单又被 Material 的 48dp 下限撑爆 → 用底部弹出面板。
+            InkWell(
+              onTap: _pickTrack,
+              borderRadius: BorderRadius.circular(9),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+                decoration: BoxDecoration(
+                  color: AppTheme.bgInset,
+                  borderRadius: BorderRadius.circular(9),
+                  border: Border.all(color: AppTheme.border),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _track.name,
+                        style: const TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          color: AppTheme.text,
+                        ),
                       ),
                     ),
-                    child: Text(
-                      t.name,
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w600,
-                        color: on ? AppTheme.accent : AppTheme.text,
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
+                    const Icon(Icons.unfold_more,
+                        size: 17, color: AppTheme.textDim),
+                  ],
+                ),
+              ),
             ),
             const SizedBox(height: 10),
             Row(
@@ -431,8 +453,57 @@ class _TrackScreenState extends State<TrackScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // ===== 境外赛道的如实说明 =====
+          // 中央气象台与雷达只覆盖中国，境外赛道上这两条链路根本没有数据。
+          // 必须说明白，否则「无雷达数据」会被误读成「没有降水」。
+          if (_track.isOverseas) ...[
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.public, size: 14, color: AppTheme.orange),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '境外赛道：中央气象台实况与雷达（均仅覆盖中国）不可用，'
+                    '研判以 Open-Meteo（ECMWF / GFS / ICON）与和风天气的多源融合为准。',
+                    style: const TextStyle(
+                        fontSize: 11.5, color: AppTheme.textDim, height: 1.45),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+          ],
+
+          // ===== 雷达数据源徽章（单站高精度 / 拼图兜底）=====
+          //
+          // 这是本轮重构最需要让用户看见的一点：定调到底用的是哪张图、
+          // 空间精度多少。单站雷达 0.68 km/像素 是拼图（2.6 km/像素）的约 4 倍。
+          if (!_track.isOverseas && r != null) ...[
+            Row(
+              children: [
+                Icon(r.fromStation ? Icons.radar : Icons.public,
+                    size: 13,
+                    color: r.fromStation ? AppTheme.green : AppTheme.textDim),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    '${r.sourceLabel} · ${r.kmPerPixel.toStringAsFixed(2)} km/像素'
+                    '${r.fromStation ? "（单站高精度）" : "（拼图兜底）"}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: r.fromStation ? AppTheme.green : AppTheme.textDim,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+          ],
+
           // ===== 雷达实况 =====
-          if (r != null) ...[
+          if (!_track.isOverseas && r != null) ...[
             Row(
               children: [
                 Expanded(
@@ -472,7 +543,7 @@ class _TrackScreenState extends State<TrackScreen> {
           _crossCheckBanner(),
 
           // ===== 各源与雷达吻合度 =====
-          if (v != null && v.scores.isNotEmpty) ...[
+          if (!_track.isOverseas && v != null && v.scores.isNotEmpty) ...[
             const SizedBox(height: 12),
             const Text('各源与雷达吻合度',
                 style: TextStyle(
@@ -526,6 +597,12 @@ class _TrackScreenState extends State<TrackScreen> {
             const SizedBox(height: 4),
             Text(v.summary,
                 style: const TextStyle(fontSize: 11, color: AppTheme.textFaint, height: 1.4)),
+            if (v.scoreBasis.isNotEmpty) ...[
+              const SizedBox(height: 3),
+              Text('打分依据：${v.scoreBasis}',
+                  style: const TextStyle(
+                      fontSize: 10.5, color: AppTheme.textFaint, height: 1.4)),
+            ],
           ],
 
           // ===== 该时刻各源数值 =====
@@ -1033,5 +1110,175 @@ class _TrackScreenState extends State<TrackScreen> {
     if (t >= 40) return AppTheme.orange;
     if (t <= 5) return AppTheme.cyan;
     return null;
+  }
+}
+
+/// 赛道选择面板（底部弹出）
+///
+/// ⚠️ **为什么不用 `DropdownButton`**：它的菜单项被 Material 强制
+/// `minHeight: kMinInteractiveDimension`（48dp，见 Flutter 源码
+/// `_DropdownMenuItemContainer`），`itemHeight` 与 padding 都压不下去；
+/// 19 条 + 5 个分组共 24 项展开会直接吃掉整屏，每行还很空（实测）。
+///
+/// 本面板行高 40dp，分组标题 10.5 号小字，并**在打开时自动滚到当前赛道**。
+class _TrackPickerSheet extends StatefulWidget {
+  const _TrackPickerSheet({required this.current});
+
+  final TrackCircuit current;
+
+  @override
+  State<_TrackPickerSheet> createState() => _TrackPickerSheetState();
+}
+
+class _TrackPickerSheetState extends State<_TrackPickerSheet> {
+  /// 行高（比 Material 下拉菜单的 48dp 下限紧凑）
+  static const double _itemHeight = 40;
+
+  /// 分组标题占位高度（padding 9+3 + 文字行高约 11）
+  static const double _headerHeight = 23;
+
+  /// 分组顺序（与 `TrackCircuit.region` 对应）
+  static const List<String> _regionOrder = ['华东', '华南', '华北', '西南', '海外'];
+
+  late final ScrollController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller =
+        ScrollController(initialScrollOffset: _offsetOfCurrent());
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// 当前赛道在列表中的纵向偏移
+  ///
+  /// 没有它会很难用：选了「印第安纳波利斯」之后，每次打开面板都从华东
+  /// 顶部开始，得手动滑很久才找得到自己选的那条。
+  double _offsetOfCurrent() {
+    var offset = 0.0;
+    for (final region in _regionOrder) {
+      final group = kTrackCircuits.where((t) => t.region == region).toList();
+      if (group.isEmpty) continue;
+      offset += _headerHeight;
+      for (final t in group) {
+        if (t.name == widget.current.name) {
+          // 让当前项上方留出一行上下文，视觉上更自然
+          return (offset - _itemHeight).clamp(0.0, double.infinity);
+        }
+        offset += _itemHeight;
+      }
+    }
+    return 0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.58,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 顶部把手
+            Container(
+              margin: const EdgeInsets.only(top: 9),
+              width: 34,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppTheme.border,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 11, 20, 4),
+              child: Row(
+                children: [
+                  Icon(Icons.sports_motorsports_outlined,
+                      size: 16, color: AppTheme.accent),
+                  SizedBox(width: 7),
+                  Text(
+                    '选择赛道',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: AppTheme.text,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView(
+                controller: _controller,
+                padding: const EdgeInsets.only(bottom: 10),
+                children: [
+                  for (final region in _regionOrder)
+                    ..._regionSection(context, region),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _regionSection(BuildContext context, String region) {
+    final group = kTrackCircuits.where((t) => t.region == region).toList();
+    if (group.isEmpty) return const [];
+    return [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(20, 9, 20, 3),
+        child: Text(
+          '— $region —',
+          style: const TextStyle(
+            fontSize: 10.5,
+            fontWeight: FontWeight.w700,
+            color: AppTheme.textFaint,
+            letterSpacing: .6,
+            height: 1.1,
+          ),
+        ),
+      ),
+      for (final t in group)
+        InkWell(
+          onTap: () => Navigator.of(context).pop(t),
+          child: SizedBox(
+            height: _itemHeight,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      t.name,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: t.name == widget.current.name
+                            ? FontWeight.w700
+                            : FontWeight.w400,
+                        color: t.name == widget.current.name
+                            ? AppTheme.accent
+                            : AppTheme.text,
+                      ),
+                    ),
+                  ),
+                  if (t.name == widget.current.name)
+                    const Icon(Icons.check, size: 16, color: AppTheme.accent),
+                ],
+              ),
+            ),
+          ),
+        ),
+    ];
   }
 }

@@ -308,13 +308,14 @@ class _RouteScreenState extends State<RouteScreen> {
       _analysis = null;
     });
     try {
-      // 优先用联想搜索选中的坐标（连锁店名走文本地理编码会定位错）
+      // 优先用联想搜索选中的坐标（连锁店名走文本地理编码会定位错）；
+      // 没点选过则走**智能地理编码**（POI 检索优先，再退地址解析）
       final from = (_originPoint != null && _originPoint!.name == o)
           ? _originPoint
-          : await _amap.geocode(o);
+          : await _amap.geocodeSmart(o);
       final to = (_destPoint != null && _destPoint!.name == d)
           ? _destPoint
-          : await _amap.geocode(d);
+          : await _amap.geocodeSmart(d);
       if (from == null) throw Exception('未找到起点：$o');
       if (to == null) throw Exception('未找到终点：$d');
       final routes = await _amap.drivingRoutes(from, to);
@@ -1059,6 +1060,27 @@ class _RouteScreenState extends State<RouteScreen> {
               ),
             ),
           if (r != null) ...[
+            // 数据源徽章 —— 让用户看见定调用的是**单站高精度**图还是**拼图兜底**
+            Row(
+              children: [
+                Icon(r.fromStation ? Icons.radar : Icons.public,
+                    size: 13,
+                    color: r.fromStation ? AppTheme.green : AppTheme.textDim),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    '${r.sourceLabel} · ${r.kmPerPixel.toStringAsFixed(2)} km/像素'
+                    '${r.fromStation ? "（单站高精度）" : "（拼图兜底）"}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: r.fromStation ? AppTheme.green : AppTheme.textDim,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
             Row(
               children: [
                 _metric('雷达回波', r.echoText),
@@ -1146,6 +1168,13 @@ class _RouteScreenState extends State<RouteScreen> {
               style: const TextStyle(fontSize: 12, color: AppTheme.textDim, height: 1.5),
             ),
           ),
+          // 打分依据：未来时刻用的是**外推预测值**而非实测，必须如实标注
+          if (v.scoreBasis.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text('打分依据：${v.scoreBasis}',
+                style: const TextStyle(
+                    fontSize: 10.5, color: AppTheme.textFaint, height: 1.4)),
+          ],
         ],
       ),
     );

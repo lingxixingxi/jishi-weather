@@ -1,17 +1,13 @@
-import 'dart:math' as math;
-import 'dart:typed_data';
-import 'dart:ui' as ui;
-
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'radar_projection.dart';
 import 'radar_service.dart';
 
-/// 中央气象台「单站雷达」服务 —— 高精度数值读取
+/// 中央气象台「单站雷达」**取图**服务
 ///
-/// 与区域拼图（[RadarService]，覆盖华东全境、约 2.6 km/像素）不同，
-/// 单站雷达**以某个雷达站为中心**，覆盖半径 256 km，分辨率约 **0.68 km/像素**
-/// （精细约 4 倍），适合回答「我脚下这一格到底有没有雨」。
+/// 单站雷达以某个雷达站为中心，覆盖半径 256 km，分辨率约 **0.68 km/像素**
+/// （区域拼图是 2.6 km/像素，粗约 4 倍），适合回答「我脚下这一格到底有没有雨」。
 ///
 /// 页面规律：
 ///   https://www.nmc.cn/publish/radar/{省拼音}/{市拼音}.htm
@@ -23,44 +19,32 @@ import 'radar_service.dart';
 /// 图上直接印着官方参数（右侧信息面板）：
 ///   「雷达站名：南京 / 数据范围：256 km / 观测时间：YYYY-MM-DD HH:MM:SS BJT」
 /// 注意**观测时间是北京时间**，而文件名时间戳是 **UTC**（相差 8 小时）。
+///
+/// ## 重构说明（重要）
+/// 几何换算（投影、距离、覆盖判断）**已全部迁到 [StationProjection]**，
+/// 本类只负责取图。取样请统一走
+/// `RadarService.analyze(bytes, t, projection: StationProjection(...))`
+/// + `RadarService.sampleAt(frame, lat, lon)`，
+/// 这样单站与拼图共用同一套分析链路，不会出现两套坐标换算各算各的。
 class NmcStationRadar {
   NmcStationRadar._();
 
-  // ==================== 图像几何（2026-09-21 实测标定）====================
-  //
-  // 单站图整体 924×734，右侧约 159px 是信息面板（站名 / 数据范围 / 观测时间 /
-  // dBZ 色标），左侧 [mapWidth] 宽的区域才是地图。地图以雷达站为中心，等距投影：
-  //   dx_km = (lon - stLon) * 111.32 * cos(stLat)
-  //   dy_km = (stLat - lat) * 110.57
-  //   px = centerX + dx_km / kmPerPx
-  //   py = centerY + dy_km / kmPerPx
-  //
-  // 三个参数由「cv2 检测图上城市标注圆点 + 70 个已知城市经纬度做迭代最小二乘」
-  // 得出（残差中位约 13px）；由它反推的覆盖半径 260 km 与图上官方标注的
-  // 256 km 吻合，说明投影假设成立。
+  // ==================== 几何（转发 StationProjection）====================
 
   /// 地图区宽度（像素）；其右侧为信息面板
-  static const int mapWidth = 765;
-
-  /// 雷达站在地图区中的像素位置
-  static const double centerX = 362.9;
-  static const double centerY = 374.9;
-
-  /// 每像素公里数（约 680 m/px）
-  static const double kmPerPx = 0.67958;
+  static const int mapWidth = StationProjection.mapWidth;
 
   /// 官方标注的覆盖半径（km）
-  static const double coverageKm = 256;
+  static const double coverageKm = StationProjection.coverageKm;
 
-  static const double _kmPerLat = 110.57;
-  static const double _kmPerLonAtEquator = 111.32;
+  /// 每像素公里数（约 680 m/px）
+  static const double kmPerPx = StationProjection.stationKmPerPx;
 
-  /// 纬度 → 单站图分辨率下的公里换算用的地球半径
-  static const double _earthKm = 6371.0;
+  /// 两点间距离（km，Haversine）
+  static double distanceKm(double lat1, double lon1, double lat2, double lon2) =>
+      StationProjection.distanceKm(lat1, lon1, lat2, lon2);
 
-  /// 经纬度 → 单站图像素坐标
-  ///
-  /// [stLat] / [stLon] 为雷达站自身坐标。落在图外返回 null。
+  /// 经纬度 → 单站图像素坐标（落在图外返回 null）
   static ({double x, double y})? latLonToPixel(
     double lat,
     double lon,
@@ -68,13 +52,17 @@ class NmcStationRadar {
     double stLon, {
     double mapHeight = 734,
   }) {
-    final cosLat = math.cos(stLat * math.pi / 180).abs().clamp(0.2, 1.0);
-    final dxKm = (lon - stLon) * _kmPerLonAtEquator * cosLat;
-    final dyKm = (stLat - lat) * _kmPerLat;
-    final x = centerX + dxKm / kmPerPx;
-    final y = centerY + dyKm / kmPerPx;
-    if (x < 0 || x >= mapWidth || y < 0 || y >= mapHeight) return null;
-    return (x: x, y: y);
+    final proj = StationProjection(
+      stationCode: '',
+      stationName: '',
+      stationLat: stLat,
+      stationLon: stLon,
+    );
+    final p = proj.latLonToPixel(lat, lon);
+    if (p.x < 0 || p.x >= StationProjection.mapWidth || p.y < 0 || p.y >= mapHeight) {
+      return null;
+    }
+    return p;
   }
 
   /// 该点是否落在单站图覆盖范围内
@@ -87,17 +75,6 @@ class NmcStationRadar {
   }) =>
       latLonToPixel(lat, lon, stLat, stLon, mapHeight: mapHeight) != null;
 
-  /// 两点间距离（km，Haversine）
-  static double distanceKm(double lat1, double lon1, double lat2, double lon2) {
-    final dLat = (lat2 - lat1) * math.pi / 180;
-    final dLon = (lon2 - lon1) * math.pi / 180;
-    final a = math.pow(math.sin(dLat / 2), 2) +
-        math.cos(lat1 * math.pi / 180) *
-            math.cos(lat2 * math.pi / 180) *
-            math.pow(math.sin(dLon / 2), 2);
-    return 2 * _earthKm * math.asin(math.min(1.0, math.sqrt(a.toDouble())));
-  }
-
   // ==================== 取图 ====================
 
   /// 从任意一帧 URL 取「文件名模板」，形如
@@ -108,14 +85,25 @@ class NmcStationRadar {
     return i < 0 ? null : name.substring(0, i);
   }
 
-  /// 抓取单站雷达图（最新可用帧）
+  /// 抓取**最近 N 帧**单站雷达图（按时间正序返回，旧 → 新）
   ///
-  /// 与 [RadarService.fetchRecentFrames] 同样的两个要点：
-  /// · 文件名时间戳是 **UTC**，按当前 UTC 对齐到 6 分钟网格；
-  /// · 从最新往旧逐帧试（产品有十几分钟延迟，且央台会很快清理过期文件）。
-  /// 时间戳为 **17 位**（`YYYYMMDDHHMM` + `00000`），少写尾部 3 个 0 会全部 404。
-  static Future<({DateTime time, Uint8List bytes})?> fetchLatest({
+  /// 多个帧用于回波运动矢量的质心追踪（单帧无法估算移动方向）。
+  ///
+  /// ⚠️ 回退帧数必须给足：**单站雷达的生成极不规律**。
+  /// 实测（4 小时窗口）：
+  ///   南京站  只命中 4/40 帧，且最新帧可能已是 2 小时 46 分前；
+  ///   青浦站  只命中 5~6/40 帧，最新帧 58 分钟前。
+  /// 各站似乎只在「自己有观测」时才出图，所以最新可用帧可能滞后 1~3 小时。
+  /// 只试 10 帧（1 小时）会经常一帧都取不到 —— 这是「雷达图拉取失败」的根因。
+  /// 现在默认回退 40 帧（4 小时）。
+  ///
+  /// 注意：即使回退到 4 小时前才凑齐帧，也不代表这些帧「新鲜」——
+  /// 是否可用由调用方按 `RadarService.stationFreshMinutes` 判定
+  /// （见 `RadarSourcePicker`）。
+  static Future<List<RadarRawFrame>> fetchRecent({
     required String stationCode,
+    int count = 3,
+    int maxBackFrames = 40,
     http.Client? client,
     DateTime? now,
   }) async {
@@ -137,14 +125,9 @@ class NmcStationRadar {
             RadarService.radarFrameMinutes,
       );
 
-      // ⚠️ 回退帧数必须给足：**单站雷达的生成极不规律**。
-      // 实测（2026-09-21 夜，4 小时窗口）：
-      //   南京站  只命中 4/40 帧，且最新帧是 2 小时 46 分前；
-      //   青浦站  只命中 5/40 帧，最新帧 58 分钟前。
-      // 各站似乎只在「自己有观测」时才出图，所以最新可用帧可能滞后 1~3 小时。
-      // 只试 10 帧（1 小时）会经常一帧都取不到 —— 这是「雷达图拉取失败」的根因。
-      // 现在放到 40 帧（4 小时）。
-      for (var i = 0; i < 40; i++) {
+      final out = <RadarRawFrame>[];
+      var attempts = 0;
+      while (out.length < count && attempts < maxBackFrames) {
         final stamp = '${t.year}${_p2(t.month)}${_p2(t.day)}'
             '${_p2(t.hour)}${_p2(t.minute)}00000';
         final url = 'https://image.nmc.cn/product/${t.year}/${_p2(t.month)}/'
@@ -156,31 +139,49 @@ class NmcStationRadar {
             'Referer': 'https://www.nmc.cn/publish/radar/',
           }).timeout(const Duration(seconds: 20));
           if (resp.statusCode == 200 && resp.bodyBytes.length > 10000) {
-            debugPrint('[单站雷达] $stationCode 取到 ${t.toLocal()} 帧 '
-                '(${resp.bodyBytes.length} 字节)');
-            return (time: t.toLocal(), bytes: resp.bodyBytes);
+            out.add((time: t.toLocal(), bytes: resp.bodyBytes));
           }
         } catch (_) {
           // 该帧不可用，继续往前找
         }
         t = t.subtract(
             const Duration(minutes: RadarService.radarFrameMinutes));
+        attempts++;
       }
-      debugPrint('[单站雷达] $stationCode 连续 10 帧均不可用');
-      return null;
+      out.sort((a, b) => a.time.compareTo(b.time));
+      debugPrint('[单站雷达] $stationCode 取到 ${out.length}/$count 帧'
+          '（尝试 $attempts 帧，最新 ${out.isEmpty ? "无" : out.last.time}）');
+      return out;
     } finally {
       if (own) c.close();
     }
+  }
+
+  /// 抓取**最新一帧**单站雷达图（薄封装，保留给只需单帧的场景）
+  static Future<RadarRawFrame?> fetchLatest({
+    required String stationCode,
+    http.Client? client,
+    DateTime? now,
+  }) async {
+    final list = await fetchRecent(
+      stationCode: stationCode,
+      count: 1,
+      client: client,
+      now: now,
+    );
+    return list.isEmpty ? null : list.last;
   }
 
   // ==================== 像素取值 ====================
 
   /// 解码单站图并读取目标点的 dBZ
   ///
+  /// ⚠️ **保留为向后兼容的便捷方法**；新代码请用
+  /// `RadarService.analyze(...)` + `RadarService.sampleAt(...)`，
+  /// 以便与拼图链路共用同一套投影与取样逻辑。
+  ///
   /// [radiusPx] 为取样半径：单站图约 0.68 km/像素，取 1~2px（≈1.4 km）
   /// 与数据本身的空间精度匹配。取太大（如 8px≈5km）会把旁边的雨算到头上。
-  ///
-  /// 返回像素坐标（便于调试核对）与 dBZ；无回波时 [dbz] 为 null。
   static Future<({int? dbz, double x, double y, int width, int height})?>
       sample(
     Uint8List pngBytes,
@@ -190,36 +191,23 @@ class NmcStationRadar {
     double stLon, {
     int radiusPx = 1,
   }) async {
-    final codec = await ui.instantiateImageCodec(pngBytes);
-    final frame = await codec.getNextFrame();
-    final img = frame.image;
-    final w = img.width;
-    final h = img.height;
+    final proj = StationProjection(
+      stationCode: '',
+      stationName: '',
+      stationLat: stLat,
+      stationLon: stLon,
+    );
+    final frame = await RadarService.analyze(pngBytes, DateTime.now(),
+        projection: proj, sampleStep: 1);
+    if (frame == null) return null;
 
-    final p = latLonToPixel(lat, lon, stLat, stLon, mapHeight: h.toDouble());
-    if (p == null) return null;
-
-    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
-    if (bd == null) return null;
-    final px = bd.buffer.asUint8List();
-
-    var best = -1;
-    for (var dy = -radiusPx; dy <= radiusPx; dy++) {
-      for (var dx = -radiusPx; dx <= radiusPx; dx++) {
-        final x = p.x.round() + dx;
-        final y = p.y.round() + dy;
-        if (x < 0 || x >= w || y < 0 || y >= h) continue;
-        final i = (y * w + x) * 4;
-        final dbz = RadarPalette.rgbToDbz(px[i], px[i + 1], px[i + 2]);
-        if (dbz != null && dbz > best) best = dbz;
-      }
-    }
+    final p = proj.latLonToPixel(lat, lon);
     return (
-      dbz: best < 0 ? null : best,
+      dbz: RadarService.sampleAt(frame, lat, lon, radiusPx: radiusPx),
       x: p.x,
       y: p.y,
-      width: w,
-      height: h,
+      width: frame.width,
+      height: frame.height,
     );
   }
 

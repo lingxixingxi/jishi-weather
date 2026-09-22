@@ -17,11 +17,11 @@ import '../services/amap_location_service.dart';
 import '../services/amap_service.dart';
 import '../services/multi_source_service.dart';
 import '../services/nmc_city_repository.dart';
-import '../services/nmc_station_radar.dart';
 import '../services/qweather_service.dart';
 import '../services/nmc_service.dart';
 import '../services/open_meteo.dart';
 import '../services/radar_service.dart';
+import '../services/radar_source.dart';
 import '../services/rainviewer_service.dart';
 import '../services/satellite_service.dart';
 import '../services/warning_service.dart';
@@ -582,7 +582,12 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 加载真实雷达拼图（中央气象台华东拼图）
   ///
   /// 流程：高德逆地理编码定位城市 → 取该市天气里的雷达图路径
-  /// → 拉最新一帧 → 裁掉底部色标 → 用 RadarGeo 标定范围叠加。
+  /// → 拉最新一帧 → 裁掉底部色标 → 用 [EastChinaProjection] 标定范围叠加。
+  ///
+  /// ⚠️ 必须 `forceMosaic: true`：央台接口**按城市返回不同产品**
+  /// （上海给区域拼图 `AECN`、南京给单站 `AZ9250`），而叠加层固定使用拼图的
+  /// 投影与经纬度范围；若拿到单站图，叠加位置会完全错位。
+  /// 用于「定调 / 实测取值」的选源请走 [RadarSourcePicker]（单站优先）。
   Future<void> _loadRadar(double lat, double lon) async {
     if (_radarLoading) return;
     setState(() => _radarLoading = true);
@@ -598,7 +603,11 @@ class _LocationScreenState extends State<LocationScreen> {
         if (mounted) setState(() => _radarLoading = false);
         return;
       }
-      final frames = await RadarService.fetchRecentFrames(radarPath: path, count: 1);
+      final frames = await RadarService.fetchRecentFrames(
+        radarPath: path,
+        count: 1,
+        forceMosaic: true,
+      );
       if (frames.isEmpty) {
         if (mounted) setState(() => _radarLoading = false);
         return;
@@ -741,8 +750,11 @@ class _LocationScreenState extends State<LocationScreen> {
         p = sel;
         debugPrint('[地点] 使用联想选中的坐标: ${sel.lat},${sel.lon}');
       } else {
-        // ② 否则退化为文本地理编码（有歧义，仅作兜底）
-        p = await _amap.geocode(q);
+        // ② 否则走**智能地理编码**：先 POI 检索（找地点），再退地址解析。
+        //    ⚠️ 不能直接用 `geocode` —— 它是**地址解析**，对 POI 名极易误匹配
+        //    （实测「鄂尔多斯国际赛车场」被解析到珠海、「金港国际赛车场」
+        //    被解析到同名住宅小区）。
+        p = await _amap.geocodeSmart(q);
       }
       if (p == null) throw Exception('未找到该地点：$q');
       await _analyze(p);
@@ -1652,58 +1664,36 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
-  /// 跑单站雷达实测：定位 → 最近站点 → 按像素取 dBZ
+  /// 加载雷达实测：定位 → **统一选源** → 按像素取 dBZ
   ///
-  /// 单站雷达覆盖半径 256 km、约 0.68 km/像素（区域拼图是 2.6 km/像素），
-  /// 用它回答「目标点这一格到底有没有雨」比拼图精确约 4 倍。
+  /// **选源规则与「雷达定调」「出行路线」「赛道研判」完全一致**
+  /// （统一由 [RadarSourcePicker] 决定，不再各写一套）：
+  /// · 最近雷达站覆盖内（256 km）且**当前小时内有更新**（≤60 分钟）
+  ///   → 用**单站雷达**，约 0.68 km/像素，是拼图（2.6 km/像素）的约 4 倍精度；
+  /// · 单站**查过但过期**（或 4 小时窗口内一帧都没有）→ 回退**区域拼图**，
+  ///   并如实标注单站上次更新时间，让用户能判断兜底数据的可信度。
   ///
-  /// **兜底**：单站雷达更新极不规律（实测 4 小时窗口只命中约 10%），
-  /// 经常出现「最近一帧已是 1~3 小时前」。那种数据用来回答"此刻有没有雨"
-  /// 已不可信，所以**当前小时没有更新时退回区域拼图**
-  /// （精度降到 2.6 km/像素，但实测 80% 的时候有数据），
-  /// 并把「单站上次更新是什么时候」如实告诉用户。
+  /// 目标点完全不在覆盖范围（境外 / 中国西部）时**不显示**这张卡 ——
+  /// 否则「无回波」会被误读成「没有降水」，这是数据源边界而非天气结论。
   Future<void> _runStationRadar(double lat, double lon) async {
     try {
-      final st = nearestRadarStation(lat, lon);
-      final dist = NmcStationRadar.distanceKm(lat, lon, st.lat, st.lon);
-      if (dist > NmcStationRadar.coverageKm) {
-        debugPrint('[单站雷达] 最近站点 ${st.name} 距 ${dist.toStringAsFixed(0)}km，'
-            '超出 ${NmcStationRadar.coverageKm.toInt()}km 覆盖，跳过');
+      final source = await RadarSourcePicker.pick(lat: lat, lon: lon, count: 1);
+      if (source.isEmpty) {
         if (mounted) setState(() => _stationRadar = null);
         return;
       }
 
-      // ---- 1) 单站雷达 ----
-      final frame = await NmcStationRadar.fetchLatest(stationCode: st.code);
-      final stationLast = frame?.time;
-      final stationAgeMin = stationLast == null
-          ? null
-          : DateTime.now().difference(stationLast).inMinutes;
-      // 「当前小时」= 最近一帧不超过 60 分钟
-      final useStation = frame != null && stationAgeMin! <= 60;
-
-      // ---- 2) 取值 ----
-      int? dbz;
-      DateTime obsTime;
-      if (useStation) {
-        final s = await NmcStationRadar.sample(
-          frame.bytes,
-          lat,
-          lon,
-          st.lat,
-          st.lon,
-        );
-        dbz = s?.dbz;
-        obsTime = frame.time;
-      } else {
-        // 兜底：区域拼图
-        final m = await _mapRadarDbz(lat, lon);
-        dbz = m?.dbz;
-        obsTime = m?.time ?? DateTime.now();
-        debugPrint('[单站雷达] ${st.name} 当前小时无更新'
-            '（上次 ${stationLast ?? "无记录"}），改用区域拼图兜底'
-            ' → ${dbz == null ? "无回波" : "$dbz dBZ"}');
+      final st = source.station;
+      if (st == null || !source.projection.covers(lat, lon)) {
+        debugPrint('[雷达实测] 目标点不在 ${source.label} 覆盖范围内，不显示实测卡');
+        if (mounted) setState(() => _stationRadar = null);
+        return;
       }
+
+      final f = source.frames.last;
+      final frame = await RadarService.analyze(f.bytes, f.time,
+          projection: source.projection);
+      final dbz = frame == null ? null : RadarService.sampleAt(frame, lat, lon);
 
       final stationRain = RadarCrossCheck.rainFromDbz(dbz);
 
@@ -1720,7 +1710,7 @@ class _LocationScreenState extends State<LocationScreen> {
           }
         }
       } catch (e) {
-        debugPrint('[单站雷达] 和风降水获取失败（不影响雷达读数）: $e');
+        debugPrint('[雷达实测] 和风降水获取失败（不影响雷达读数）: $e');
       }
 
       final check = RadarCrossCheck(
@@ -1735,48 +1725,19 @@ class _LocationScreenState extends State<LocationScreen> {
       setState(() {
         _stationRadar = StationRadarReading(
           station: st,
-          distanceKm: dist,
+          distanceKm: source.stationDistanceKm ?? 0,
           dbz: dbz,
-          time: obsTime,
-          fromStation: useStation,
-          stationLastTime: stationLast,
+          time: f.time,
+          fromStation: source.fromStation,
+          stationLastTime: source.stationLastTime,
           check: check,
         );
       });
-      debugPrint('[单站雷达] ${st.name}(${st.code}) 距 ${dist.toStringAsFixed(0)}km '
-          '${useStation ? "单站" : "拼图兜底"}'
-          ' → ${dbz == null ? "无回波" : "$dbz dBZ"}'
-          '；${check.conclusion}');
+      debugPrint('[雷达实测] ${st.name}(${st.code}) '
+          '${source.fromStation ? "单站" : "拼图兜底"}'
+          ' → ${dbz == null ? "无回波" : "$dbz dBZ"}；${check.conclusion}');
     } catch (e) {
-      debugPrint('[单站雷达] 失败: $e');
-    }
-  }
-
-  /// 用**区域拼图**取某点的 dBZ（单站雷达当前小时没更新时的兜底）
-  ///
-  /// 拼图覆盖华东（约 2.6 km/像素），虽然比单站粗 4 倍，但实测 80% 的
-  /// 6 分钟窗口都有帧，比单站（约 10%）可靠得多。
-  Future<({int? dbz, DateTime time})?> _mapRadarDbz(double lat, double lon) async {
-    try {
-      // 用 `_multi` 拿到的路径取其「文件名模板」；没有就用内置的华东模板
-      const fallbackPath = '/product/2026/01/01/RDCP/'
-          'SEVP_AOC_RDCP_SLDAS3_ECREF_AECN_L88_PI_20260101000000000.PNG';
-      final path = _multi.lastRadarPath ?? fallbackPath;
-      final frames = await RadarService.fetchRecentFrames(
-        radarPath: path,
-        count: 1,
-      );
-      if (frames.isEmpty) return null;
-      final f = frames.last;
-      final parsed = await RadarService.analyze(f.bytes, f.time);
-      if (parsed == null) return null;
-      return (
-        dbz: RadarService.sampleAt(parsed, lat, lon),
-        time: f.time,
-      );
-    } catch (e) {
-      debugPrint('[单站雷达] 区域拼图兜底失败: $e');
-      return null;
+      debugPrint('[雷达实测] 失败: $e');
     }
   }
 

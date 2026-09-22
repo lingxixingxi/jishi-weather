@@ -182,7 +182,7 @@ class ScreenScaffold extends StatelessWidget {
                                           AppTheme.accent.withValues(alpha: .55)),
                                 ),
                                 child: const Text(
-                                  '0.1.7 内测 · 禁止外传',
+                                  '0.1.8 内测 · 禁止外传',
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
