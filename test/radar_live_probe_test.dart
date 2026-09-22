@@ -154,4 +154,34 @@ void main() {
       amap.dispose();
     }
   }, timeout: const Timeout(Duration(minutes: 5)), skip: _skip);
+
+  test('未来时刻（≤2h）：打分依据应体现外推，而不是闷着用当前回波', () async {
+    for (final h in [30, 60, 120]) {
+      final v = await RadarVerdictEngine.judge(
+        lat: 31.23,
+        lon: 121.47,
+        models: const [],
+        radarPath: null,
+        horizonOverride: h,
+      );
+      // ignore: avoid_print
+      print('[LIVE] horizon=$h → 依据="${v.scoreBasis}" | '
+          '仲裁=${v.arbitrationUsed} | 外推值=${v.radar?.dbzForecast} dBZ | '
+          '当前值=${v.radar?.dbzNow} dBZ');
+    }
+  }, timeout: const Timeout(Duration(minutes: 5)), skip: _skip);
+
+  test('超出外推范围（>2h）：不做外推、不启用雷达仲裁', () async {
+    final v = await RadarVerdictEngine.judge(
+      lat: 31.23,
+      lon: 121.47,
+      models: const [],
+      radarPath: null,
+      horizonOverride: 300,
+    );
+    // ignore: avoid_print
+    print('[LIVE] horizon=300 → 依据="${v.scoreBasis}" | 仲裁=${v.arbitrationUsed}');
+    expect(v.arbitrationUsed, isFalse, reason: '超出外推范围不应启用雷达仲裁');
+    expect(v.scoreBasis, contains('超出'));
+  }, timeout: const Timeout(Duration(minutes: 5)), skip: _skip);
 }

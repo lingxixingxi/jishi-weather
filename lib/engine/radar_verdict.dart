@@ -321,9 +321,13 @@ class RadarVerdictEngine {
     final scoreBasis = beyondNowcast
         ? '目标时刻超出雷达外推可信范围（>${RadarService.forecastMaxMinutes} 分钟），'
             '未用雷达定调'
-        : (useForecastForScore
+        : useForecastForScore
             ? '按 $leadMinutes 分钟后外推值比对'
-            : '按当前回波比对');
+            : (futureTarget
+                // 目标确实是未来时刻，但该点当前无回波 → 外推拿不到值。
+                // 必须说清楚，否则用户看到「按当前回波比对」会以为系统用错了时刻。
+                ? '目标是 $leadMinutes 分钟后，但该点当前无回波、无可用外推值 → 按当前回波比对'
+                : '按当前回波比对');
 
     final scores = <ModelScore>[];
     for (final src
