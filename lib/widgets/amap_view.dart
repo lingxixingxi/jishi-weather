@@ -232,15 +232,35 @@ class _AmapViewState extends State<AmapView> {
     }
   }
 
+  /// 上一次真正执行过的适配范围签名
+  ///
+  /// `_scheduleFit()` 会在 0/600/1500/3000ms 各调一次 `_applyFit`（地图刚创建时
+  /// 立即调用常不生效）。若每次都真的 moveCamera，会有两个副作用：
+  /// ① 反复重置 `_autoFitting` 抑制窗口，把用户的连续缩放一起吞掉；
+  /// ② 频繁打断用户正在进行的捏合，缩放自然不顺滑。
+  /// 用签名去重后，同一范围只适配一次。
+  String? _lastFitKey;
+
   void _applyFit() {
     final c = _controller;
     final pts = widget.fitPoints;
     debugPrint('[AmapView] _applyFit controller=${c != null} points=${pts.length}');
     if (c == null || !mounted || pts.isEmpty) return;
 
-    // 标记「接下来这段相机变化是程序驱动的」，外部据此跳过重采等响应
+    // 同一范围只适配一次。
+    // ⚠️ 必须在**拿到 controller 之后**才记录签名 —— 否则地图尚未创建的那一次
+    // 会把签名占掉，后续延迟重试全部被去重跳过，永远 fit 不上。
+    final key = pts
+        .map((p) => '${p.latitude.toStringAsFixed(6)},'
+            '${p.longitude.toStringAsFixed(6)}')
+        .join('|');
+    if (key == _lastFitKey) return;
+    _lastFitKey = key;
+
+    // 标记「接下来这段相机变化是程序驱动的」，外部据此跳过重采等响应。
+    // 窗口取 600ms：足够覆盖 moveCamera 的回调，又不长时间吞掉用户操作。
     _autoFitting = true;
-    Future.delayed(const Duration(milliseconds: 1200), () {
+    Future.delayed(const Duration(milliseconds: 600), () {
       if (mounted) _autoFitting = false;
     });
 

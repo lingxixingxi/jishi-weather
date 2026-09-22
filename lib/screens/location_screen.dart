@@ -2478,11 +2478,18 @@ class _LocationScreenState extends State<LocationScreen> {
           continue;
         }
         final color = _layerMode == _LayerMode.cloud ? _cloudColor(v) : _rainColor(v);
+        // 边缘淡出：网格之外本就没有数据，硬截断会让叠加图看起来像「贴了一块
+        // 方色块」（用户反馈「边缘还是会卡」）。外圈 12% 线性降到全透明。
+        final ddx = ((px / (size - 1)) - 0.5).abs() * 2; // 0=中心 1=边缘
+        final ddy = ((py / (size - 1)) - 0.5).abs() * 2;
+        final dd = ddx > ddy ? ddx : ddy;
+        final fade =
+            dd <= 0.88 ? 1.0 : (1.0 - (dd - 0.88) / 0.12).clamp(0.0, 1.0);
         // Color 分量在新版 Flutter 里为浮点（0~1）
         pixels[i] = (color.r * 255).round().clamp(0, 255);
         pixels[i + 1] = (color.g * 255).round().clamp(0, 255);
         pixels[i + 2] = (color.b * 255).round().clamp(0, 255);
-        pixels[i + 3] = (color.a * 255).round().clamp(0, 255);
+        pixels[i + 3] = (color.a * 255 * fade).round().clamp(0, 255);
       }
     }
 
@@ -2576,10 +2583,12 @@ class _LocationScreenState extends State<LocationScreen> {
       if (!mounted) return;
       debugPrint('[网格] 缩放档位变化 zoom=$_currentZoom → spanKm=$span'
           '（${grid.length} 点）');
+      // ⚠️ **不要在这里清空 `_overlayPng`** —— 那会让叠加层在网络请求期间
+      // 先「闪一下消失」再出现。`_regenerateOverlay()` 会在新位图渲染好之后
+      // 一次性替换，旧图一直保留到那一刻，缩放过程才是连续的。
       setState(() {
         _grid = grid;
         _gridSpanKm = span;
-        _overlayPng = null; // 强制重渲染叠加位图
       });
       await _regenerateOverlay();
     } catch (e) {
@@ -2622,8 +2631,12 @@ class _LocationScreenState extends State<LocationScreen> {
         return _boxAround(center, 800);
       case _LayerMode.cloud:
       case _LayerMode.rain:
-        // 1.25 倍留边，避免叠加图正好贴住屏幕边缘
-        return _boxAround(center, _fitSpanKm / 2 * 1.25);
+        // ⚠️ 半径取 **0.7 × 网格半跨**（而不是放大留边）：
+        // `moveCamera(newLatLngBounds)` 会把给定范围尽量框满（还有 56px padding），
+        // 若半径接近网格半跨，框出来的视野就**大于网格**，云量块的方形边缘会露在
+        // 屏幕里 —— 这正是用户看到的「边缘还是会卡」。
+        // 取 0.7 让视野明显小于网格（约 0.7~0.8 倍），连边缘淡出带一起推到屏幕外。
+        return _boxAround(center, _fitSpanKm / 2 * 0.7);
       case _LayerMode.none:
         return const [];
     }
