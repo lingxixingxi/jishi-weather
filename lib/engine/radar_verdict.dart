@@ -136,6 +136,12 @@ class RadarVerdict {
   /// 数据源标签
   final String sourceLabel;
 
+  /// 目标时刻是否**超出雷达外推可信范围**（此时完全未使用雷达定调）
+  ///
+  /// 为 true 时 [scores] 必为空、[bestModelKey] 必为 null ——
+  /// 调用方据此**不得**用「雷达判出的最优源」重建数据，应保持多源融合。
+  final bool beyondNowcast;
+
   const RadarVerdict({
     this.radar,
     this.scores = const [],
@@ -146,6 +152,7 @@ class RadarVerdict {
     this.scoreBasis = '',
     this.fromStation = false,
     this.sourceLabel = '',
+    this.beyondNowcast = false,
   });
 }
 
@@ -309,41 +316,50 @@ class RadarVerdictEngine {
 
     // 5. 各模型打分 —— **必须用与模型同一时刻的雷达值**
     //
-    // ⚠️ 这里是本轮修掉的时间轴错配：
-    // models 是「目标时刻」的预报，若拿**当前**回波去比，未来时刻的定调就不准。
-    // 目标在未来、外推可信、且同点有外推值时 → 用外推值参与打分。
-    final useForecastForScore = futureTarget &&
-        !beyondNowcast &&
-        dbzForecast != null;
-    final scoreDbz = useForecastForScore ? dbzForecast : dbz;
-    final scoreRain = useForecastForScore ? rainForecast : rain;
-
-    final scoreBasis = beyondNowcast
-        ? '目标时刻超出雷达外推可信范围（>${RadarService.forecastMaxMinutes} 分钟），'
-            '未用雷达定调'
-        : useForecastForScore
-            ? '按 $leadMinutes 分钟后外推值比对'
-            : (futureTarget
-                // 目标确实是未来时刻，但该点当前无回波 → 外推拿不到值。
-                // 必须说清楚，否则用户看到「按当前回波比对」会以为系统用错了时刻。
-                ? '目标是 $leadMinutes 分钟后，但该点当前无回波、无可用外推值 → 按当前回波比对'
-                : '按当前回波比对');
-
+    // ⚠️ 两条硬规则（都是实测踩出来的）：
+    //
+    // ① **时间对齐**：models 是「目标时刻」的预报，若拿**当前**回波去比就是
+    //    时间轴错配。目标在未来、外推可信、且同点有外推值时 → 用外推值打分。
+    //
+    // ② **超出外推可信范围时一个都不打**（scores 保持为空）。
+    //    这不是图省事，而是调用方的语义依赖：路线页会依据 `bestModelKey` 用
+    //    「雷达判出的最优源」重建整条路线的分段，地点页也会切换中心点显示。
+    //    若几天后的行程还能拿到 bestModelKey，它们就会照常按雷达重建 ——
+    //    表现正是**「选了很远的时间，雷达定调却没降级」**（实测 bug）。
+    //    scores 为空 → bestModelKey 为 null → 调用方不动 → 真正的多源融合。
     final scores = <ModelScore>[];
-    for (final src
-        in (models.isNotEmpty ? models.first.sources : <ModelForecast>[])) {
-      scores.add(_scoreModel(src, scoreDbz, scoreRain,
-          basis: useForecastForScore ? '$leadMinutes 分钟后外推' : null));
+    String scoreBasis;
+
+    if (beyondNowcast) {
+      scoreBasis = '目标时刻超出雷达外推可信范围'
+          '（>${RadarService.forecastMaxMinutes} 分钟），未用雷达定调，以多源融合为准';
+    } else {
+      final useForecastForScore = futureTarget && dbzForecast != null;
+      final scoreDbz = useForecastForScore ? dbzForecast : dbz;
+      final scoreRain = useForecastForScore ? rainForecast : rain;
+
+      scoreBasis = useForecastForScore
+          ? '按 $leadMinutes 分钟后外推值比对'
+          : (futureTarget
+              // 目标确实是未来时刻，但该点当前无回波 → 外推拿不到值。
+              // 必须说清楚，否则用户看到「按当前回波比对」会以为系统用错了时刻。
+              ? '目标是 $leadMinutes 分钟后，但该点当前无回波、无可用外推值 → 按当前回波比对'
+              : '按当前回波比对');
+
+      for (final src
+          in (models.isNotEmpty ? models.first.sources : <ModelForecast>[])) {
+        scores.add(_scoreModel(src, scoreDbz, scoreRain,
+            basis: useForecastForScore ? '$leadMinutes 分钟后外推' : null));
+      }
+      scores.sort((a, b) => b.score.compareTo(a.score));
     }
-    scores.sort((a, b) => b.score.compareTo(a.score));
 
     // 6. 是否启用仲裁（模型间分歧大）
     //
-    // 超出外推可信范围时**不仲裁**：用当前回波去裁决几小时后的分歧没有意义，
+    // 超出外推可信范围时**不仲裁**：用当前回波去裁决几天后的分歧没有意义，
     // 那种情况应由多源融合自行给出结论。
     final spread = models.isNotEmpty ? models.first.precipProbSpread : null;
-    final arbitration =
-        !beyondNowcast && spread != null && spread > 30;
+    final arbitration = !beyondNowcast && spread != null && spread > 30;
 
     return RadarVerdict(
       radar: pointVerdict,
@@ -363,6 +379,7 @@ class RadarVerdictEngine {
       scoreBasis: scoreBasis,
       fromStation: source.fromStation,
       sourceLabel: source.label,
+      beyondNowcast: beyondNowcast,
     );
   }
 

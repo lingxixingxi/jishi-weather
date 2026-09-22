@@ -105,11 +105,15 @@ class _TrackScreenState extends State<TrackScreen> {
         return;
       }
 
+      // 赛道页也有「研判时刻」（可选未来 3 天内任意时刻）—— 同样要把**真实
+      // 提前量**传下去；不传的话，选了未来时刻仍会按**当前**回波定调。
+      final lead = at.difference(DateTime.now()).inMinutes;
       final v = await RadarVerdictEngine.judge(
         lat: _track.lat,
         lon: _track.lon,
         models: [m],
         radarPath: _multi.lastRadarPath,
+        horizonOverride: lead > 0 ? lead : null,
       );
       debugPrint('[赛道] 多源 ${m.sources.length} 源 · 雷达：${v.summary}'
           '（最优=${v.bestModel ?? "—"}）');
@@ -448,8 +452,11 @@ class _TrackScreenState extends State<TrackScreen> {
     }
 
     final r = v?.radar;
+    final outOfRange = v?.beyondNowcast ?? false;
     return PanelCard(
-      heading: '多源研判 · 雷达定调${m == null ? "" : " · ${m.sources.length} 源"}',
+      // 超出外推范围时雷达不参与定调，标题要跟着变
+      heading: '多源研判 · ${outOfRange ? "雷达未参与定调" : "雷达定调"}'
+          '${m == null ? "" : " · ${m.sources.length} 源"}',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

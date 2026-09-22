@@ -495,10 +495,14 @@ class _LocationScreenState extends State<LocationScreen> {
 
   /// 选中未来时刻后，把**雷达定调**同步到该时刻
   ///
-  /// 雷达回波外推的有效时限约 2 小时（[RadarService.forecastMaxMinutes]）：
-  /// · 该时刻在时限内 → 用「距今分钟数」作为外推提前量重跑一次
-  /// · 超出时限       → 不重跑（界面会标注「超出雷达外推范围」，
-  ///                    此时该时段的判断应以数值模式为准）
+  /// 不论该时刻距今多久，都把**真实分钟数**交给 [RadarVerdictEngine]，
+  /// 由它判断是否超出外推可信范围（[RadarService.forecastMaxMinutes] = 2 小时）：
+  /// · 在时限内 → 用该时长做回波外推，给出那一刻的预测
+  /// · 超出时限 → 引擎返回 `beyondNowcast`，**不打分、不给最优源**，
+  ///   界面明确标注「未参与定调，以多源融合为准」
+  ///
+  /// ⚠️ 早先的实现是「超出时限就什么都不做」，界面会一直停在上一次（当前时刻）
+  /// 的结论上，看起来就像**「选了很远的时间，雷达却没有降级」**（实测 bug）。
   Future<void> _syncRadarToSelected(DateTime? t) async {
     final center = _result?.center;
     if (center == null || _hourlyForecast.isEmpty) return;
@@ -509,12 +513,15 @@ class _LocationScreenState extends State<LocationScreen> {
       return;
     }
     final lead = t.difference(DateTime.now()).inMinutes;
-    if (lead <= 0) {
-      await _runLocationVerdict(center, _hourlyForecast);
-    } else if (lead <= RadarService.forecastMaxMinutes) {
-      await _runLocationVerdict(center, _hourlyForecast, horizonOverride: lead);
-    }
-    // 超出外推时限：保持原结果，由 UI 标注不可用
+    // ⚠️ 只要目标在未来就把**真实分钟数**传下去，不要在这里因超范围而跳过：
+    // 那样界面会一直停留在上一次（当前时刻）的结论上，看起来就像「没降级」。
+    // 交给 `RadarVerdictEngine` 判断，并给出「超出雷达外推范围，以多源融合为准」
+    // 的明确结论。
+    await _runLocationVerdict(
+      center,
+      _hourlyForecast,
+      horizonOverride: lead > 0 ? lead : null,
+    );
   }
 
   /// 加载风云四号卫星云图（看云系，与雷达互补）
@@ -1773,10 +1780,10 @@ class _LocationScreenState extends State<LocationScreen> {
     }
     final v = _verdict!;
     final r = v.radar;
-    // 选中的未来时刻是否超出雷达外推时限（约 2 小时）
-    final selLead = _selectedTime?.difference(DateTime.now()).inMinutes;
-    final radarOutOfRange =
-        selLead != null && selLead > RadarService.forecastMaxMinutes;
+    // 目标时刻是否超出雷达外推能力 —— 直接采信引擎给出的结论 `beyondNowcast`，
+    // 而不是用 UI 状态另算一遍：两处判断一旦不一致，就会出现
+    // 「提示说没定调、实际却按雷达结果切换了中心点」这类矛盾。
+    final radarOutOfRange = v.beyondNowcast;
 
     return PanelCard(
       heading: _selectedTime == null

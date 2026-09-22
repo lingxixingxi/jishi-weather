@@ -476,6 +476,12 @@ class _RouteScreenState extends State<RouteScreen> {
     if (models == null) return;
 
     // 出发时刻距今多少分钟
+    //
+    // ⚠️ **必须传真实分钟数**（哪怕几万分钟），由 `RadarVerdictEngine` 自己判断
+    // 是否超出外推可信范围并降级。早先这里在 > 2h 时传 `null`，而 `null` 在
+    // judge 里的含义是「**当前时刻**」—— 于是几天后的行程被当成此刻照常打分、
+    // 照常返回 `bestModelKey`，路线页再按「雷达判出的最优源」重建分段，
+    // 表现就是**「选了很远的时间，雷达定调却没有降级」**（实测 bug）。
     final leadMin = _departAt.difference(DateTime.now()).inMinutes;
     final withinNowcast =
         leadMin > 0 && leadMin <= RadarService.forecastMaxMinutes;
@@ -490,7 +496,7 @@ class _RouteScreenState extends State<RouteScreen> {
         lon: samples[mid].point.lon,
         models: [models],
         radarPath: path,
-        horizonOverride: withinNowcast ? leadMin : null,
+        horizonOverride: leadMin > 0 ? leadMin : null,
       );
       if (!mounted) return;
       setState(() {
@@ -1041,10 +1047,29 @@ class _RouteScreenState extends State<RouteScreen> {
     final nowcastWindow = RadarService.forecastMaxMinutes;
     final withinNowcast = lead > 0 && lead <= nowcastWindow;
     return PanelCard(
-      heading: '雷达定调 · 真实回波校验',
+      // 超出外推范围时雷达**不参与定调**，标题也要跟着变，
+      // 否则用户会以为下方内容仍是「雷达裁决出来的结果」
+      heading: v.beyondNowcast ? '雷达实况 · 未参与定调' : '雷达定调 · 真实回波校验',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (v.beyondNowcast)
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+              decoration: BoxDecoration(
+                color: AppTheme.bgInset,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.borderSoft),
+              ),
+              child: const Text(
+                '目标时刻超出雷达外推有效范围 → 不参与定调，以多源融合为准',
+                style: TextStyle(
+                    fontSize: 11.5,
+                    color: AppTheme.textDim,
+                    fontWeight: FontWeight.w600),
+              ),
+            ),
           if (v.arbitrationUsed)
             Container(
               margin: const EdgeInsets.only(bottom: 10),

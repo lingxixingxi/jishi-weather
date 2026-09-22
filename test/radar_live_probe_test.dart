@@ -13,6 +13,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jishiweather/engine/radar_verdict.dart';
+import 'package:jishiweather/models/hourly_weather.dart';
 import 'package:jishiweather/services/amap_service.dart';
 import 'package:jishiweather/services/multi_source_service.dart';
 import 'package:jishiweather/services/nmc_city_repository.dart';
@@ -171,17 +172,84 @@ void main() {
     }
   }, timeout: const Timeout(Duration(minutes: 5)), skip: _skip);
 
-  test('超出外推范围（>2h）：不做外推、不启用雷达仲裁', () async {
+  test('超出外推范围（>2h）：不打分、不仲裁、不给最优源 —— 否则调用方不会降级', () async {
+    // 必须传**真实的模型数据**：models 为空时 scores 本来就是空的，测不出东西。
+    final models = [
+      MultiModelHourly(
+        time: DateTime.now().add(const Duration(days: 4)),
+        lat: 31.23,
+        lon: 121.47,
+        place: '上海',
+        sources: const [
+          ModelForecast(
+            model: 'ecmwf_ifs025',
+            displayName: 'ECMWF',
+            temperature: 22,
+            precipitation: 0,
+            precipitationProbability: 10,
+          ),
+          ModelForecast(
+            model: 'gfs_seamless',
+            displayName: 'GFS',
+            temperature: 23,
+            precipitation: 1.2,
+            precipitationProbability: 60,
+          ),
+        ],
+      ),
+    ];
+
+    for (final h in [300, 5760]) {
+      final v = await RadarVerdictEngine.judge(
+        lat: 31.23,
+        lon: 121.47,
+        models: models,
+        radarPath: null,
+        horizonOverride: h,
+      );
+      // ignore: avoid_print
+      print('[LIVE] horizon=$h → beyondNowcast=${v.beyondNowcast} | '
+          'scores=${v.scores.length} | bestModelKey=${v.bestModelKey} | '
+          '依据="${v.scoreBasis}"');
+      expect(v.beyondNowcast, isTrue, reason: '超出 2h 应标记 beyondNowcast');
+      expect(v.scores, isEmpty, reason: '超出范围时一个模型都不该打分');
+      expect(v.bestModelKey, isNull,
+          reason: '拿不到最优源，路线页才不会按雷达结果重建分段 —— 这才是真降级');
+      expect(v.arbitrationUsed, isFalse);
+      expect(v.scoreBasis, contains('超出'));
+    }
+  }, timeout: const Timeout(Duration(minutes: 5)), skip: _skip);
+
+  test('对照：未来 1 小时内仍要正常打分（修 bug 不能把正常路径也关掉）', () async {
+    final models = [
+      MultiModelHourly(
+        time: DateTime.now().add(const Duration(hours: 1)),
+        lat: 31.23,
+        lon: 121.47,
+        place: '上海',
+        sources: const [
+          ModelForecast(
+            model: 'ecmwf_ifs025',
+            displayName: 'ECMWF',
+            temperature: 22,
+            precipitation: 0,
+            precipitationProbability: 10,
+          ),
+        ],
+      ),
+    ];
     final v = await RadarVerdictEngine.judge(
       lat: 31.23,
       lon: 121.47,
-      models: const [],
+      models: models,
       radarPath: null,
-      horizonOverride: 300,
+      horizonOverride: 60,
     );
     // ignore: avoid_print
-    print('[LIVE] horizon=300 → 依据="${v.scoreBasis}" | 仲裁=${v.arbitrationUsed}');
-    expect(v.arbitrationUsed, isFalse, reason: '超出外推范围不应启用雷达仲裁');
-    expect(v.scoreBasis, contains('超出'));
+    print('[LIVE] horizon=60（对照）→ beyondNowcast=${v.beyondNowcast} | '
+        'scores=${v.scores.length} | bestModelKey=${v.bestModelKey}');
+    expect(v.beyondNowcast, isFalse, reason: '1 小时属于外推可信范围');
+    expect(v.scores, isNotEmpty, reason: '可信范围内必须正常打分');
+    expect(v.bestModelKey, isNotNull, reason: '应能给出最吻合的源');
   }, timeout: const Timeout(Duration(minutes: 5)), skip: _skip);
 }
