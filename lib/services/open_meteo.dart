@@ -134,13 +134,36 @@ class OpenMeteoService {
   /// Open-Meteo 支持一次请求多个坐标（逗号分隔），5×5 网格只需 1 次请求。
   /// 返回按行优先排列：index = row * n + col，row 由南到北、col 由西到东。
   /// 每个点带完整逐小时序列，便于做时间轴动画。
+  ///
+  /// ## ⚡ 性能设计（实测驱动，2026-09-23）
+  ///
+  /// 这是「缩放 / 平移地图时重采网格」的热路径，**耗时直接决定跟手程度**。
+  /// 实测 9×9 网格、24 km 跨度（脚本：`_research/probe/probe_grid_speed.py`）：
+  ///
+  /// | 时间跨度 | 变量数 | 耗时 |
+  /// |---|---|---|
+  /// | 48 h | 3 | **8.65 s** ← 旧实现，用户反馈「加载慢」的根因 |
+  /// | 24 h | 3 | 4.20 s |
+  /// | 48 h | 2 | 3.64 s |
+  /// | **24 h** | **2** | **1.05 s** |
+  ///
+  /// 结论：**时间跨度是主因，点数几乎不影响** —— 3×3（仅 9 个点）仍要 2.55 s，
+  /// 比 24 h / 81 点的 1.05 s 还慢。Open-Meteo 官方也说明「多坐标 + 长时间跨度」
+  /// 代价很高（GitHub issue #369：单次调用可能返回数 GB 数据）。
+  ///
+  /// 因此这里做两件事：
+  /// 1. **只请求 `cloud_cover` + `precipitation`**（叠加图用不到降水概率）；
+  /// 2. **把整段时间轴拆成「逐日窗口」并发拉取** —— 每个窗口 24 h 约 1 s，
+  ///    并发后总耗时仍约 1 s，而时间轴长度不变（过去 1 天 + 今天 = 48 帧）。
+  ///
+  /// ⚠️ 不要退回「一次请求 48 h」：那是 8.65 s，用户会明显感到卡。
   Future<List<GridPoint>> fetchGrid({
     required double centerLat,
     required double centerLon,
     double spanKm = 24, // 覆盖范围（公里）
     int n = 5, // 每边格点数
+    int pastDays = 1, // 含过去 N 天（可回看）
     int forecastDays = 1,
-    int pastDays = 1, // 含过去 N 天（可回看移动轨迹）
   }) async {
     final half = spanKm / 2 / 111.0;
     final dLat = spanKm / 111.0 / (n - 1);
@@ -156,12 +179,66 @@ class OpenMeteoService {
       }
     }
 
+    // 组成「逐日窗口」列表（过去的 N 天 + 未来 N 天，按时间顺序）
+    final today = DateTime.now();
+    final base = DateTime(today.year, today.month, today.day);
+    final days = <DateTime>[
+      for (var d = pastDays; d >= 1; d--) base.subtract(Duration(days: d)),
+      for (var d = 0; d < forecastDays; d++) base.add(Duration(days: d)),
+    ];
+    if (days.isEmpty) days.add(base);
+
+    // 并发拉取：单个窗口失败不影响其余（返回空列表占位）
+    final parts = await Future.wait(days.map((d) async {
+      try {
+        return await _fetchGridDay(lats: lats, lons: lons, day: d);
+      } catch (e) {
+        debugPrint('[网格] 窗口 ${_ymd(d)} 失败: $e');
+        return const <GridPoint>[];
+      }
+    }));
+
+    // 按时间顺序把各窗口的序列拼接起来
+    final out = <GridPoint>[];
+    for (var i = 0; i < lats.length; i++) {
+      final times = <String>[];
+      final cloud = <double?>[];
+      final rain = <double?>[];
+      for (final part in parts) {
+        if (i >= part.length) continue;
+        times.addAll(part[i].times);
+        cloud.addAll(part[i].cloud);
+        rain.addAll(part[i].rain);
+      }
+      out.add(GridPoint(
+        lat: lats[i],
+        lon: lons[i],
+        times: times,
+        cloud: cloud,
+        rain: rain,
+        // 叠加图不需要降水概率 —— 去掉它实测可省约 4 倍耗时
+        pop: const [],
+      ));
+    }
+    return out;
+  }
+
+  static String _ymd(DateTime d) => '${d.year}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+
+  /// 拉取**单个自然日**的网格数据（[fetchGrid] 的并发单元）
+  Future<List<GridPoint>> _fetchGridDay({
+    required List<double> lats,
+    required List<double> lons,
+    required DateTime day,
+  }) async {
     final uri = Uri.parse(_forecastUrl).replace(queryParameters: {
       'latitude': lats.map((e) => e.toStringAsFixed(4)).join(','),
       'longitude': lons.map((e) => e.toStringAsFixed(4)).join(','),
-      'hourly': 'cloud_cover,precipitation,precipitation_probability',
-      'forecast_days': '$forecastDays',
-      'past_days': '$pastDays',
+      'hourly': 'cloud_cover,precipitation',
+      'start_date': _ymd(day),
+      'end_date': _ymd(day),
       'timezone': 'Asia/Shanghai',
     });
 
@@ -170,7 +247,8 @@ class OpenMeteoService {
       throw Exception('网格数据请求失败 ${resp.statusCode}');
     }
     final decoded = jsonDecode(utf8.decode(resp.bodyBytes));
-    final list = (decoded is List ? decoded : [decoded]).cast<Map<String, dynamic>>();
+    final list =
+        (decoded is List ? decoded : [decoded]).cast<Map<String, dynamic>>();
 
     List<double?> toList(dynamic hourly, String key) {
       final arr = (hourly as Map<String, dynamic>?)?[key] as List?;
@@ -183,13 +261,11 @@ class OpenMeteoService {
       var times = <String>[];
       var cloud = <double?>[];
       var rain = <double?>[];
-      var pop = <double?>[];
       if (i < list.length) {
         final hourly = list[i]['hourly'] as Map<String, dynamic>?;
         times = ((hourly?['time'] as List?) ?? const []).cast<String>();
         cloud = toList(hourly, 'cloud_cover');
         rain = toList(hourly, 'precipitation');
-        pop = toList(hourly, 'precipitation_probability');
       }
       out.add(GridPoint(
         lat: lats[i],
@@ -197,7 +273,7 @@ class OpenMeteoService {
         times: times,
         cloud: cloud,
         rain: rain,
-        pop: pop,
+        pop: const [],
       ));
     }
     return out;

@@ -883,15 +883,21 @@ class _LocationScreenState extends State<LocationScreen> {
     var grid = const <GridPoint>[];
     try {
       // 网格跨度跟着地图缩放走（见 [_spanKmForZoom]）：视野大时覆盖更大范围，
-      // 缩小时才看得到周边云量/雨量分布，而不是永远只有中心那一小块
-      _gridSpanKm = _spanKmForZoom(_currentZoom);
-      _fitSpanKm = _gridSpanKm; // 换地点：适配视野也跟着新网格走
+      // 缩小时才看得到周边云量 / 雨量分布。
+      // 实际网格 = 视野档 × 2（多出的一倍作为平移缓冲，见 [_gridSpanKm]）
+      _viewSpanKm = _spanKmForZoom(_currentZoom);
+      _fitSpanKm = _viewSpanKm; // 换地点：适配视野也跟着新网格走
+      _gridCenter = LatLng(center.lat, center.lon);
+      final tGrid = DateTime.now();
       grid = await _meteo.fetchGrid(
         centerLat: center.lat,
         centerLon: center.lon,
         spanKm: _gridSpanKm,
         n: _gridN,
       );
+      debugPrint('[网格] 首次加载 ${grid.length} 点 × '
+          '${grid.isEmpty ? 0 : grid.first.times.length} 时刻，'
+          '耗时 ${DateTime.now().difference(tGrid).inMilliseconds}ms');
       debugPrint('[网格] 点数=${grid.length} 时刻数=${grid.isEmpty ? 0 : grid.first.length}');
     } catch (e) {
       debugPrint('[网格] 失败: $e');
@@ -1366,14 +1372,12 @@ class _LocationScreenState extends State<LocationScreen> {
                       // （贴近定位所在地，而不是拉到图层的整个覆盖范围）
                       fitPoints: _mapFitPoints(LatLng(r.center.lat, r.center.lon)),
                       onCameraMoveEnd: (target, zoom) {
-                        if ((zoom - _currentZoom).abs() > 0.01) {
-                          setState(() => _currentZoom = zoom);
-                          // 缩放跨越档位时，按新视野重采云量 / 雨量网格 ——
-                          // 这是「缩小地图能看到更大范围云量」的关键。
-                          // 网格是一次请求取回 N×N 个点（逗号分隔多坐标），
-                          // 所以**不增加请求数**，只改变覆盖范围与分辨率。
-                          unawaited(_resampleGridForZoom());
-                        }
+                        final zoomChanged = (zoom - _currentZoom).abs() > 0.01;
+                        if (zoomChanged) setState(() => _currentZoom = zoom);
+                        // 缩放跨档 **或** 平移出当前网格范围 → 重采网格。
+                        // ⚠️ 平移同样必须重采：否则把地图挪到别的区域后，看到的
+                        // 还是原来那块云量（用户反馈的第二个问题）。
+                        _onMapSettled(target);
                       },
                       interactive: true,
                     ),
@@ -2286,10 +2290,10 @@ class _LocationScreenState extends State<LocationScreen> {
           // 风云四号卫星云图（看云系）
           _loadSatellite();
         } else {
-          // 切到云量 / 雨量：把「适配视野」的跨度快照更新为当前网格档，
+          // 切到云量 / 雨量：把「适配视野」的跨度快照更新为当前视野档，
           // 这样从雷达 / 卫星的大范围切回来时会**缩放到网格范围**
           // （用户反馈「从雷达图切回云量不会放大到最近尺寸」）。
-          _fitSpanKm = _gridSpanKm;
+          _fitSpanKm = _viewSpanKm;
           _regenerateOverlay();
         }
       },
@@ -2528,23 +2532,40 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
-  /// 当前云量 / 雨量网格的覆盖跨度（km）
+  /// 当前**视野档位**跨度（km）—— 由地图缩放级别决定（见 [_spanKmForZoom]）
   ///
-  /// 由地图缩放级别决定（见 [_spanKmForZoom]）：视野大时网格也放大。
-  /// 这样缩小地图能看到更大范围的云量分布，而不是永远只有中心那一小块。
-  double _gridSpanKm = 24;
+  /// 实际网格跨度是它的 **2 倍**（见 [_gridSpanKm]），多出的部分作为**平移缓冲**。
+  double _viewSpanKm = 24;
 
-  /// 网格重采是否进行中（防止连续捏合触发并发请求）
+  /// 网格实际覆盖跨度（km）= 视野 × 2
+  ///
+  /// ⚠️ 取 2 倍是为了**平移缓冲**：用户把地图挪半个屏，视野里依然全是有效数据，
+  /// 不必等新网格回来。这是「移动到别的区域也能立刻看到那里的图」的关键 ——
+  /// 早先网格只有 1 倍视野，一平移边缘就露白。
+  double get _gridSpanKm => _viewSpanKm * 2;
+
+  /// 当前网格的中心（用于判断地图是否已移出有效范围）
+  LatLng? _gridCenter;
+
+  /// 地图当前中心（由 `onCameraMoveEnd` 上报）
+  LatLng? _mapCenter;
+
+  /// 网格重采的防抖计时器
+  ///
+  /// 拖动地图会连续触发 `onCameraMoveEnd`，若每次都发请求会又慢又浪费
+  /// （还容易撞上 Open-Meteo 限流）。停手 350ms 后才真正重采。
+  Timer? _gridDebounce;
+
+  /// 网格重采是否进行中（防止连续操作触发并发请求）
   bool _gridResampling = false;
 
-  /// 按地图缩放级别给出合适的网格覆盖跨度（km）
+  /// 按地图缩放级别给出合适的**视野**跨度（km）
   ///
   /// 高德（Web Mercator）下 `米/像素 = 156543 × cos(lat) / 2^zoom`。
   /// ⚠️ 地图卡片是 `SizedBox(height: 300)`，即 **300 逻辑像素**高，所以
   /// 视野跨度 ≈ 300 × 156543 × cos(32°) / 2^zoom / 1000 ≈ **39.8 / 2^zoom 公里**
   ///   · zoom 11 → 约 19 km     · zoom 10 → 约 39 km
   ///   · zoom 9  → 约 78 km     · zoom 8  → 约 156 km
-  /// 网格跨度取与之相当的值，缩小地图就能看到更大范围的云量。
   ///
   /// ⚠️ 必须**用离散档位而不是连续跟随**：连续计算会让每一次捏合都触发重新
   /// 采样（抖动且浪费），而网格本来就是固定的 9×9 个点，按档位整体换一档即可。
@@ -2553,46 +2574,87 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 「程序移动也重采」曾形成正反馈（zoom 从 11.5 一路发散到 7.7）。
   double _spanKmForZoom(double z) {
     if (z >= 12.0) return 12; // 视野 ≤ 10 km
-    if (z >= 11.0) return 24; // 默认档（初始 zoom 11.5 落这里，与原 24km 行为一致）
+    if (z >= 11.0) return 24; // 默认档（初始 zoom 11.5 落这里）
     if (z >= 10.0) return 48;
     if (z >= 9.0) return 96;
     if (z >= 8.0) return 192;
     return 384; // 省域级
   }
 
-  /// 地图缩放跨越档位后，按新视野重新采样云量 / 雨量网格
-  ///
-  /// 这是「缩小地图能看到更大范围云量」的实现：网格覆盖范围跟着视野走。
-  /// **不增加请求数** —— `OpenMeteoService.fetchGrid` 用逗号分隔的多坐标
-  /// 一次取回 N×N 个点，只改变覆盖范围与分辨率。
-  Future<void> _resampleGridForZoom() async {
-    final c = _result?.center;
-    if (c == null || _gridResampling) return;
+  /// 地图静止后决定是否重采网格（缩放跨档 **或** 平移出有效范围）
+  void _onMapSettled(LatLng center) {
+    _mapCenter = center;
+    // 只有云量 / 雨量需要按视野重采；雷达、卫星是固定覆盖的整图
+    if (_layerMode != _LayerMode.cloud && _layerMode != _LayerMode.rain) return;
 
-    final span = _spanKmForZoom(_currentZoom);
-    if (span == _gridSpanKm) return; // 档位没变，不重采
+    final spanChanged = _spanKmForZoom(_currentZoom) != _viewSpanKm;
+    if (!spanChanged && !_gridCenterMoved(center)) return;
+
+    _gridDebounce?.cancel();
+    _gridDebounce = Timer(const Duration(milliseconds: 350), () {
+      unawaited(_resampleGridForZoom());
+    });
+  }
+
+  /// 地图中心是否已移出当前网格的**主要覆盖区**
+  ///
+  /// 网格半径是 `_viewSpanKm`（跨度 2 倍视野），中心偏离超过一个视野跨度
+  /// 就重采 —— 留一半重叠可以保证重采期间画面里始终有数据，不会出现空白。
+  bool _gridCenterMoved(LatLng center) {
+    final ref = _gridCenter;
+    if (ref == null) return true;
+    final dLatKm = (center.latitude - ref.latitude).abs() * 110.57;
+    final cosLat =
+        math.cos(ref.latitude * math.pi / 180).abs().clamp(0.2, 1.0);
+    final dLonKm = (center.longitude - ref.longitude).abs() * 111.32 * cosLat;
+    final dKm = math.sqrt(dLatKm * dLatKm + dLonKm * dLonKm);
+    return dKm > _viewSpanKm;
+  }
+
+  /// 按当前**地图中心**与缩放档位重新采样云量 / 雨量网格
+  ///
+  /// 这是「缩放到哪、移到哪，就看到哪的云量」的实现。
+  ///
+  /// ⚡ 请求本身已被 `OpenMeteoService.fetchGrid` 优化过（拆成单日窗口并发 +
+  /// 只取 2 个变量），实测由 8.65 s 降到约 1 s —— 否则再怎么防抖也还是慢。
+  ///
+  /// ⚠️ **不要清空 `_overlayPng`**：那会让叠加层在网络请求期间先「闪一下消失」
+  /// 再出现。`_regenerateOverlay()` 会在新位图渲染好后一次性替换，旧图一直保留
+  /// 到那一刻，视觉才是连续的。
+  Future<void> _resampleGridForZoom() async {
+    final fallback = _result?.center;
+    // ⚠️ 用**地图当前中心**而不是查询时的中心点 —— 用户平移到别的区域时，
+    // 网格必须跟着走，否则那片区域永远没有云量。
+    final lat = _mapCenter?.latitude ?? fallback?.lat;
+    final lon = _mapCenter?.longitude ?? fallback?.lon;
+    if (lat == null || lon == null || _gridResampling) return;
+
+    final view = _spanKmForZoom(_currentZoom);
+    if (view == _viewSpanKm && !_gridCenterMoved(LatLng(lat, lon))) return;
 
     _gridResampling = true;
     try {
+      final t0 = DateTime.now();
       final grid = await _meteo.fetchGrid(
-        centerLat: c.lat,
-        centerLon: c.lon,
-        spanKm: span,
+        centerLat: lat,
+        centerLon: lon,
+        spanKm: view * 2, // 2 倍视野做平移缓冲
         n: _gridN,
       );
+      final ms = DateTime.now().difference(t0).inMilliseconds;
       if (!mounted) return;
-      debugPrint('[网格] 缩放档位变化 zoom=$_currentZoom → spanKm=$span'
-          '（${grid.length} 点）');
-      // ⚠️ **不要在这里清空 `_overlayPng`** —— 那会让叠加层在网络请求期间
-      // 先「闪一下消失」再出现。`_regenerateOverlay()` 会在新位图渲染好之后
-      // 一次性替换，旧图一直保留到那一刻，缩放过程才是连续的。
+      debugPrint('[网格] 重采 视野档=$view km 网格=${view * 2} km '
+          'zoom=${_currentZoom.toStringAsFixed(2)} '
+          '中心=${lat.toStringAsFixed(3)},${lon.toStringAsFixed(3)}'
+          '（${grid.length} 点，耗时 ${ms}ms）');
       setState(() {
         _grid = grid;
-        _gridSpanKm = span;
+        _viewSpanKm = view;
+        _gridCenter = LatLng(lat, lon);
       });
       await _regenerateOverlay();
     } catch (e) {
-      debugPrint('[网格] 按缩放重采失败: $e');
+      debugPrint('[网格] 重采失败: $e');
     } finally {
       _gridResampling = false;
     }
