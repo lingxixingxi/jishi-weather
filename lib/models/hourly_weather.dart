@@ -400,21 +400,29 @@ class MultiModelHourly {
 
   /// 生成一条 HourlyWeather（用融合值，source 标记为多源）
   ///
-  /// **天气现象的取值逻辑修正**：
-  /// 有降水 → 用降水来源的文字（如「小雨」）；
-  /// 无降水 → **按各源云量的共识判定**（晴/少云/多云/阴）。
-  /// 这样避免「第一个源报晴、其余源云量 100%」时显示成晴天的问题。
+  /// **天气现象统一走 [effectiveWeatherText]** —— 地点页中心点、四个方位点、
+  /// 7 天聚合因此走**完全同一套判断**：有降水用该源原文（缺失则按降水强度分级），
+  /// 无降水才用各源云量共识。
+  ///
+  /// ⚠️ 旧实现是「有降水取 texts.first（**第一个源**的文字）」，与中心点取
+  /// 「雷达定调最优源原文」的口径并不一致；再加上四个方位点当初只拉单模型，
+  /// 实测出现「中心 大雨、四个方位全是毛毛雨」这种同页面两套判法的观感。
   HourlyWeather toHourlyWeather({String source = 'multi-model'}) {
     final codes = sources.map((s) => s.weatherCode).whereType<int>().toList();
     final texts = sources.map((s) => s.weatherText).whereType<String>().toList();
 
     final hasPrecip = (precipitation ?? 0) >= 0.1;
-    final String? effectiveText;
-    if (hasPrecip) {
-      effectiveText = texts.isEmpty ? null : texts.first;
-    } else {
-      effectiveText = consensusWeatherText ?? (texts.isEmpty ? null : texts.first);
-    }
+    final String? effectiveText = hasPrecip
+        // 有降水：用**融合降水强度的分级**（小雨/中雨/大雨/暴雨）。
+        //
+        // ⚠️ 不能取某一个源的定性词：同一时刻各源差异极大（实测 ECMWF 报
+        // 「毛毛雨」而 GFS 报「中雨」），取 texts.first 会出现
+        // 「毛毛雨 + 91% 降水概率」这种与**自身显示的数值**不自洽的结果，
+        // 而且中心点用「实况源原文」、方位点用「第一个源原文」又是两套口径。
+        // 用降水强度分级则与数值同源，各方位点之间也可比。
+        ? HourlyWeather.levelOf(precipitation)
+        // 无降水：各源云量共识（拿不到共识时兜底用第一个源的文字）
+        : (consensusWeatherText ?? (texts.isEmpty ? null : texts.first));
 
     return HourlyWeather(
       place: place,

@@ -269,7 +269,12 @@ class _LocationScreenState extends State<LocationScreen> {
   DateTime? _selectedTime;
 
   /// 4 个方位点的逐小时预报（与中心同长度，供采样明细按时刻取值）
-  List<List<HourlyWeather>> _altHourly = const [];
+  /// 四个方位点的逐小时数据 —— **与中心点同源同判**（5 源融合）
+  ///
+  /// 早先这里是 `List<List<HourlyWeather>>`（best_match **单模型**），
+  /// 而中心点是 5 源融合 + 雷达定调 —— 两者是**两套逻辑**，
+  /// 实测出现「中心 大雨、四个方位全毛毛雨」。现已统一为多源。
+  List<List<MultiModelHourly>> _altHourly = const [];
 
   bool _loading = false;
   String? _error;
@@ -432,9 +437,15 @@ class _LocationScreenState extends State<LocationScreen> {
   }
 
   /// 取某方位点在给定时刻的预报（无选中时刻则用当前时间）
+  /// 取某个方位点在该时刻的天气
+  ///
+  /// **与中心点同一套判断**：多源融合值 → `effectiveWeatherText`
+  /// （有降水用该源原文、缺失按降水强度分级；无降水用云量共识）。
+  /// 早先这里是把单模型 best_match 的原文直出，才出现同页面两套判法。
   HourlyWeather? _altAt(int index, DateTime t) {
     if (index < 0 || index >= _altHourly.length) return null;
-    return _nearest(_altHourly[index], t);
+    final m = _nearestMulti(_altHourly[index], t);
+    return m?.toHourlyWeather(source: '多源融合');
   }
 
   /// 区域概览的「中心天气」块
@@ -794,33 +805,55 @@ class _LocationScreenState extends State<LocationScreen> {
     // 走城市仓库的逆地理缓存，不会多花一次请求
     final addrFuture = _cityRepo.addressAt(center.lat, center.lon);
 
-    // 中心点走**多源融合**（5 源交叉验证 + 雷达定调），保留完整多源集合
-    List<MultiModelHourly> centerMulti = const [];
-    try {
-      centerMulti = await _multi.fetch(
-        lat: center.lat,
-        lon: center.lon,
-        place: center.name.isEmpty ? '中心' : center.name,
-        forecastDays: 7, // 7 天多源逐小时 → 本地聚合出多源逐日预报
-      );
-      debugPrint('[多源] 中心点 ${centerMulti.length} 个时刻，'
-          '${centerMulti.isEmpty ? 0 : centerMulti.first.sources.length} 源');
-    } catch (e) {
-      debugPrint('[多源] 中心点失败: $e');
-    }
-
-    // 四方位点用单模型（省流量，只做方位差异对比）
-    // 注意：也要拉 7 天，这样采样明细能跟随「未来小时」的选择切到同一时刻
+    // 中心点 + 四方位点**都走多源融合**（5 源交叉验证）
+    //
+    // ⚠️ 早先方位点用的是 best_match **单模型**（为了省流量），于是同一张卡片里
+    // 中心与四个点成了**两套数据源 + 两套天气现象判法** —— 实测出现
+    // 「中心 大雨（央台实测 13.5mm/h）、四周全毛毛雨（单模型预报）」这种
+    // 同一时刻相距仅 5km 却自相矛盾的观感。现在两侧同源同判。
+    //
+    // 两者**并行发起**：串行会让首次查询耗时直接相加。
     final others = points.where((p) => p.label != '中心').toList();
-    var otherForecasts = <List<HourlyWeather>>[];
-    try {
-      otherForecasts = await _meteo.fetchMany(
-        others.map((p) => (lat: p.point.lat, lon: p.point.lon, place: p.label)).toList(),
-        forecastDays: 7,
-      );
-    } catch (e) {
-      debugPrint('[单模型] 方位点失败: $e');
-    }
+
+    List<MultiModelHourly> centerMulti = const [];
+    List<List<MultiModelHourly>> otherMulti = const [];
+
+    await Future.wait([
+      () async {
+        try {
+          centerMulti = await _multi.fetch(
+            lat: center.lat,
+            lon: center.lon,
+            place: center.name.isEmpty ? '中心' : center.name,
+            forecastDays: 7, // 7 天多源逐小时 → 本地聚合出多源逐日预报
+          );
+          debugPrint('[多源] 中心点 ${centerMulti.length} 个时刻，'
+              '${centerMulti.isEmpty ? 0 : centerMulti.first.sources.length} 源');
+        } catch (e) {
+          debugPrint('[多源] 中心点失败: $e');
+        }
+      }(),
+      () async {
+        try {
+          otherMulti = await _multi.fetchMany(
+            others
+                .map((p) => (lat: p.point.lat, lon: p.point.lon, place: p.label))
+                .toList(),
+            // ⚠️ 方位点只要 **2 天**，不是 7 天：
+            // 它服务的只是「采样明细」与「未来 12 小时」两种展示，
+            // 而 5 源 × 4 点 × 7 天的数据量会让首次查询从十几秒涨到近 30 秒（实测）。
+            // 中心的 7 天仍然保留 —— 7 日预报是它在供。
+            forecastDays: 2,
+          );
+          final n = otherMulti.isEmpty || otherMulti.first.isEmpty
+              ? 0
+              : otherMulti.first.first.sources.length;
+          debugPrint('[多源] 方位点 ${otherMulti.length} 个，各 $n 源');
+        } catch (e) {
+          debugPrint('[多源] 方位点失败: $e');
+        }
+      }(),
+    ]);
 
     // 注：逐日预报不再调 Open-Meteo 的单源 daily 接口，
     // 改为从上面的 5 源逐小时数据本地聚合（见 _dailySummaries()），
@@ -844,10 +877,10 @@ class _LocationScreenState extends State<LocationScreen> {
       maxPop = centerW!.precipitationProbability;
     }
 
-    // 方位点：用单模型值
+    // 方位点：**与中心同一套**（多源融合值 + effectiveWeatherText）
     for (var i = 0; i < others.length; i++) {
-      final list = i < otherForecasts.length ? otherForecasts[i] : const <HourlyWeather>[];
-      final w = _nearest(list, now);
+      final list = i < otherMulti.length ? otherMulti[i] : const <MultiModelHourly>[];
+      final w = _nearestMulti(list, now)?.toHourlyWeather(source: '多源融合');
       samples.add((label: others[i].label, point: others[i].point, weather: w));
       final t = w?.temperature;
       if (t != null) temps.add(t);
@@ -935,7 +968,7 @@ class _LocationScreenState extends State<LocationScreen> {
       // 多源与未来预测
       _centerMulti = centerMulti.isEmpty ? null : _nearestMulti(centerMulti, now);
       _hourlyForecast = centerMulti;
-      _altHourly = otherForecasts;
+      _altHourly = otherMulti;
       _selectedTime = null; // 换地点后回到「当前时刻」
       _verdict = null;
       _result = _AreaResult(
@@ -1332,26 +1365,27 @@ class _LocationScreenState extends State<LocationScreen> {
               ),
             ] else if (_layerMode != _LayerMode.none && _timeCount > 0) ...[
               const SizedBox(height: 6),
-              Row(
-                children: [
-                  // ⚠️ 数据源诚实标注：云量 / 雨量叠加图是 **Open-Meteo 数值模式预报**，
-                  // 不是实况观测。不标出来，用户拿它跟「雷达图」（实况）比对时
-                  // 会以为雨量图算错了 —— 实测反馈「雷达中到大雨、雨量图却几乎无色」，
-                  // 差的其实是「实况 vs 模式」这个性质，不是数据出错。
-                  if (_layerMode == _LayerMode.cloud ||
-                      _layerMode == _LayerMode.rain)
-                    const Flexible(
-                      child: Text(
-                        '数据源 Open-Meteo 模式预报（非实况）',
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 10, color: AppTheme.textFaint),
-                      ),
-                    ),
-                  const Spacer(),
-                  Text(_timeLabel,
-                      style: const TextStyle(
-                          fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
-                ],
+              // ⚠️ 数据源诚实标注：云量 / 雨量叠加图是 **Open-Meteo 数值模式预报**，
+              // 不是实况观测。不标出来，用户拿它跟「雷达图」（实况）比对时
+              // 会以为雨量图算错了 —— 实测反馈「雷达中到大雨、雨量图却几乎无色」，
+              // 差的其实是「实况 vs 模式」这个性质，不是数据出错。
+              //
+              // ⚠️ 必须**独占一行**：与右侧时间标签同行时会被挤成
+              // 「Open-Meteo 模式预报（…」（真机实测两次），来源等于没标。
+              if (_layerMode == _LayerMode.cloud ||
+                  _layerMode == _LayerMode.rain)
+                const Text(
+                  'Open-Meteo 模式预报（非实况）',
+                  style: TextStyle(fontSize: 10, color: AppTheme.textFaint),
+                ),
+              if (_layerMode == _LayerMode.cloud ||
+                  _layerMode == _LayerMode.rain)
+                const SizedBox(height: 3),
+              Align(
+                alignment: Alignment.centerRight,
+                child: Text(_timeLabel,
+                    style: const TextStyle(
+                        fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
               ),
             ],
             const SizedBox(height: 8),

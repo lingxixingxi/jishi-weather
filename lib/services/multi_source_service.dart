@@ -132,16 +132,22 @@ class MultiSourceService {
     if (!includeNmc) return result;
 
     // 2. 每个点的城市（去重后只拉一次天气）
+    //
+    // ⚠️ 这里原本是 `for + await` **串行**逆地理 —— 4 个方位点要排队 4 次。
+    // 地点页把「中心 + 方位」改为并行发起后，这一段成了新的瓶颈，改为并行。
+    final located = await Future.wait(points.map((p) async {
+      try {
+        return await _cityRepo.locate(p.lat, p.lon);
+      } catch (_) {
+        return null;
+      }
+    }));
     final cityOf = <int, NmcCity?>{};
     final cityCodes = <String, NmcCity>{};
-    for (var i = 0; i < points.length; i++) {
-      try {
-        final c = await _cityRepo.locate(points[i].lat, points[i].lon);
-        cityOf[i] = c;
-        if (c != null) cityCodes[c.code] = c;
-      } catch (_) {
-        cityOf[i] = null;
-      }
+    for (var i = 0; i < located.length; i++) {
+      cityOf[i] = located[i];
+      final c = located[i];
+      if (c != null) cityCodes[c.code] = c;
     }
     if (cityCodes.isEmpty) return result;
 
