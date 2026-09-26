@@ -1060,17 +1060,16 @@ class _LocationScreenState extends State<LocationScreen> {
         }
         if (src != null) {
           final r = _result!;
-          // ⚠️ 天气现象用**共识判定**，不要直接用最优源的原文。
-          // 原因：中央气象台的 weatherText 是「观测站的天气现象」（可能是几小时前的
-          // 实况，如「少云」），而多源面板的「共识判定」基于**各源预报云量的中位数**
-          // （≥85% 判阴）。两者依据不同，直接混用会出现
-          // 「采样明细写少云、共识判定写阴」的自相矛盾（用户反馈）。
-          // 现在统一：数值取最优源，天气现象取共识判定（有降水时优先用降水文字）。
-          final consensusText = nowMulti.consensusWeatherText;
-          final hasPrecip = (src.precipitation ?? 0) >= 0.1;
-          final effText = hasPrecip
-              ? (src.weatherText ?? consensusText)
-              : (consensusText ?? src.weatherText);
+          // 天气现象的取值口径（2026-09-26 修正）：
+          // 数值取最优源；**天气现象由 [MultiModelHourly.effectiveWeatherText] 统一决策** ——
+          // 有降水时用该源原文（央台实测已带上 real.weather.info，如「大雨」），
+          // 原文缺失则按降水强度分级；只有**无降水**时才用云量共识。
+          // 旧实现有降水时也会往共识上落，而共识没有降水档 ——
+          // 大雨天云量必然 ≥85%，于是把央台实测的「大雨」显示成了「阴」。
+          final effText = nowMulti.effectiveWeatherText(
+            sourceText: src.weatherText,
+            sourcePrecipitation: src.precipitation,
+          );
 
           final eff = HourlyWeather(
             place: r.placeName,
@@ -1330,11 +1329,26 @@ class _LocationScreenState extends State<LocationScreen> {
               ),
             ] else if (_layerMode != _LayerMode.none && _timeCount > 0) ...[
               const SizedBox(height: 6),
-              Align(
-                alignment: Alignment.centerRight,
-                child: Text(_timeLabel,
-                    style: const TextStyle(
-                        fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
+              Row(
+                children: [
+                  // ⚠️ 数据源诚实标注：云量 / 雨量叠加图是 **Open-Meteo 数值模式预报**，
+                  // 不是实况观测。不标出来，用户拿它跟「雷达图」（实况）比对时
+                  // 会以为雨量图算错了 —— 实测反馈「雷达中到大雨、雨量图却几乎无色」，
+                  // 差的其实是「实况 vs 模式」这个性质，不是数据出错。
+                  if (_layerMode == _LayerMode.cloud ||
+                      _layerMode == _LayerMode.rain)
+                    const Flexible(
+                      child: Text(
+                        '数据源 Open-Meteo 模式预报（非实况）',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 10, color: AppTheme.textFaint),
+                      ),
+                    ),
+                  const Spacer(),
+                  Text(_timeLabel,
+                      style: const TextStyle(
+                          fontSize: 11.5, color: AppTheme.accent, fontWeight: FontWeight.w600)),
+                ],
               ),
             ],
             const SizedBox(height: 8),

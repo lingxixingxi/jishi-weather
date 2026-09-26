@@ -187,6 +187,15 @@ class MultiSourceService {
     if (isPastOrNow) {
       final h = wx.historyAt(t);
       if (h != null) {
+        // ⚠️ passedchart（逐小时实测）**只有数值，没有天气现象字段**。
+        // 早先这里不传 weatherText，导致央台源在当前时刻的天气现象为 null：
+        // 调用方（地点页中心点）用 `src.weatherText ?? 云量共识` 兜底，
+        // 而云量共识只有 晴/少云/多云/阴 —— 大雨天云量必然 ≥85%，于是得出「阴」。
+        // 实测（南京 2026-09-26 13:00）：rain1h=13.5mm/h、real.weather.info="大雨"，
+        // 界面却把「央台」标成了「阴」（用户实测反馈）。
+        // 现在补上实况文字，并只在该点贴近当前（±90 分钟）时使用 ——
+        // 更早的时刻不该贴「此刻的实况」，那种情况由降水强度分级兜底。
+        final nearNow = t.difference(now).abs() <= const Duration(minutes: 90);
         return ModelForecast(
           model: 'nmc',
           displayName: '中央气象台',
@@ -195,6 +204,7 @@ class MultiSourceService {
           precipitation: h.rain1h,
           windSpeed: h.windSpeed == null ? null : h.windSpeed! * 3.6, // m/s → km/h
           windDirection: h.windDirection?.round(),
+          weatherText: nearNow ? wx.weatherText : null,
           isObservation: true,
         ).enriched();
       }

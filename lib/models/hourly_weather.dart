@@ -47,15 +47,19 @@ class HourlyWeather {  /// 地点名（或 "纬度,经度"）
   });
 
   /// 降水强度分级（mm/h）—— 与 Python 版 `降水强度分级()` 保持一致
-  String get precipitationLevel {
-    final p = precipitation;
-    if (p == null) return '未知';
-    if (p < 0.1) return '无雨';
-    if (p < 2.5) return '小雨';
-    if (p < 8.0) return '中雨';
-    if (p < 16.0) return '大雨';
+  ///
+  /// 提成 static 是为了让**非 HourlyWeather 场景**（如中心点文本决策）复用
+  /// 同一套界限，避免各处自己写一遍导致分级漂移。
+  static String levelOf(double? mmh) {
+    if (mmh == null) return '未知';
+    if (mmh < 0.1) return '无雨';
+    if (mmh < 2.5) return '小雨';
+    if (mmh < 8.0) return '中雨';
+    if (mmh < 16.0) return '大雨';
     return '暴雨';
   }
+
+  String get precipitationLevel => levelOf(precipitation);
 
   /// 是否有降水（用于分段判断）
   bool get hasRain => (precipitation ?? 0) >= 0.1;
@@ -169,13 +173,20 @@ class ModelForecast {
       // 不补的话 UI 会显示「无数据」）
       weatherText: (weatherText != null && weatherText!.isNotEmpty)
           ? weatherText
-          : _textFromCloud(cloud),
+          : _textFromCloud(cloud, precipitation: precipitation),
       isObservation: isObservation,
     );
   }
 
   /// 由云量反推天气现象文字
-  static String? _textFromCloud(double? cloud) {
+  ///
+  /// ⚠️ **有降水时必须先按降水强度给文字**（2026-09-26 修正，实测 bug）：
+  /// 只看云量的话，下雨天云量必然 ≥85%（[WeatherEstimator.estimateCloudCover]
+  /// 对降水直接给 90），反推结果**永远是「阴」** ——
+  /// 实测把中央气象台 13.5 mm/h 的「大雨」显示成了「阴」。
+  static String? _textFromCloud(double? cloud, {double? precipitation}) {
+    final p = precipitation ?? 0;
+    if (p >= 0.1) return HourlyWeather.levelOf(p);
     if (cloud == null) return null;
     if (cloud >= 85) return '阴';
     if (cloud >= 60) return '多云';
@@ -351,6 +362,30 @@ class MultiModelHourly {
     if (median >= 60) return '多云';
     if (median >= 30) return '少云';
     return '晴';
+  }
+
+  /// 中心点天气现象的**统一决策**（地点页「中心」行 / 区域概览共用）
+  ///
+  /// [sourceText] 是「最优源」自带的天气现象原文，[sourcePrecipitation] 是该源
+  /// 同时刻的降水量（mm/h）。
+  ///
+  /// ⚠️ 规则（2026-09-26 修正，实测 bug）：
+  /// · **有降水** → 用该源原文；原文缺失时**按降水强度分级**
+  ///   （如 13.5 mm/h → 大雨），**绝不**回落到云量共识 ——
+  ///   共识只输出 晴/少云/多云/阴，**没有降水档**，而大雨天云量必然 ≥85%，
+  ///   回落过去就得到「阴」。实测正是把「央台实测大雨」显示成了「阴」。
+  /// · **无降水** → 才用云量共识（此时「阴/多云/少云/晴」才是要回答的问题）。
+  String? effectiveWeatherText({
+    required String? sourceText,
+    required double? sourcePrecipitation,
+  }) {
+    final hasPrecip = (sourcePrecipitation ?? 0) >= 0.1;
+    if (hasPrecip) {
+      return (sourceText != null && sourceText.isNotEmpty)
+          ? sourceText
+          : HourlyWeather.levelOf(sourcePrecipitation);
+    }
+    return consensusWeatherText ?? sourceText;
   }
 
   /// 共识云量（各源中位数）
