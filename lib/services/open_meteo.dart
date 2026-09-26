@@ -560,15 +560,26 @@ class DailyWeather {
     this.sunset,
   });
 
-  /// 降水强度描述（按日累计量粗分）
-  String get precipLevel {
-    final p = precipitationSum ?? 0;
+  /// 日累计降水分级（mm/24h，国标日雨量）
+  ///
+  /// ⚠️ 这是**日口径**，与 `HourlyWeather.levelOf`（小时口径 mm/h）界限完全不同，
+  /// 两者**不可混用**：日累计 8mm 是「小雨」，而 8mm/h 已经是「中雨」。
+  ///
+  /// 提成 static 是为了让逐日聚合（`_dailySummaries`）复用 —— 那里原先误用了
+  /// **小时**分级去判日预报，于是整周 7 天全显示「小雨」（实测反馈：
+  /// 9/26 当天累计 31.8mm，按日口径本应是「大雨」）。
+  static String dailyLevelOf(double? mm) {
+    final p = mm ?? 0;
     if (p < 0.1) return '无雨';
     if (p < 10) return '小雨';
     if (p < 25) return '中雨';
     if (p < 50) return '大雨';
-    return '暴雨';
+    if (p < 100) return '暴雨';
+    return '大暴雨';
   }
+
+  /// 降水强度描述（按日累计量粗分）
+  String get precipLevel => dailyLevelOf(precipitationSum);
 
   /// 星期几
   String get weekday {

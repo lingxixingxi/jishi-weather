@@ -477,6 +477,15 @@ class MultiModelHourly {
   }
 }
 
+/// 「年-月-日」分组 / 排序键（**零填充**）
+///
+/// ⚠️ 必须零填充：字符串排序下 `2026-10-01` 会排在 `2026-9-26` **前面**
+/// （逐字符比较 `'1' < '9'`），跨月时日期就乱了 —— 实测 7 天预报里
+/// 「今天 9/26」被排到第 3 位，前面是 10/1、10/2。
+String ymdKey(DateTime t) => '${t.year}-'
+    '${t.month.toString().padLeft(2, '0')}-'
+    '${t.day.toString().padLeft(2, '0')}';
+
 /// WMO 天气代码 → 中文（Open-Meteo 用）
 const Map<int, String> wmoCodeText = {
   0: '晴',

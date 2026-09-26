@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:jishiweather/models/hourly_weather.dart';
 import 'package:jishiweather/services/multi_source_service.dart';
 import 'package:jishiweather/services/nmc_service.dart';
+import 'package:jishiweather/services/open_meteo.dart';
 
 /// 锁定「中心点天气现象」的口径 —— 2026-09-26 真机实测 bug 的回归测试。
 ///
@@ -247,6 +248,52 @@ void main() {
       final pref = m.toHourlyWeather(preferObservation: true);
       expect(pref.weatherText, fused.weatherText);
       expect(pref.precipitation, fused.precipitation);
+    });
+  });
+
+  group('日累计降水分级 dailyLevelOf（7 天预报用）', () {
+    test('界限按国标日雨量', () {
+      expect(DailyWeather.dailyLevelOf(null), '无雨');
+      expect(DailyWeather.dailyLevelOf(0), '无雨');
+      expect(DailyWeather.dailyLevelOf(8.4), '小雨');
+      expect(DailyWeather.dailyLevelOf(9.99), '小雨');
+      expect(DailyWeather.dailyLevelOf(10.1), '中雨');
+      expect(DailyWeather.dailyLevelOf(24.9), '中雨');
+      expect(DailyWeather.dailyLevelOf(31.8), '大雨');
+      expect(DailyWeather.dailyLevelOf(50), '暴雨');
+      expect(DailyWeather.dailyLevelOf(120), '大暴雨');
+    });
+
+    test('回归：日口径与小时口径差一个量级，不可混用', () {
+      // 用户实测：7 天预报全是「小雨」—— 因为日预报误用了**小时**分级。
+      // 实测数据：9/26 当天累计 31.8mm，而中午那一小时的融合降水仅约 0.6mm/h。
+      expect(DailyWeather.dailyLevelOf(31.8), '大雨'); // 日口径（正确）
+      expect(HourlyWeather.levelOf(0.6), '小雨'); // 小时口径（当时误用，故全周小雨）
+    });
+  });
+
+  group('日期分组键 ymdKey（跨月不能乱序）', () {
+    test('零填充后字符串排序 = 日期排序', () {
+      final keys = [
+        DateTime(2026, 10, 1),
+        DateTime(2026, 9, 26),
+        DateTime(2026, 9, 30),
+        DateTime(2026, 10, 2),
+      ].map(ymdKey).toList()
+        ..sort();
+      expect(keys, [
+        '2026-09-26',
+        '2026-09-30',
+        '2026-10-01',
+        '2026-10-02',
+      ]);
+    });
+
+    test('回归：不零填充会把 10 月排到 9 月前面（今天排第 3 位）', () {
+      // 旧实现的键 '${y}-${m}-${d}'，直接 sort 的结果
+      final bad = ['2026-10-1', '2026-10-2', '2026-9-26', '2026-9-30']..sort();
+      expect(bad.first, '2026-10-1'); // 10 月跑到最前 —— 用户实测现象
+      expect(ymdKey(DateTime(2026, 10, 1)), '2026-10-01'); // 新键不会
     });
   });
 }

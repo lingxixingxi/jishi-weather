@@ -370,10 +370,14 @@ class _LocationScreenState extends State<LocationScreen> {
     }
 
     // 按「年-月-日」分组
+    //
+    // ⚠️ 键必须用 [ymdKey]（**零填充**）：下面的 `keys.sort()` 是**字符串排序**，
+    // 不填充的话 `2026-10-1` < `2026-9-26`（逐字符 '1' < '9'），
+    // 10 月的日期会排到 9 月**前面** —— 实测 7 天预报里「今天 9/26」
+    // 被排在第 3 位，前面是 10/1、10/2。
     final byDay = <String, List<MultiModelHourly>>{};
     for (final h in _hourlyForecast) {
-      final k = '${h.time.year}-${h.time.month}-${h.time.day}';
-      byDay.putIfAbsent(k, () => []).add(h);
+      byDay.putIfAbsent(ymdKey(h.time), () => []).add(h);
     }
 
     final out = <_DailySummary>[];
@@ -411,7 +415,12 @@ class _LocationScreenState extends State<LocationScreen> {
       final String? text;
       final hasRain = precipSum >= 0.5; // 当天累计 >= 0.5mm 视为有降水
       if (hasRain) {
-        text = midday.toHourlyWeather().weatherText ?? '有雨';
+        // ⚠️ 必须按**日累计**分级（`dailyLevelOf`），不能用「中午那一小时」的
+        // 小时分级 —— 两者界限差一个量级：日累计 8mm 是「小雨」，而 8mm/h
+        // 已经是「中雨」。原实现取中午小时的融合降水（模式预报常年 0.5~1mm/h），
+        // 于是整周 7 天全显示「小雨」（用户实测反馈）；实际 9/26 当天累计
+        // 31.8mm，按日口径本应是「大雨」。
+        text = DailyWeather.dailyLevelOf(precipSum);
       } else {
         text = midday.consensusWeatherText;
       }
@@ -2282,7 +2291,7 @@ class _LocationScreenState extends State<LocationScreen> {
               Text('${days.first.sourceCount} 源聚合',
                   style: const TextStyle(fontSize: 10, color: AppTheme.textFaint)),
               const SizedBox(width: 8),
-              const Text('天气现象由各源云量共识判定',
+              const Text('天气现象按当日累计雨量分级（有降水时）',
                   style: TextStyle(fontSize: 10, color: AppTheme.textFaint)),
             ],
           ),
