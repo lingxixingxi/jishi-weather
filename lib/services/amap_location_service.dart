@@ -12,13 +12,86 @@ import 'amap_service.dart' show GeoPoint;
 /// 相比 geolocator（依赖 Google Location Service，小米等国内设备常失败），
 /// 高德定位走**基站 + WiFi + GPS 混合定位**，把周边 WiFi/基站指纹发到高德服务端匹配，
 /// 室内也能定位，WiFi 场景精度可达十几米~几十米（微信/QQ 同款原理）。
+///
+/// ## ⚡ 共享缓存与并发去重（2026-09-26 加）
+///
+/// 五个页面（地点 / 路线 / 台风 / 摄影 / 设置）都会在 `initState` 里
+/// 「预热定位」，各自直接调用本方法 —— 实测**一次冷启动并发发起 4 次定位**
+/// （logcat 里同一毫秒出现 4 条「开始定位」），纯属浪费电量与流量。
+///
+/// 现在两层收敛：
+/// 1. **结果缓存**：[cacheTtl] 内直接复用上次结果，不再重新定位；
+/// 2. **并发去重**：已有定位在飞时，后续调用**共享同一个 Future**，
+///    不会各发一次（缓存为空时的启动瞬间正是这种情况）。
+///
+/// 用户**主动**点「当前位置 / 用当前位置」时应传 `forceRefresh: true`
+/// （跳过缓存、单独发起），这是用户明确要求重新定位的场景。
 class AmapLocationService {
   static bool _keyInitialized = false;
 
+  /// 最近一次成功定位的结果与时刻（各页面共享）
+  static GeoPoint? _cached;
+  static DateTime? _cachedAt;
+
+  /// 进行中的定位请求 —— 供并发调用共享
+  static Future<GeoPoint?>? _inflight;
+
+  /// 缓存有效期
+  ///
+  /// 3 分钟足够覆盖「在一个页面里来回切」的典型用法，
+  /// 又不会让用户在一个地方停留很久后拿到明显过期的位置。
+  static const Duration cacheTtl = Duration(minutes: 3);
+
+  /// 清空缓存（换城市、或需要强制重取的场景）
+  static void clearCache() {
+    _cached = null;
+    _cachedAt = null;
+  }
+
   /// 单次定位，带超时
+  ///
+  /// [forceRefresh] 为 true 时忽略缓存与进行中的请求，单独发起一次定位 ——
+  /// 用户点「用当前位置」这类明确要求重新定位的入口应传 true。
+  ///
+  /// ⚠️ 多个并发调用若共享同一次定位，**以最先发起者的 timeout 为准**；
+  /// 超时只是保护性上限，不影响正常路径。
   static Future<GeoPoint?> locate({
     Duration timeout = const Duration(seconds: 15),
-  }) async {
+    bool forceRefresh = false,
+  }) {
+    if (!forceRefresh) {
+      final c = _cached;
+      final at = _cachedAt;
+      if (c != null && at != null) {
+        final age = DateTime.now().difference(at);
+        if (age < cacheTtl) {
+          debugPrint('[高德定位] 复用缓存（${age.inSeconds}s 前）');
+          return Future.value(c);
+        }
+      }
+      final flying = _inflight;
+      if (flying != null) {
+        debugPrint('[高德定位] 复用进行中的定位请求');
+        // 复用别人的请求，**失败就是失败** —— 不再各自重试。
+        //
+        // 曾经在这里加过「未成功则按本次 timeout 重试」，实测反而更糟：
+        // 首个请求若超时，3 个复用者会同时重试，又变回 4 次并发定位
+        // （日志：开始定位 5 次）。而「预热定位」失败本来就有 IP 定位兜底，
+        // 用户**主动**点「当前位置」走的是 forceRefresh，单独发起、不受影响。
+        return flying;
+      }
+    }
+
+    late final Future<GeoPoint?> future;
+    future = _locateInner(timeout: timeout).whenComplete(() {
+      if (identical(_inflight, future)) _inflight = null;
+    });
+    if (!forceRefresh) _inflight = future;
+    return future;
+  }
+
+  /// 真正发起一次高德定位
+  static Future<GeoPoint?> _locateInner({required Duration timeout}) async {
     final location = AMapFlutterLocation();
     final completer = Completer<GeoPoint?>();
     StreamSubscription<Map<String, Object>>? sub;
@@ -57,10 +130,16 @@ class AmapLocationService {
       });
 
       location.startLocation();
-      return await completer.future.timeout(timeout, onTimeout: () {
+      final point = await completer.future.timeout(timeout, onTimeout: () {
         debugPrint('[高德定位] 超时 ${timeout.inSeconds}s（检查 Key 是否勾选「Android定位SDK」）');
         return null;
       });
+      // 只有成功结果才进缓存 —— 失败/超时不该被后续调用复用
+      if (point != null) {
+        _cached = point;
+        _cachedAt = DateTime.now();
+      }
+      return point;
     } catch (_) {
       return null;
     } finally {

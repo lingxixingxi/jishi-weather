@@ -42,7 +42,9 @@ class _RouteScreenState extends State<RouteScreen> {
 
   Future<void> _warmUpLocation() async {
     try {
-      var p = await AmapLocationService.locate(timeout: const Duration(seconds: 5));
+      // timeout 给足 10s —— 与地点页预热一致：高德 SDK 首次调用要初始化，
+      // 多个页面共用同一次定位时，短 timeout 会把复用者一起拖失败。
+      var p = await AmapLocationService.locate(timeout: const Duration(seconds: 10));
       p ??= await _amap.ipLocation(); // 真实定位失败时用 IP 兜底
       if (!mounted || p == null) return;
       setState(() => _myLocation = p);

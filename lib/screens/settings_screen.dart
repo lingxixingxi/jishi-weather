@@ -133,13 +133,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// 用当前位置作为提醒地点
   ///
-  /// 设置页是从任意页面的顶栏进来的，拿不到别处的定位结果，
-  /// 所以这里**自己重新定位**（用户可能已经移动了）。
+  /// ⚠️ 这里**强制重新定位**（`forceRefresh`）：用户进设置页点这个按钮，
+  /// 语义就是「按我**现在**所在的位置设提醒」，不能吃 [AmapLocationService]
+  /// 那 3 分钟的共享缓存（其它页面的「预热定位」用缓存就够了）。
   Future<void> _useCurrentLocation() async {
     setState(() => _busy = true);
     try {
-      final GeoPoint? located =
-          await AmapLocationService.locate(timeout: const Duration(seconds: 8));
+      final GeoPoint? located = await AmapLocationService.locate(
+        timeout: const Duration(seconds: 8),
+        forceRefresh: true,
+      );
       final GeoPoint? p = located ?? await _amap.ipLocation(); // 真实定位失败时用 IP 兜底
       if (!mounted) return;
       if (p == null) {

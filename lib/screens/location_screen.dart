@@ -210,11 +210,16 @@ class _LocationScreenState extends State<LocationScreen> {
 
   /// 预热定位 —— 只为让 POI 联想候选**按距离排序**（用户附近的排前面）
   ///
-  /// 策略：真实定位（5s 超时）→ 失败则 IP 定位兜底（1~2 秒）。
+  /// 策略：真实定位（**10s 超时**）→ 失败则 IP 定位兜底（1~2 秒）。
   /// 完全失败也不影响使用，只是候选不限地域。
+  ///
+  /// ⚠️ timeout 不能给太小：高德 SDK **首次调用要初始化**，实测首帧可能 >5s。
+  /// 而四个页面（地点/路线/台风/摄影）启动时会同时预热，如今共用**同一次**
+  /// 定位请求 —— 5s 一超时，其余页面的复用者也一起失败，反而各自重试
+  /// （实测日志：1 次超时 + 3 次重试，等于没省）。
   Future<void> _warmUpLocation() async {
     try {
-      var p = await AmapLocationService.locate(timeout: const Duration(seconds: 5));
+      var p = await AmapLocationService.locate(timeout: const Duration(seconds: 10));
       p ??= await _amap.ipLocation();
       if (!mounted || p == null) return;
       setState(() => _myLocation = p);
@@ -349,8 +354,20 @@ class _LocationScreenState extends State<LocationScreen> {
   /// 而我们已经有 5 源（ECMWF/GFS/ICON/和风/中央气象台）的逐小时数据，
   /// 本地聚合即可得到**多源融合**的日最高/最低温、降水总量、降水概率，
   /// 并能用 `consensusWeatherText`（各源云量中位数）判定天气现象。
+  /// [_dailySummaries] 的缓存
+  ///
+  /// 它在 `build` 里被调用，而一次查询会触发多次 setState
+  /// （雷达定调完成、网格重载、切时刻…）—— 实测一次冷启动**重复计算 4 次**
+  /// （logcat 里 4 组 `[逐日聚合]`）。结果只依赖 `_hourlyForecast`，
+  /// 因此**引用没换就直接复用**。
+  List<_DailySummary>? _dailyCache;
+  List<MultiModelHourly>? _dailyCacheFor;
+
   List<_DailySummary> _dailySummaries() {
     if (_hourlyForecast.isEmpty) return const [];
+    if (_dailyCache != null && identical(_dailyCacheFor, _hourlyForecast)) {
+      return _dailyCache!;
+    }
 
     // 按「年-月-日」分组
     final byDay = <String, List<MultiModelHourly>>{};
@@ -414,6 +431,8 @@ class _LocationScreenState extends State<LocationScreen> {
           '降水 ${precipSum.toStringAsFixed(1)}mm '
           '温度 ${out.last.tempMin?.toStringAsFixed(0)}~${out.last.tempMax?.toStringAsFixed(0)}°');
     }
+    _dailyCacheFor = _hourlyForecast;
+    _dailyCache = out;
     return out;
   }
 
@@ -683,7 +702,11 @@ class _LocationScreenState extends State<LocationScreen> {
     });
     try {
       // 同时启动两条定位链路
-      final amapFuture = AmapLocationService.locate(timeout: const Duration(seconds: 6));
+      // 用户主动点「当前位置」→ **强制重新定位**（不吃 3 分钟缓存）
+      final amapFuture = AmapLocationService.locate(
+        timeout: const Duration(seconds: 6),
+        forceRefresh: true,
+      );
       final geoFuture = _locateBySystem(timeout: const Duration(seconds: 6));
 
       // 高德优先；未回来则用系统定位（已在并行跑）
