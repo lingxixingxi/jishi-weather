@@ -464,7 +464,14 @@ class _LocationScreenState extends State<LocationScreen> {
   HourlyWeather? _altAt(int index, DateTime t) {
     if (index < 0 || index >= _altHourly.length) return null;
     final m = _nearestMulti(_altHourly[index], t);
-    return m?.toHourlyWeather(source: '多源融合');
+    // 当前小时**实况优先**（与中心点同一口径：实况不与预报平均）；
+    // 未来时刻没有实况，照旧用多源融合值。
+    final now = DateTime.now();
+    final isNow = t.year == now.year &&
+        t.month == now.month &&
+        t.day == now.day &&
+        t.hour == now.hour;
+    return m?.toHourlyWeather(source: '多源融合', preferObservation: isNow);
   }
 
   /// 区域概览的「中心天气」块
@@ -889,13 +896,13 @@ class _LocationScreenState extends State<LocationScreen> {
     final temps = <double>[];
     int? maxPop;
 
-    // 中心点：用多源融合值
-    final centerW = centerMulti.isEmpty
-        ? _nearest(const [], now)
-        : _nearest(
-            centerMulti.map((m) => m.toHourlyWeather()).toList(),
-            now,
-          );
+    // 中心点当前值：**实况优先**（有央台实测就用它，不与预报做平均）
+    //
+    // ⚠️ 早先用融合均值：把实况（央台 20.7mm/h）与预报（ECMWF 2.0 / GFS 0.1）
+    // 平均成约 4.9mm/h（中雨）—— 既不是实况也不是预报；两三秒后雷达定调完成
+    // 又会换成最优源（央台→暴雨），界面上就表现为「刚显示中雨、突然跳成暴雨」。
+    final centerW =
+        _nearestMulti(centerMulti, now)?.toHourlyWeather(preferObservation: true);
     samples.add((label: '中心', point: center, weather: centerW));
     if (centerW?.temperature != null) temps.add(centerW!.temperature!);
     if (centerW?.precipitationProbability != null) {

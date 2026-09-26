@@ -176,4 +176,77 @@ void main() {
       expect(m.effectiveWeatherText(sourceText: null, sourcePrecipitation: 0), '阴');
     });
   });
+
+  group('当前时刻实况优先（preferObservation）', () {
+    /// 复现用户看到的「刚启动显示中雨，突然跳成暴雨」
+    MultiModelHourly withObs() => MultiModelHourly(
+          place: '南京市江宁区',
+          lat: 31.9585,
+          lon: 118.8318,
+          time: DateTime(2026, 9, 26, 15),
+          sources: [
+            const ModelForecast(
+              model: 'ecmwf_ifs025',
+              displayName: 'ECMWF',
+              precipitation: 2.0,
+              precipitationProbability: 95,
+              cloudCover: 100,
+            ),
+            const ModelForecast(
+              model: 'gfs_seamless',
+              displayName: 'GFS',
+              precipitation: 0.1,
+              precipitationProbability: 80,
+              cloudCover: 100,
+            ),
+            const ModelForecast(
+              model: 'nmc',
+              displayName: '中央气象台',
+              precipitation: 20.7, // 实测（passedchart rain1h）
+              precipitationProbability: 100,
+              cloudCover: 95,
+              isObservation: true,
+            ),
+          ],
+        );
+
+    test('回归：实况不与预报平均 —— 融合均值给出中雨，实况优先给出暴雨', () {
+      final m = withObs();
+      // 融合均值 = (2.0 + 0.1 + 20.7) / 3 = 7.6 mm/h → 「中雨」
+      expect(m.precipitation, closeTo(7.6, 0.01));
+      expect(m.toHourlyWeather().weatherText, '中雨');
+
+      // 实况优先 → 直接采用央台实测 20.7 → 「暴雨」
+      final obs = m.toHourlyWeather(preferObservation: true);
+      expect(obs.precipitation, 20.7);
+      expect(obs.weatherText, '暴雨');
+    });
+
+    test('无实况源时 preferObservation 不改变结果（海外/央台失败场景）', () {
+      final m = MultiModelHourly(
+        place: '纽北',
+        lat: 50.33,
+        lon: 6.94,
+        time: DateTime(2026, 9, 26, 15),
+        sources: const [
+          ModelForecast(
+            model: 'ecmwf_ifs025',
+            displayName: 'ECMWF',
+            precipitation: 2.0,
+            cloudCover: 100,
+          ),
+          ModelForecast(
+            model: 'gfs_seamless',
+            displayName: 'GFS',
+            precipitation: 0.1,
+            cloudCover: 100,
+          ),
+        ],
+      );
+      final fused = m.toHourlyWeather();
+      final pref = m.toHourlyWeather(preferObservation: true);
+      expect(pref.weatherText, fused.weatherText);
+      expect(pref.precipitation, fused.precipitation);
+    });
+  });
 }

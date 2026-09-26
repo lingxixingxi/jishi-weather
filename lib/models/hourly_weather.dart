@@ -405,12 +405,51 @@ class MultiModelHourly {
   /// 7 天聚合因此走**完全同一套判断**：有降水用该源原文（缺失则按降水强度分级），
   /// 无降水才用各源云量共识。
   ///
-  /// ⚠️ 旧实现是「有降水取 texts.first（**第一个源**的文字）」，与中心点取
-  /// 「雷达定调最优源原文」的口径并不一致；再加上四个方位点当初只拉单模型，
-  /// 实测出现「中心 大雨、四个方位全是毛毛雨」这种同页面两套判法的观感。
-  HourlyWeather toHourlyWeather({String source = 'multi-model'}) {
+  /// [preferObservation] 为 true 时（**当前时刻**）**优先采用实况源**
+  /// （`isObservation`，即央台 passedchart 实测）的数值，**不参与平均**：
+  ///
+  /// ⚠️ 实况不该与预报做平均。实测南京：央台实测 20.7 mm/h 与 ECMWF 2.0 /
+  /// GFS 0.1 / ICON 0.8 平均后只剩约 4.9 mm/h（中雨）—— 既不是实况也不是预报，
+  /// 没有物理意义。表现为「刚启动显示中雨，两三秒后雷达定调完成又跳成暴雨」，
+  /// 用户看到数值闪烁（实测反馈）。
+  HourlyWeather toHourlyWeather({
+    String source = 'multi-model',
+    bool preferObservation = false,
+  }) {
     final codes = sources.map((s) => s.weatherCode).whereType<int>().toList();
     final texts = sources.map((s) => s.weatherText).whereType<String>().toList();
+
+    // 当前时刻：有实况源就直接用它的数值与文字
+    if (preferObservation) {
+      ModelForecast? obs;
+      for (final s in sources) {
+        if (s.isObservation) {
+          obs = s;
+          break;
+        }
+      }
+      if (obs != null) {
+        return HourlyWeather(
+          place: place,
+          lat: lat,
+          lon: lon,
+          time: time,
+          source: '${obs.displayName}（实况）',
+          temperature: obs.temperature,
+          precipitationProbability: obs.precipitationProbability,
+          precipitation: obs.precipitation,
+          windSpeed: obs.windSpeed,
+          windGust: obs.windGust,
+          visibility: obs.visibility,
+          cloudCover: obs.cloudCover,
+          weatherCode: obs.weatherCode,
+          weatherText: effectiveWeatherText(
+            sourceText: obs.weatherText,
+            sourcePrecipitation: obs.precipitation,
+          ),
+        );
+      }
+    }
 
     // 与地点页「中心」行、区域概览**同一套**决策（含未来时刻）
     final effectiveText = effectiveWeatherText(
