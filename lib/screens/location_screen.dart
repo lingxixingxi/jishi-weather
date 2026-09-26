@@ -1378,6 +1378,17 @@ class _LocationScreenState extends State<LocationScreen> {
                   'Open-Meteo 模式预报（非实况）',
                   style: TextStyle(fontSize: 10, color: AppTheme.textFaint),
                 ),
+              // 雨量图再补一行**实况对照** —— 模式预报在对流性降水下常比实况弱
+              // 5~10 倍（实测 1.2 vs 雷达 5.6 vs 央台 13.5 mm/h），
+              // 不把实况数字摆出来，用户会以为雨量图算错了。
+              if (_rainRealityCompareText() != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 3),
+                  child: Text(
+                    _rainRealityCompareText()!,
+                    style: const TextStyle(fontSize: 10, color: AppTheme.textDim),
+                  ),
+                ),
               if (_layerMode == _LayerMode.cloud ||
                   _layerMode == _LayerMode.rain)
                 const SizedBox(height: 3),
@@ -2484,6 +2495,48 @@ class _LocationScreenState extends State<LocationScreen> {
         ],
       ),
     );
+  }
+
+  /// 雨量图的「实况对照」文字
+  ///
+  /// 雨量图画的是 **Open-Meteo 模式预报**，而**对流性降水下模式常比实况弱
+  /// 5~10 倍**。实测（南京 2026-09-26 14:00）：
+  /// 模式 1.2 mm/h、雷达实况 5.6、央台实测 13.5 —— 图上自然几乎看不到颜色。
+  ///
+  /// 不把实况摆在一起，用户会以为「雨量图算错了」。
+  /// 这里并排给出三个口径，让差异一眼可见（**不改数据、不缩放假象**）。
+  String? _rainRealityCompareText() {
+    if (_layerMode != _LayerMode.rain || _grid.isEmpty || _timeCount <= 0) {
+      return null;
+    }
+    final t = _timeIndex.clamp(0, math.max(0, _timeCount - 1)).toInt();
+    final parts = <String>[];
+
+    // ① 模式预报：取网格**中心点**在该时刻的值（与图上中心位置一致）
+    final n = _gridN;
+    final centerIdx = ((n - 1) ~/ 2) * n + ((n - 1) ~/ 2);
+    if (centerIdx < _grid.length) {
+      final v = _grid[centerIdx].rainAt(t);
+      if (v != null) parts.add('模式 ${v.toStringAsFixed(1)}');
+    }
+
+    // ② 雷达实况：中心点像素反演（与「雷达实测」卡片同一个数）
+    final dbz = _stationRadar?.dbz;
+    if (dbz != null) {
+      final r = RadarCrossCheck.rainFromDbz(dbz);
+      if (r != null) parts.add('雷达 ${r.toStringAsFixed(1)}');
+    }
+
+    // ③ 央台实测：取最近一次逐小时雨量（passedchart 的 rain1h）
+    final nmc = _multi.lastNmcWeather;
+    if (nmc != null) {
+      final v = nmc.historyAt(DateTime.now())?.rain1h ?? nmc.rain;
+      if (v != null) parts.add('央台 ${v.toStringAsFixed(1)}');
+    }
+
+    // 少于两项就没有「对照」的意义
+    if (parts.length < 2) return null;
+    return '实况对照 mm/h：${parts.join(' / ')}';
   }
 
   /// 生成天气叠加位图（PNG 字节）
