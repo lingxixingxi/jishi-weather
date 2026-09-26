@@ -481,10 +481,12 @@ class _LocationScreenState extends State<LocationScreen> {
       cw = r.effectiveCenter;
       sourceNote = r.adoptedSource == null
           ? '多源融合'
-          // ⚠️ 文案要与实际取值口径一致（2026-09-26 改）：
-          // 天气现象**不再**一律用云量共识 —— 有降水时用该源原文，
-          // 原文缺失按降水强度分级，只有无降水才用云量共识。
-          : '数值取自${r.adoptedSource}（雷达定调最优源）；天气现象优先用该源实况原文';
+          // ⚠️ 文案必须与实际口径一致（2026-09-26 二次修正）：
+          // 现在是**有降水一律按降水强度分级**（小雨/中雨/大雨/暴雨），
+          // 无降水才用云量共识 —— 与「未来时刻」「四个方位点」「逐日聚合」同一套。
+          // 早先写「优先用该源实况原文」，会让当前时刻显示源的定性词
+          // （如某个数值模型的「毛毛雨」），与未来时刻的分级词打架。
+          : '数值取自${r.adoptedSource}（雷达定调最优源）；天气现象按降水强度分级';
     } else {
       cw = mm?.toHourlyWeather(source: '5 源融合');
       sourceNote = '未来 ${sel.hour.toString().padLeft(2, '0')}:00 · '
@@ -2198,7 +2200,13 @@ class _LocationScreenState extends State<LocationScreen> {
 
             return GestureDetector(
               onTap: () {
-                final next = selected ? null : h.time;
+                // ⚠️ 点「当前小时」这一格 = **回到当前时刻**（置 null），
+                // 而不是「选中它」。否则同一个时刻会有两组数：
+                // 未选中走「雷达定调最优源」、选中走「5 源融合均值」——
+                // 用户实测：现在就是 15 点，「当前」显示 ECMWF 的 2.0mm/h，
+                // 点「15 时」却显示融合值 0.67mm/h，同一时刻两个数。
+                // 点「已选中的格子」仍是取消，语义不变。
+                final next = (selected || isNow) ? null : h.time;
                 setState(() => _selectedTime = next);
                 _syncRadarToSelected(next);
               },

@@ -369,22 +369,23 @@ class MultiModelHourly {
   /// [sourceText] 是「最优源」自带的天气现象原文，[sourcePrecipitation] 是该源
   /// 同时刻的降水量（mm/h）。
   ///
-  /// ⚠️ 规则（2026-09-26 修正，实测 bug）：
-  /// · **有降水** → 用该源原文；原文缺失时**按降水强度分级**
-  ///   （如 13.5 mm/h → 大雨），**绝不**回落到云量共识 ——
-  ///   共识只输出 晴/少云/多云/阴，**没有降水档**，而大雨天云量必然 ≥85%，
-  ///   回落过去就得到「阴」。实测正是把「央台实测大雨」显示成了「阴」。
-  /// · **无降水** → 才用云量共识（此时「阴/多云/少云/晴」才是要回答的问题）。
+  /// ⚠️ 规则（2026-09-26 二次修正）：
+  /// · **有降水 → 一律按降水强度分级**（小雨/中雨/大雨/暴雨）
+  /// · **无降水 → 云量共识**（共识拿不到时才退回该源原文）
+  ///
+  /// 为什么有降水时**不采用**该源的定性词：那会让「当前时刻」（走雷达定调的
+  /// 最优源）显示源的定性词，而「未来时刻」（走融合值）显示强度分级 ——
+  /// 同一位置相邻两小时自相矛盾。用户实测反馈：区域概览显示「毛毛雨」，
+  /// 点一下 15 时变成「中雨」，无从判断哪个对。
+  ///
+  /// 按**小时雨量国标**分级是客观且各处一致的；实测央台 `info="暴雨"`
+  /// 与 `rain1h=20.7mm/h` 的分级本就吻合，采用分级不会损失它的专业判断。
   String? effectiveWeatherText({
     required String? sourceText,
     required double? sourcePrecipitation,
   }) {
     final hasPrecip = (sourcePrecipitation ?? 0) >= 0.1;
-    if (hasPrecip) {
-      return (sourceText != null && sourceText.isNotEmpty)
-          ? sourceText
-          : HourlyWeather.levelOf(sourcePrecipitation);
-    }
+    if (hasPrecip) return HourlyWeather.levelOf(sourcePrecipitation);
     return consensusWeatherText ?? sourceText;
   }
 
@@ -411,18 +412,11 @@ class MultiModelHourly {
     final codes = sources.map((s) => s.weatherCode).whereType<int>().toList();
     final texts = sources.map((s) => s.weatherText).whereType<String>().toList();
 
-    final hasPrecip = (precipitation ?? 0) >= 0.1;
-    final String? effectiveText = hasPrecip
-        // 有降水：用**融合降水强度的分级**（小雨/中雨/大雨/暴雨）。
-        //
-        // ⚠️ 不能取某一个源的定性词：同一时刻各源差异极大（实测 ECMWF 报
-        // 「毛毛雨」而 GFS 报「中雨」），取 texts.first 会出现
-        // 「毛毛雨 + 91% 降水概率」这种与**自身显示的数值**不自洽的结果，
-        // 而且中心点用「实况源原文」、方位点用「第一个源原文」又是两套口径。
-        // 用降水强度分级则与数值同源，各方位点之间也可比。
-        ? HourlyWeather.levelOf(precipitation)
-        // 无降水：各源云量共识（拿不到共识时兜底用第一个源的文字）
-        : (consensusWeatherText ?? (texts.isEmpty ? null : texts.first));
+    // 与地点页「中心」行、区域概览**同一套**决策（含未来时刻）
+    final effectiveText = effectiveWeatherText(
+      sourceText: texts.isEmpty ? null : texts.first,
+      sourcePrecipitation: precipitation,
+    );
 
     return HourlyWeather(
       place: place,

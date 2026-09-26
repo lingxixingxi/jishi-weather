@@ -148,9 +148,26 @@ void main() {
       expect(m.effectiveWeatherText(sourceText: null, sourcePrecipitation: 13.5), '大雨');
     });
 
-    test('有降水 + 有原文 → 用原文', () {
-      final m = build(nmcText: '大雨', nmcRain: 13.5);
-      expect(m.effectiveWeatherText(sourceText: '大雨', sourcePrecipitation: 13.5), '大雨');
+    test('有降水 + 原文与数值一致 → 结果相同（央台 info=暴雨、rain1h=20.7）', () {
+      final m = build(nmcText: '暴雨', nmcRain: 20.7);
+      expect(m.effectiveWeatherText(sourceText: '暴雨', sourcePrecipitation: 20.7), '暴雨');
+    });
+
+    test('回归：有降水时以**数值分级**为准，不采用与数值不符的定性词', () {
+      final m = build(nmcText: '毛毛雨', nmcRain: 3.0);
+      // 「毛毛雨」配 3.0 mm/h 是自相矛盾的（国标 2.5~8 为「中雨」）
+      expect(m.effectiveWeatherText(sourceText: '毛毛雨', sourcePrecipitation: 3.0), '中雨');
+    });
+
+    test('回归：同一位置「当前」与「15 时」不再一个毛毛雨一个中雨', () {
+      // 修前：当前时刻用最优源的**定性词**、未来时刻用**融合分级** ——
+      // 用户实测「区域概览显示毛毛雨，点一下 15 时就变中雨」，无从判断哪个对。
+      // 修后两者都由降水**数值**决定：数值相同 → 文字必然相同。
+      final m = build();
+      final now = m.effectiveWeatherText(sourceText: '毛毛雨', sourcePrecipitation: 3.0);
+      final later = m.effectiveWeatherText(sourceText: '中雨', sourcePrecipitation: 3.0);
+      expect(now, later);
+      expect(now, '中雨');
     });
 
     test('无降水 → 才用云量共识（各源云量 95~100% → 阴）', () {
