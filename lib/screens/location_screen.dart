@@ -451,7 +451,10 @@ class _LocationScreenState extends State<LocationScreen> {
       cw = r.effectiveCenter;
       sourceNote = r.adoptedSource == null
           ? '多源融合'
-          : '数值取自${r.adoptedSource}（雷达定调最优源）；天气现象由各源云量共识判定';
+          // ⚠️ 文案要与实际取值口径一致（2026-09-26 改）：
+          // 天气现象**不再**一律用云量共识 —— 有降水时用该源原文，
+          // 原文缺失按降水强度分级，只有无降水才用云量共识。
+          : '数值取自${r.adoptedSource}（雷达定调最优源）；天气现象优先用该源实况原文';
     } else {
       cw = mm?.toHourlyWeather(source: '5 源融合');
       sourceNote = '未来 ${sel.hour.toString().padLeft(2, '0')}:00 · '
