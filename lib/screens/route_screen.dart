@@ -197,9 +197,13 @@ class _RouteScreenState extends State<RouteScreen> {
   /// 雷达定调结果（用真实雷达回波裁决模型分歧）
   RadarVerdict? _verdict;
 
-  /// 出发时刻距今的分钟数（负数=已过去）
+  /// 雷达校验点（**路线中点**）到达时刻距今的分钟数（负数 = 已过去）
   ///
   /// 用来区分雷达该怎么用：≤2h 走外推，>2h 以多源融合为准。
+  ///
+  /// ⚠️ 基准是「中点到达时刻」，**不是「出发时刻」** —— 必须与传给
+  /// `RadarVerdictEngine.judge` 的 `models` 对齐（那同样是中点到达时刻的
+  /// 数据），否则提前量会少算半个行程（2026-09-27 修正）。
   int? _verdictLeadMinutes;
   bool _verdictLoading = false;
 
@@ -527,11 +531,22 @@ class _RouteScreenState extends State<RouteScreen> {
       });
 
       // ===== 雷达定调（异步，不阻塞主流程）=====
+      //
+      // 雷达校验点取路线中点，时间基准必须是**中点到达时刻** ——
+      // `multiAtArrival[mid]` 正是按这个时刻挑出来的数据，两者必须对齐。
+      // （早先这里用的是出发时刻，差半个行程；详见 _runRadarVerdict 的说明。）
+      final midIdx = samples.length ~/ 2;
+      final midFrac = opt.distanceKm <= 0
+          ? 0.0
+          : (samples[midIdx].kmFromStart / opt.distanceKm).clamp(0.0, 1.0);
+      final midArriveAt = _departAt
+          .add(Duration(minutes: (opt.durationMinutes * midFrac).round()));
+
       _lastSamples = samples;
       _lastMulti = multiAtArrival;
       _lastWeathers = weathers;
       _lastOpt = opt;
-      _runRadarVerdict(samples, multiAtArrival);
+      _runRadarVerdict(samples, multiAtArrival, midArriveAt);
 
       // ===== 台风 × 路线重叠（异步，不阻塞主流程）=====
       unawaited(_runTyphoonRoute(_analysis));
@@ -545,16 +560,21 @@ class _RouteScreenState extends State<RouteScreen> {
 
   /// 异步跑雷达定调：用真实雷达回波裁决各模型分歧
   ///
-  /// 取路线中点做代表点（雷达图覆盖范围内最可能被关注的区域）。
+  /// **只在路线中点取一个代表点分析一次**（雷达图覆盖范围内最可能被关注的
+  /// 区域）。判出的「最吻合源」会被 [\_rebuildWithSource] 用作 `preferredModel`
+  /// 应用到**全线每个分段** —— 注意各分段取的仍是**各自采样点**的数据，
+  /// 只有「用哪个源」这个决定是全线共用的（单点定源覆盖全线，长途路线
+  /// 上这是个已知的粗粒度，见待办清单）。
   ///
-  /// **出发时刻决定雷达怎么用**（与地点查询页点选未来时刻是同一套逻辑）：
-  /// - 距现在 ≤ [RadarService.forecastMaxMinutes]（2h）：把外推提前量设为
+  /// **中点到达时刻决定雷达怎么用**（与地点查询页点选未来时刻是同一套逻辑）：
+  /// - 距今 ≤ [RadarService.forecastMaxMinutes]（2h）：把外推提前量设为
   ///   「距现在多少分钟」，给出**那一刻**的回波预测；
   /// - > 2h：雷达外推误差已经很大、不该再外推，此时仍做一次定调用以裁决
   ///   「哪个源此刻最可信」，但 UI 上会明确标注以多源融合为准。
   Future<void> _runRadarVerdict(
     List<({GeoPoint point, double kmFromStart})> samples,
     List<MultiModelHourly?> multiAtArrival,
+    DateTime midArriveAt,
   ) async {
     // ⚠️ 这两处早先是**静默 return** —— 一旦命中，雷达卡片连「正在分析」
     // 都不显示，用户完全看不到雷达，也查不到原因。实测反馈正是
@@ -594,14 +614,21 @@ class _RouteScreenState extends State<RouteScreen> {
       return;
     }
 
-    // 出发时刻距今多少分钟
+    // 雷达校验点（路线中点）**到达时刻**距现在多少分钟
     //
-    // ⚠️ **必须传真实分钟数**（哪怕几万分钟），由 `RadarVerdictEngine` 自己判断
-    // 是否超出外推可信范围并降级。早先这里在 > 2h 时传 `null`，而 `null` 在
-    // judge 里的含义是「**当前时刻**」—— 于是几天后的行程被当成此刻照常打分、
-    // 照常返回 `bestModelKey`，路线页再按「雷达判出的最优源」重建分段，
+    // ⚠️ 基准必须与传进 judge 的 `models` 对齐 —— `models` 是
+    // `multiAtArrival[mid]`，即**中点到达时刻**的预报。早先这里算的是
+    // **出发时刻**距今，于是提前量少算了半个行程：1 小时行程错 30 分钟，
+    // 5 小时行程错 2.5 小时，雷达外推值跟拿它去比的模型预报根本不在同一
+    // 时刻上。`RadarVerdictEngine` 的契约是「horizonOverride = models 对应
+    // 时刻距今的分钟数」，2026-09-27 修正为传入 [midArriveAt]。
+    //
+    // ⚠️ 另外**必须传真实分钟数**（哪怕几万分钟），由 `RadarVerdictEngine` 自己
+    // 判断是否超出外推可信范围并降级。早先这里在 > 2h 时传 `null`，而 `null`
+    // 在 judge 里的含义是「**当前时刻**」—— 于是几天后的行程被当成此刻照常
+    // 打分、照常返回 `bestModelKey`，路线页再按「雷达判出的最优源」重建分段，
     // 表现就是**「选了很远的时间，雷达定调却没有降级」**（实测 bug）。
-    final leadMin = _departAt.difference(DateTime.now()).inMinutes;
+    final leadMin = midArriveAt.difference(DateTime.now()).inMinutes;
     final withinNowcast =
         leadMin > 0 && leadMin <= RadarService.forecastMaxMinutes;
 
@@ -626,11 +653,11 @@ class _RouteScreenState extends State<RouteScreen> {
       // 点「现在出发」后立刻研判时 leadMin == 0，早先会被打成
       // "超出外推范围(>120min)"，排查时极易被带偏（本次真机实测踩到）。
       final radarBasis = leadMin <= 0
-          ? '出发时刻已到，按当前回波定调'
+          ? '中点到达时刻已到，按当前回波定调'
           : (withinNowcast
               ? '雷达外推 $leadMin 分钟'
               : '超出外推范围(>${RadarService.forecastMaxMinutes}min)，以多源融合为准');
-      debugPrint('[雷达定调] 出发距今 ${leadMin}min → $radarBasis');
+      debugPrint('[雷达定调] 中点到达距今 ${leadMin}min → $radarBasis');
 
       // 雷达定调判出了最吻合的源 → 用它重建分段详情
       // （各要素取自该源；「多源验证」信息依然保留）
@@ -1305,16 +1332,17 @@ class _RouteScreenState extends State<RouteScreen> {
                   '向${r.motionDirection} ${r.motionSpeedKmh!.toStringAsFixed(0)} km/h（${r.framesUsed} 帧追踪）'),
 
             // 出发时刻决定雷达的使用方式（与地点页点选未来时刻同一套逻辑）
+            // 雷达校验点是路线中点，时距按**中点到达时刻**算（不是出发时刻）
             if (withinNowcast)
-              _kv('外推时距', '出发距今 $lead 分钟，回波按此时距外推')
+              _kv('外推时距', '中点到达距今 $lead 分钟，回波按此时距外推')
             else if (lead > nowcastWindow)
               _kv(
                 '时距提示',
-                '出发距今 ${(lead / 60).toStringAsFixed(1)} 小时，已超出雷达外推'
+                '中点到达距今 ${(lead / 60).toStringAsFixed(1)} 小时，已超出雷达外推'
                 '有效范围（${nowcastWindow ~/ 60}h）→ 以多源融合为准',
               )
             else if (lead <= 0)
-              _kv('时距提示', '出发时刻已过，按当前实况研判'),
+              _kv('时距提示', '中点到达时刻已过，按当前实况研判'),
 
             if (r.expectedRainAhead && withinNowcast)
               _kv('外推预警', '未来 $lead 分钟该区域可能受影响'),
