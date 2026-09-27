@@ -622,8 +622,15 @@ class _RouteScreenState extends State<RouteScreen> {
         _verdict = v;
         _verdictLoading = false;
       });
-      debugPrint('[雷达定调] 出发距今 ${leadMin}min → '
-          '${withinNowcast ? "雷达外推 $leadMin 分钟" : "超出外推范围(>${RadarService.forecastMaxMinutes}min)，以多源融合为准"}');
+      // 三态，别把「此刻出发」误报成「超出外推范围」——
+      // 点「现在出发」后立刻研判时 leadMin == 0，早先会被打成
+      // "超出外推范围(>120min)"，排查时极易被带偏（本次真机实测踩到）。
+      final radarBasis = leadMin <= 0
+          ? '出发时刻已到，按当前回波定调'
+          : (withinNowcast
+              ? '雷达外推 $leadMin 分钟'
+              : '超出外推范围(>${RadarService.forecastMaxMinutes}min)，以多源融合为准');
+      debugPrint('[雷达定调] 出发距今 ${leadMin}min → $radarBasis');
 
       // 雷达定调判出了最吻合的源 → 用它重建分段详情
       // （各要素取自该源；「多源验证」信息依然保留）
