@@ -183,11 +183,16 @@ class RouteAnalyzer {
     /// **多源交叉验证数据**（与 samples 一一对应，元素可为 null）
     List<MultiModelHourly?> multiModels = const [],
 
-    /// **优先采用的数据源标识**（如 `ecmwf_ifs025`）
+    /// **每个采样点的优先源标识**（与 samples 一一对应，元素可为 null）
     ///
-    /// 雷达定调判出最吻合源后，用它重建分段 —— 各要素取自该源，
-    /// 而不是多源平均值。传 null 表示用融合值。
-    String? preferredModel,
+    /// 雷达定调沿途取若干校验点，逐点判出「该点最吻合的源」。这里按采样点
+    /// 逐个给出 —— 每个分段取**它起点采样点**对应的那个源，各要素取自该源
+    /// 而非多源平均值。元素为 null 表示该点用融合值。
+    ///
+    /// ⚠️ 由「全线共用一个源」改为「逐点给源」的原因：雷达校验点原本只有
+    /// 一个（路线中点），却拿它的结论管全线 —— 长途路线上起点与终点可能
+    /// 根本不是同一个天气型，中点准不代表全线准（2026-09-27 改）。
+    List<String?> preferredModels = const [],
   }) {
     if (samples.isEmpty) return const [];
 
@@ -263,7 +268,9 @@ class RouteAnalyzer {
         w: w,
         points: _sliceByKm(fullPolyline, startKm, endKm),
         mm: startIdx < multiModels.length ? multiModels[startIdx] : null,
-        preferredModel: preferredModel,
+        preferredModel: startIdx < preferredModels.length
+            ? preferredModels[startIdx]
+            : null,
         splitReason: reason,
       ));
     }

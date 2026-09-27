@@ -32,6 +32,35 @@ class RouteScreen extends StatefulWidget {
   State<RouteScreen> createState() => _RouteScreenState();
 }
 
+/// 一个雷达校验点的定调结论
+///
+/// 雷达定调沿途取若干校验点（最多 3 个，且只在**外推可信窗内**选），
+/// 每个点各判一次「该点最吻合哪个源」。本类把「哪个采样点 / 什么时刻 /
+/// 结论是什么」绑在一起，供分段**就近取源**。
+///
+/// 老实现只用路线中点一个点，却拿它的结论管全线；长途路线上起点与终点
+/// 可能根本不是同一个天气型，中点准不代表全线准（2026-09-27 改）。
+class RadarCheckpoint {
+  /// 对应的采样点序号（同时是 arriveTimes / multiAtArrival 的下标）
+  final int sampleIndex;
+
+  /// 该点里程（km，展示用）
+  final double km;
+
+  /// 该点到达时刻
+  final DateTime arriveAt;
+
+  /// 该点的定调结论
+  final RadarVerdict verdict;
+
+  const RadarCheckpoint({
+    required this.sampleIndex,
+    required this.km,
+    required this.arriveAt,
+    required this.verdict,
+  });
+}
+
 class _RouteScreenState extends State<RouteScreen> {
   @override
   void initState() {
@@ -182,6 +211,23 @@ class _RouteScreenState extends State<RouteScreen> {
   /// 40 个点已足够刻画沿途天气变化（间距约 12~15km）。
   static const int _maxRouteSamples = 40;
 
+  /// 雷达校验点数量上限
+  ///
+  /// 沿途每个校验点都要「选源 → 取图 → 逐帧分析」，是整条研判链里最重的一步。
+  /// 3 个点已能刻画「起点 / 中段 / 外推极限」的源可信度变化；
+  /// 再多就主要是等待时间在涨。
+  static const int _maxRadarCheckpoints = 3;
+
+  /// 多点雷达定调的**总时间预算**
+  ///
+  /// `RadarVerdictEngine.judge` 单次 timeout 默认 40 秒，三个点串行最坏
+  /// 120 秒 —— 用户等不起。这里给整批封顶，**先近后远**跑，
+  /// 超预算就用已回来的结果，剩下的如实标注跳过。
+  static const Duration _radarTotalBudget = Duration(seconds: 14);
+
+  /// 单个校验点的超时上限（还要受剩余预算约束）
+  static const Duration _radarPerPointCap = Duration(seconds: 10);
+
   GeoPoint? _from;
   GeoPoint? _to;
   List<RouteOption> _options = const [];
@@ -197,14 +243,19 @@ class _RouteScreenState extends State<RouteScreen> {
   /// 雷达定调结果（用真实雷达回波裁决模型分歧）
   RadarVerdict? _verdict;
 
-  /// 雷达校验点（**路线中点**）到达时刻距今的分钟数（负数 = 已过去）
+  /// **最近那个校验点**的到达时刻距今分钟数（负数 = 已到达 / 已过去）
   ///
   /// 用来区分雷达该怎么用：≤2h 走外推，>2h 以多源融合为准。
   ///
-  /// ⚠️ 基准是「中点到达时刻」，**不是「出发时刻」** —— 必须与传给
-  /// `RadarVerdictEngine.judge` 的 `models` 对齐（那同样是中点到达时刻的
-  /// 数据），否则提前量会少算半个行程（2026-09-27 修正）。
+  /// ⚠️ 基准是该校验点自己的**到达时刻**，不是出发时刻 —— 必须与传给
+  /// `RadarVerdictEngine.judge` 的 `models` 对齐（那同样是该点到达时刻的
+  /// 数据），否则提前量会少算（2026-09-27 修正）。
   int? _verdictLeadMinutes;
+
+  /// 本次研判的全部雷达校验点（按里程升序）
+  ///
+  /// 第一个（最近的）作为 [_verdict] 展开详情，其余列进「沿程校验点」。
+  List<RadarCheckpoint> _checkpoints = const [];
   bool _verdictLoading = false;
 
   /// 保存最近一次研判的原始数据，用于雷达定调后按最优源重建分段
@@ -532,21 +583,25 @@ class _RouteScreenState extends State<RouteScreen> {
 
       // ===== 雷达定调（异步，不阻塞主流程）=====
       //
-      // 雷达校验点取路线中点，时间基准必须是**中点到达时刻** ——
-      // `multiAtArrival[mid]` 正是按这个时刻挑出来的数据，两者必须对齐。
-      // （早先这里用的是出发时刻，差半个行程；详见 _runRadarVerdict 的说明。）
-      final midIdx = samples.length ~/ 2;
-      final midFrac = opt.distanceKm <= 0
-          ? 0.0
-          : (samples[midIdx].kmFromStart / opt.distanceKm).clamp(0.0, 1.0);
-      final midArriveAt = _departAt
-          .add(Duration(minutes: (opt.durationMinutes * midFrac).round()));
+      // 每个采样点的**到达时刻**都要算出来 —— 雷达校验点按「到达时刻是否
+      // 落在外推可信窗内」筛选（见 _runRadarVerdict）。时间基准必须与
+      // `multiAtArrival[i]` 对齐：后者正是按这个时刻挑出来的数据。
+      final arriveTimes = <DateTime>[
+        for (final s in samples)
+          _departAt.add(Duration(
+            minutes: (opt.durationMinutes *
+                    (opt.distanceKm <= 0
+                        ? 0.0
+                        : (s.kmFromStart / opt.distanceKm).clamp(0.0, 1.0)))
+                .round(),
+          )),
+      ];
 
       _lastSamples = samples;
       _lastMulti = multiAtArrival;
       _lastWeathers = weathers;
       _lastOpt = opt;
-      _runRadarVerdict(samples, multiAtArrival, midArriveAt);
+      _runRadarVerdict(samples, multiAtArrival, arriveTimes);
 
       // ===== 台风 × 路线重叠（异步，不阻塞主流程）=====
       unawaited(_runTyphoonRoute(_analysis));
@@ -558,23 +613,36 @@ class _RouteScreenState extends State<RouteScreen> {
     }
   }
 
-  /// 异步跑雷达定调：用真实雷达回波裁决各模型分歧
+  /// 沿途多点雷达定调：逐点判出「该点最吻合哪个源」
   ///
-  /// **只在路线中点取一个代表点分析一次**（雷达图覆盖范围内最可能被关注的
-  /// 区域）。判出的「最吻合源」会被 [\_rebuildWithSource] 用作 `preferredModel`
-  /// 应用到**全线每个分段** —— 注意各分段取的仍是**各自采样点**的数据，
-  /// 只有「用哪个源」这个决定是全线共用的（单点定源覆盖全线，长途路线
-  /// 上这是个已知的粗粒度，见待办清单）。
+  /// ## 为什么是「多点」而不是「一个中点」（2026-09-27 改）
   ///
-  /// **中点到达时刻决定雷达怎么用**（与地点查询页点选未来时刻是同一套逻辑）：
-  /// - 距今 ≤ [RadarService.forecastMaxMinutes]（2h）：把外推提前量设为
-  ///   「距现在多少分钟」，给出**那一刻**的回波预测；
-  /// - > 2h：雷达外推误差已经很大、不该再外推，此时仍做一次定调用以裁决
-  ///   「哪个源此刻最可信」，但 UI 上会明确标注以多源融合为准。
+  /// 老实现只在路线中点做一次定调，却拿它的结论管**全线**。上海→苏州这种
+  /// 短途无所谓，长途路线上起点与终点可能压根不是同一个天气型 ——
+  /// 中点准不代表全线准。现在沿途取最多 [_maxRadarCheckpoints] 个校验点，
+  /// 每个采样点用**离它最近**那个校验点的结论。
+  ///
+  /// ## 三条约束，全部来自「雷达外推只有 2 小时可信」这条硬边界
+  ///
+  /// 1. **只在可信窗内选点**：到达时刻距今 ≤ [RadarService.forecastMaxMinutes]
+  ///    的采样点才有资格当校验点，且按里程均匀撒开（别全挤在起点）。
+  ///    窗外的段**不参与定调** —— 20 小时行程里只有前 2 小时对雷达有意义，
+  ///    把代表点均匀铺在 2000km 上纯属浪费，本来也定不出东西。
+  /// 2. **总时限兜底**：`judge` 单次 timeout 就有 40 秒，多点串行会让用户
+  ///    干等。这里给整批一个总预算 [_radarTotalBudget]，**先近后远**跑
+  ///    （近端才是雷达真正有价值的地方，先出结果），超预算就用已回来的
+  ///    结果，剩下的如实标注跳过。
+  /// 3. **窗外一律用融合值**：校验点只做它附近那一小段的主意。哪怕离最近
+  ///    校验点很近，只要该采样点自己的到达时刻在窗外，就不采用雷达结论。
+  ///
+  /// ## 与「超长途雷达外推超时」的关系
+  ///
+  /// 超长途**不需要额外处理** —— 超窗的段本来就不该用雷达。真正要设计的
+  /// 只是上面 1、2 两条：窗内怎么选点、总耗时怎么兜底。
   Future<void> _runRadarVerdict(
     List<({GeoPoint point, double kmFromStart})> samples,
     List<MultiModelHourly?> multiAtArrival,
-    DateTime midArriveAt,
+    List<DateTime> arriveTimes,
   ) async {
     // ⚠️ 这两处早先是**静默 return** —— 一旦命中，雷达卡片连「正在分析」
     // 都不显示，用户完全看不到雷达，也查不到原因。实测反馈正是
@@ -600,81 +668,150 @@ class _RouteScreenState extends State<RouteScreen> {
       return;
     }
 
-    final mid = samples.length ~/ 2;
-    final models = mid < multiAtArrival.length ? multiAtArrival[mid] : null;
-    if (models == null) {
+    final now = DateTime.now();
+    final windowMin = RadarService.forecastMaxMinutes;
+
+    // ---- 1) 选校验点：只挑到达时刻落在可信窗内的采样点 ----
+    final inWindow = <int>[];
+    for (var i = 0; i < samples.length; i++) {
+      if (arriveTimes[i].difference(now).inMinutes <= windowMin) {
+        inWindow.add(i);
+      }
+    }
+
+    if (inWindow.isEmpty) {
+      // 全部落在窗外（例：「3 小时后出发 + 长途」）—— 此刻的雷达回波跟任何
+      // 一个采样点的到达时刻都对不上，硬做定调等于伪造依据，不如不做。
+      final firstLead =
+          arriveTimes.isEmpty ? 0 : arriveTimes.first.difference(now).inMinutes;
       if (!mounted) return;
       setState(() {
         _verdict = RadarVerdict(
-          summary: '路线中点没有多源天气数据（天气请求未成功），'
-              '雷达没有可比对的对象，本次未做雷达定调。',
+          summary: '全部采样点的到达时刻都超出雷达外推可信范围'
+              '（最近的一点距今 ${(firstLead / 60).toStringAsFixed(1)} 小时，'
+              '上限 ${windowMin ~/ 60} 小时），本次未做雷达定调，以多源融合为准。',
         );
+        _checkpoints = const [];
+        _verdictLoading = false;
+      });
+      debugPrint('[雷达定调] 全部点超窗（最近 ${firstLead}min > ${windowMin}min）'
+          ' → 未做定调');
+      return;
+    }
+
+    // 窗内点按里程均匀取最多 N 个（首尾都保），再按「先近后远」排执行顺序
+    final picks = _spreadPick(inWindow, _maxRadarCheckpoints)
+      ..sort((a, b) => arriveTimes[a].compareTo(arriveTimes[b]));
+
+    setState(() {
+      _verdictLoading = true;
+      _verdictLeadMinutes = arriveTimes[picks.first].difference(now).inMinutes;
+    });
+    debugPrint('[雷达定调] 窗内 ${inWindow.length} 点 → 取 ${picks.length} 个校验点'
+        '（${picks.map((i) => samples[i].kmFromStart.round()).join("/")} km）');
+
+    // ---- 2) 逐个定调，带总时限 ----
+    final done = <RadarCheckpoint>[];
+    final sw = Stopwatch()..start();
+    for (final idx in picks) {
+      final remain = _radarTotalBudget - sw.elapsed;
+      if (remain < const Duration(seconds: 4)) {
+        debugPrint('[雷达定调] 总预算 ${_radarTotalBudget.inSeconds}s 用尽，'
+            '跳过剩余 ${picks.length - done.length} 个校验点');
+        break;
+      }
+      final models = idx < multiAtArrival.length ? multiAtArrival[idx] : null;
+      if (models == null) continue;
+
+      final lead = arriveTimes[idx].difference(now).inMinutes;
+      try {
+        final v = await RadarVerdictEngine.judge(
+          lat: samples[idx].point.lat,
+          lon: samples[idx].point.lon,
+          models: [models],
+          radarPath: path,
+          // 单点超时不超过剩余预算，避免第一个点就吃光整批
+          timeout: remain < _radarPerPointCap ? remain : _radarPerPointCap,
+          horizonOverride: lead > 0 ? lead : null,
+        );
+        done.add(RadarCheckpoint(
+          sampleIndex: idx,
+          km: samples[idx].kmFromStart,
+          arriveAt: arriveTimes[idx],
+          verdict: v,
+        ));
+        final basis = lead <= 0 ? '按当前回波' : '外推 $lead 分钟';
+        debugPrint('[雷达定调] ${samples[idx].kmFromStart.round()}km 处'
+            '（到达距今 $lead min，$basis）→ ${v.bestModelKey ?? "未定源"}');
+      } catch (e) {
+        debugPrint('[雷达定调] ${samples[idx].kmFromStart.round()}km 处失败: $e');
+      }
+    }
+
+    if (done.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _verdict = RadarVerdict(
+            summary: '雷达定调全部失败（取图或逐帧分析未成功），本次以多源融合为准。');
+        _checkpoints = const [];
         _verdictLoading = false;
       });
       return;
     }
 
-    // 雷达校验点（路线中点）**到达时刻**距现在多少分钟
-    //
-    // ⚠️ 基准必须与传进 judge 的 `models` 对齐 —— `models` 是
-    // `multiAtArrival[mid]`，即**中点到达时刻**的预报。早先这里算的是
-    // **出发时刻**距今，于是提前量少算了半个行程：1 小时行程错 30 分钟，
-    // 5 小时行程错 2.5 小时，雷达外推值跟拿它去比的模型预报根本不在同一
-    // 时刻上。`RadarVerdictEngine` 的契约是「horizonOverride = models 对应
-    // 时刻距今的分钟数」，2026-09-27 修正为传入 [midArriveAt]。
-    //
-    // ⚠️ 另外**必须传真实分钟数**（哪怕几万分钟），由 `RadarVerdictEngine` 自己
-    // 判断是否超出外推可信范围并降级。早先这里在 > 2h 时传 `null`，而 `null`
-    // 在 judge 里的含义是「**当前时刻**」—— 于是几天后的行程被当成此刻照常
-    // 打分、照常返回 `bestModelKey`，路线页再按「雷达判出的最优源」重建分段，
-    // 表现就是**「选了很远的时间，雷达定调却没有降级」**（实测 bug）。
-    final leadMin = midArriveAt.difference(DateTime.now()).inMinutes;
-    final withinNowcast =
-        leadMin > 0 && leadMin <= RadarService.forecastMaxMinutes;
-
+    done.sort((a, b) => a.km.compareTo(b.km));
+    if (!mounted) return;
     setState(() {
-      _verdictLoading = true;
-      _verdictLeadMinutes = leadMin;
+      _checkpoints = done;
+      _verdict = done.first.verdict; // 最近那个展开详情
+      _verdictLoading = false;
     });
-    try {
-      final v = await RadarVerdictEngine.judge(
-        lat: samples[mid].point.lat,
-        lon: samples[mid].point.lon,
-        models: [models],
-        radarPath: path,
-        horizonOverride: leadMin > 0 ? leadMin : null,
-      );
-      if (!mounted) return;
-      setState(() {
-        _verdict = v;
-        _verdictLoading = false;
-      });
-      // 三态，别把「此刻出发」误报成「超出外推范围」——
-      // 点「现在出发」后立刻研判时 leadMin == 0，早先会被打成
-      // "超出外推范围(>120min)"，排查时极易被带偏（本次真机实测踩到）。
-      final radarBasis = leadMin <= 0
-          ? '中点到达时刻已到，按当前回波定调'
-          : (withinNowcast
-              ? '雷达外推 $leadMin 分钟'
-              : '超出外推范围(>${RadarService.forecastMaxMinutes}min)，以多源融合为准');
-      debugPrint('[雷达定调] 中点到达距今 ${leadMin}min → $radarBasis');
 
-      // 雷达定调判出了最吻合的源 → 用它重建分段详情
-      // （各要素取自该源；「多源验证」信息依然保留）
-      if (v.bestModelKey != null && v.scores.isNotEmpty) {
-        _rebuildWithSource(v.bestModelKey!);
+    // ---- 3) 逐点给源：每个采样点用「离它最近的校验点」的结论，
+    //         但**仅当它自己的到达时刻也在窗内** ----
+    final preferred = List<String?>.filled(samples.length, null);
+    for (var i = 0; i < samples.length; i++) {
+      if (arriveTimes[i].difference(now).inMinutes > windowMin) continue;
+      RadarCheckpoint? best;
+      var bestDist = 1 << 30;
+      for (final c in done) {
+        final d = (c.sampleIndex - i).abs();
+        if (d < bestDist) {
+          bestDist = d;
+          best = c;
+        }
       }
-    } catch (_) {
-      if (!mounted) return;
-      setState(() => _verdictLoading = false);
+      final key = best?.verdict.bestModelKey;
+      if (key != null && (best?.verdict.scores.isNotEmpty ?? false)) {
+        preferred[i] = key;
+      }
     }
+    final used = preferred.where((e) => e != null).length;
+    debugPrint('[雷达定调] ${done.length} 个校验点 → $used/${samples.length} '
+        '个采样点采用雷达定源（其余保持多源融合）');
+    if (used > 0) _rebuildWithSource(preferred);
   }
 
-  /// 用雷达定调判出的**最吻合源**重建分段详情
+  /// 从下标列表里等间隔取最多 [maxCount] 个（**首尾都保留**）
   ///
-  /// 各要素（温度/降水/概率/风速等）改用该源的值，
+  /// 用来把「窗内的采样点」撒成最多 3 个校验点 —— 均匀撒开，而不是全挤在
+  /// 起点附近。首尾保留是因为起点（当前实况）和窗内最远点（外推极限）
+  /// 恰好是雷达信息价值最高与最低的两个端点，都值得看。
+  static List<int> _spreadPick(List<int> idx, int maxCount) {
+    if (idx.length <= maxCount) return List<int>.from(idx);
+    final out = <int>[];
+    for (var k = 0; k < maxCount; k++) {
+      out.add(idx[(k * (idx.length - 1) / (maxCount - 1)).round()]);
+    }
+    return out.toSet().toList()..sort();
+  }
+
+  /// 用雷达**逐点判出的源**重建分段详情
+  ///
+  /// [preferredModels] 与采样点一一对应（元素为 null = 该点保持多源融合）。
+  /// 各要素（温度/降水/概率/风速等）改用对应源的值，
   /// 但**多源验证信息（各源数值 + 一致性评分）依然保留**在研判依据里。
-  void _rebuildWithSource(String modelKey) {
+  void _rebuildWithSource(List<String?> preferredModels) {
     final opt = _lastOpt;
     if (opt == null || _lastSamples.isEmpty) return;
 
@@ -688,7 +825,7 @@ class _RouteScreenState extends State<RouteScreen> {
       destinationName: _dest.text.trim(),
       fullPolyline: opt.fullPolyline,
       multiModels: _lastMulti,
-      preferredModel: modelKey,
+      preferredModels: preferredModels,
     );
 
     setState(() {
@@ -701,7 +838,8 @@ class _RouteScreenState extends State<RouteScreen> {
         overallGrade: RouteAnalyzer.worstGrade(segments.map((s) => s.grade)),
       );
     });
-    debugPrint('[雷达定调] 已按最优源重建分段: $modelKey');
+    debugPrint('[雷达定调] 已按逐点定源重建分段'
+        '（${preferredModels.where((e) => e != null).length} 个采样点采用雷达定源）');
   }
 
   @override
@@ -1332,17 +1470,17 @@ class _RouteScreenState extends State<RouteScreen> {
                   '向${r.motionDirection} ${r.motionSpeedKmh!.toStringAsFixed(0)} km/h（${r.framesUsed} 帧追踪）'),
 
             // 出发时刻决定雷达的使用方式（与地点页点选未来时刻同一套逻辑）
-            // 雷达校验点是路线中点，时距按**中点到达时刻**算（不是出发时刻）
+            // 雷达校验点是沿途多点里**最近的那个**，时距按它自己的到达时刻算
             if (withinNowcast)
-              _kv('外推时距', '中点到达距今 $lead 分钟，回波按此时距外推')
+              _kv('外推时距', '最近校验点到达距今 $lead 分钟，回波按此时距外推')
             else if (lead > nowcastWindow)
               _kv(
                 '时距提示',
-                '中点到达距今 ${(lead / 60).toStringAsFixed(1)} 小时，已超出雷达外推'
+                '最近校验点到达距今 ${(lead / 60).toStringAsFixed(1)} 小时，已超出雷达外推'
                 '有效范围（${nowcastWindow ~/ 60}h）→ 以多源融合为准',
               )
             else if (lead <= 0)
-              _kv('时距提示', '中点到达时刻已过，按当前实况研判'),
+              _kv('时距提示', '最近校验点已到达，按当前实况研判'),
 
             if (r.expectedRainAhead && withinNowcast)
               _kv('外推预警', '未来 $lead 分钟该区域可能受影响'),
@@ -1411,6 +1549,78 @@ class _RouteScreenState extends State<RouteScreen> {
             Text('打分依据：${v.scoreBasis}',
                 style: const TextStyle(
                     fontSize: 10.5, color: AppTheme.textFaint, height: 1.4)),
+          ],
+
+          // ===== 沿程校验点 =====
+          //
+          // 雷达外推只有 2 小时可信，所以校验点**只在这一窗内选**；窗外路段
+          // 保持多源融合。这里把每个校验点各判出的源列出来，让用户看得见
+          // 「雷达管到哪、从哪开始不管」。
+          if (_checkpoints.length > 1) ...[
+            const Divider(height: 20, color: AppTheme.borderSoft),
+            Row(
+              children: [
+                const Text('沿程校验点',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: AppTheme.textFaint,
+                        fontWeight: FontWeight.w700)),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    '${_checkpoints.length} 个 · 仅取外推 ${nowcastWindow ~/ 60}h 窗内',
+                    style: const TextStyle(fontSize: 10.5, color: AppTheme.textFaint),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            for (final cp in _checkpoints)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2.5),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 46,
+                      child: Text('${cp.km.round()}km',
+                          style: const TextStyle(
+                              fontSize: 11.5, color: AppTheme.textDim)),
+                    ),
+                    SizedBox(
+                      width: 46,
+                      child: Text(
+                        '${cp.arriveAt.hour.toString().padLeft(2, '0')}:'
+                        '${cp.arriveAt.minute.toString().padLeft(2, '0')}',
+                        style: const TextStyle(
+                            fontSize: 11.5, color: AppTheme.textFaint),
+                      ),
+                    ),
+                    Expanded(
+                      child: Text(
+                        cp.verdict.bestModel ?? '未定源',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: cp.verdict.bestModel == null
+                              ? AppTheme.textFaint
+                              : AppTheme.accent,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      cp.verdict.scores.isEmpty
+                          ? '—'
+                          : '${cp.verdict.scores.first.score}',
+                      style: const TextStyle(fontSize: 11.5, color: AppTheme.textDim),
+                    ),
+                  ],
+                ),
+              ),
+            const SizedBox(height: 4),
+            const Text(
+              '每个路段采用离它最近那个校验点的源；落在窗外或校验点未覆盖的路段，保持多源融合。',
+              style: TextStyle(fontSize: 10.5, color: AppTheme.textFaint, height: 1.4),
+            ),
           ],
         ],
       ),
