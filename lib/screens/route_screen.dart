@@ -489,7 +489,9 @@ class _RouteScreenState extends State<RouteScreen> {
 
       debugPrint('[路线研判] 采样 ${rawSamples.length} → ${samples.length} 点，'
           '预报 $forecastDays 天'
-          '（出发距今 ${leadHours}h + 行程 ${tripHours}h + 余量 6h）');
+          // 行程显示**实际分钟**而不是 tripHours ——
+          // tripHours 是 ceil 出来的（61 分钟 → 2h），写进日志会误导排查
+          '（出发距今 ${leadHours}h + 行程 ${opt.durationMinutes}min + 余量 6h）');
 
       // **多源交叉验证**：Open-Meteo 三模型（ECMWF/GFS/ICON）+ 中央气象台
       final multiAll = await _multi.fetchMany(
@@ -1575,6 +1577,25 @@ class _RouteScreenState extends State<RouteScreen> {
               ],
             ),
             const SizedBox(height: 6),
+            // 列标题：三列分别是 里程 / 到达时刻 / 判出的源
+            const Row(
+              children: [
+                SizedBox(
+                    width: 46,
+                    child: Text('里程',
+                        style: TextStyle(fontSize: 10, color: AppTheme.textFaint))),
+                SizedBox(
+                    width: 46,
+                    child: Text('到达',
+                        style: TextStyle(fontSize: 10, color: AppTheme.textFaint))),
+                Expanded(
+                    child: Text('判出源',
+                        style: TextStyle(fontSize: 10, color: AppTheme.textFaint))),
+                Text('分',
+                    style: TextStyle(fontSize: 10, color: AppTheme.textFaint)),
+              ],
+            ),
+            const SizedBox(height: 2),
             for (final cp in _checkpoints)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 2.5),
