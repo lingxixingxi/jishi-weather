@@ -382,25 +382,58 @@ class OpenMeteoService {
     return out;
   }
 
-  /// 多地点 × 多模型，**带超时降级**
+  /// 多地点 × 多模型，**带超时降级 + 分批限流 + 单点重试**
   ///
-  /// 三模型请求的响应体积是单模型的 3 倍，网络慢时容易超时。
-  /// 这里给每个点单独设超时；超时的点自动降级为 `best_match` 单模型，
-  /// 保证整条路线仍能出研判结果（而不是整个流程失败）。
+  /// ## 为什么必须分批（2026-09-26 修复「路线研判全是未知」）
+  ///
+  /// 原实现是 `Future.wait(points.map(...))` —— **所有采样点一次性全发出去**。
+  /// 沿途每 10km 一个点，长途路线能到几十个点，而每个点又是
+  /// 「3 模型 × 3 天 × 8 变量」的大响应。几十个这种请求同时打过去，
+  /// Open-Meteo 会限流、大面积超时。
+  ///
+  /// 失败后虽然会降级到 `best_match` 单模型，但降级请求同样挤在限流窗口里，
+  /// 于是**降级也失败 → 返回空 list**。整条路线的采样点全空之后，
+  /// `RouteAnalyzer.signature()` 拿到 null 一律返回「未知」——
+  /// 表现就是用户实测反馈的**「所有段都是未知」**（不是天气真的未知）。
+  ///
+  /// 现在做三件事：**限制在飞请求数**（[maxConcurrent]）、**每点重试一次**、
+  /// **降级走独立超时**（不与三模型共用被限流的那一拨）。
   Future<List<List<MultiModelHourly>>> fetchMultiModelMany({
     required List<({double lat, double lon, String place})> points,
     List<String> models = defaultModels,
     int forecastDays = 2,
     List<String>? variables,
-    Duration perPointTimeout = const Duration(seconds: 20),
-  }) {
-    return Future.wait(points.map((p) => _fetchOneWithFallback(
-          p,
+    Duration perPointTimeout = const Duration(seconds: 25),
+    int maxConcurrent = 6,
+  }) async {
+    if (points.isEmpty) return const [];
+
+    // 按序号「发牌」：保证结果顺序与 points 严格一一对应
+    final out = List<List<MultiModelHourly>>.filled(points.length, const []);
+    var cursor = 0;
+
+    Future<void> worker() async {
+      while (true) {
+        final i = cursor++;
+        if (i >= points.length) return;
+        out[i] = await _fetchOneWithFallback(
+          points[i],
           models: models,
           forecastDays: forecastDays,
           variables: variables,
           timeout: perPointTimeout,
-        )));
+        );
+      }
+    }
+
+    final lanes = math.min(maxConcurrent, points.length);
+    await Future.wait(List.generate(lanes, (_) => worker()));
+
+    final failed = out.where((e) => e.isEmpty).length;
+    debugPrint('[Open-Meteo] 批量拉取 ${points.length} 点'
+        '（并发 $lanes）→ ${out.length - failed} 点成功'
+        '${failed > 0 ? "，$failed 点无数据" : ""}');
+    return out;
   }
 
   Future<List<MultiModelHourly>> _fetchOneWithFallback(
@@ -410,54 +443,67 @@ class OpenMeteoService {
     List<String>? variables,
     required Duration timeout,
   }) async {
-    try {
-      return await fetchMultiModel(
-        lat: p.lat,
-        lon: p.lon,
-        place: p.place,
-        models: models,
-        forecastDays: forecastDays,
-        variables: variables,
-      ).timeout(timeout);
-    } catch (e) {
-      debugPrint('[Open-Meteo] 三模型失败(${p.place})，降级单模型: $e');
-      // 降级：单模型 best_match
+    // ① 三模型 —— 失败重试一次。限流多为瞬时（几秒窗口），重试命中率不低。
+    for (var attempt = 0; attempt < 2; attempt++) {
       try {
-        final single = await fetchHourly(
+        final r = await fetchMultiModel(
           lat: p.lat,
           lon: p.lon,
           place: p.place,
+          models: models,
           forecastDays: forecastDays,
           variables: variables,
-        );
-        return single
-            .map((w) => MultiModelHourly(
-                  place: p.place,
-                  lat: p.lat,
-                  lon: p.lon,
-                  time: w.time,
-                  sources: [
-                    ModelForecast(
-                      model: 'best_match',
-                      displayName: '综合',
-                      temperature: w.temperature,
-                      precipitationProbability: w.precipitationProbability,
-                      precipitation: w.precipitation,
-                      windSpeed: w.windSpeed,
-                      windDirection: w.windDirection,
-                      windGust: w.windGust,
-                      visibility: w.visibility,
-                      cloudCover: w.cloudCover,
-                      weatherCode: w.weatherCode,
-                      weatherText: w.weatherText,
-                    ),
-                  ],
-                ))
-            .toList();
-      } catch (e2) {
-        debugPrint('[Open-Meteo] 降级也失败(${p.place}): $e2');
-        return const <MultiModelHourly>[];
+        ).timeout(timeout);
+        if (r.isNotEmpty) return r;
+        debugPrint('[Open-Meteo] 三模型返回空(${p.place})');
+        break; // 返回空不是网络问题，重试无益，直接走降级
+      } catch (e) {
+        if (attempt == 0) {
+          debugPrint('[Open-Meteo] 三模型失败(${p.place})，重试一次: $e');
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+          continue;
+        }
+        debugPrint('[Open-Meteo] 三模型重试仍失败(${p.place})，降级单模型: $e');
       }
+    }
+
+    // ② 降级：单模型 best_match。响应体积只有三模型的 1/3，
+    //    且这里用独立超时 —— 上一拨被限流时它更可能挤进去。
+    try {
+      final single = await fetchHourly(
+        lat: p.lat,
+        lon: p.lon,
+        place: p.place,
+        forecastDays: forecastDays,
+        variables: variables,
+      ).timeout(const Duration(seconds: 30));
+      return single
+          .map((w) => MultiModelHourly(
+                place: p.place,
+                lat: p.lat,
+                lon: p.lon,
+                time: w.time,
+                sources: [
+                  ModelForecast(
+                    model: 'best_match',
+                    displayName: '综合',
+                    temperature: w.temperature,
+                    precipitationProbability: w.precipitationProbability,
+                    precipitation: w.precipitation,
+                    windSpeed: w.windSpeed,
+                    windDirection: w.windDirection,
+                    windGust: w.windGust,
+                    visibility: w.visibility,
+                    cloudCover: w.cloudCover,
+                    weatherCode: w.weatherCode,
+                    weatherText: w.weatherText,
+                  ),
+                ],
+              ))
+          .toList();
+    } catch (e2) {
+      debugPrint('[Open-Meteo] 降级也失败(${p.place}): $e2');
+      return const <MultiModelHourly>[];
     }
   }
 

@@ -185,7 +185,7 @@ class ScreenScaffold extends StatelessWidget {
                                   // ⚠️ 发版时**必须**与 pubspec.yaml 的 version 同步 ——
                                   // 0.1.9 就出现过「装的是 0.1.9、徽章还写 0.1.8」。
                                   // `_research/pack_dist.py` 已加一致性校验，不一致会直接报错。
-                                  '0.1.9 内测 · 禁止外传',
+                                  '0.1.10 内测 · 禁止外传',
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(

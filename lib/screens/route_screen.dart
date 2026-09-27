@@ -168,6 +168,20 @@ class _RouteScreenState extends State<RouteScreen> {
   bool _analyzing = false;
   String? _error;
 
+  /// 部分采样点没拿到数据时的提示（非致命，但必须让用户看见）
+  ///
+  /// 与 [_error] 的区别：[_error] 会中断研判，这个只是降级提示 ——
+  /// 缺数据的路段按空缺处理，结论偏保守，但整条路线仍可用。
+  String? _partialFailNote;
+
+  /// 路线采样点上限
+  ///
+  /// 沿途每 10km 一个点，长途路线（如 500km）会切出 50+ 个点，
+  /// 每个点一次「3 模型 × N 天」的多模型请求 —— 既慢又容易触发限流，
+  /// 结果是整批失败、全线显示「未知」（见 `OpenMeteoService.fetchMultiModelMany`）。
+  /// 40 个点已足够刻画沿途天气变化（间距约 12~15km）。
+  static const int _maxRouteSamples = 40;
+
   GeoPoint? _from;
   GeoPoint? _to;
   List<RouteOption> _options = const [];
@@ -337,6 +351,46 @@ class _RouteScreenState extends State<RouteScreen> {
     }
   }
 
+  /// 出发时刻是否就是「现在」（±5 分钟内）
+  ///
+  /// 只用于按钮高亮 —— 让用户一眼看出当前是按"现在出发"在算。
+  bool get _isDepartingNow =>
+      _departAt.difference(DateTime.now()).abs() <= const Duration(minutes: 5);
+
+  /// 「现在出发」：把出发时刻设为此刻，**并按当前时间重算研判**
+  ///
+  /// ⚠️ 只改时间不重算，界面上的时间变了、结论却还是按旧时刻算的 ——
+  /// 这种「显示与依据脱节」是本项目反复踩过的坑，所以这里一并重算。
+  ///
+  /// 尚未研判过（没点过「按此路线生成研判」）时只设时间，不擅自触发研判。
+  void _departNow() {
+    final now = DateTime.now();
+    setState(() => _departAt = now);
+    debugPrint('[路线] 出发时间 → 现在 '
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}');
+    if (_analysis != null && _options.isNotEmpty && !_analyzing) {
+      unawaited(_analyze(_options[_selectedIndex]));
+    }
+  }
+
+  /// 采样点抽稀 —— 等间隔取点，**但必须保住最后一个点**
+  ///
+  /// 丢尾点会让路线终点那一段没有天气依据（末段只能靠前一个采样点兜底），
+  /// 所以抽稀后若末点不是原始末点，就补上。
+  static List<({GeoPoint point, double kmFromStart})> _thinSamples(
+    List<({GeoPoint point, double kmFromStart})> raw,
+    int maxCount,
+  ) {
+    if (raw.length <= maxCount) return raw;
+    final step = (raw.length / maxCount).ceil();
+    final out = <({GeoPoint point, double kmFromStart})>[];
+    for (var i = 0; i < raw.length; i += step) {
+      out.add(raw[i]);
+    }
+    if (out.last.kmFromStart < raw.last.kmFromStart) out.add(raw.last);
+    return out;
+  }
+
   /// 按到达时刻挑出最接近的多源集合
   MultiModelHourly? _nearestMulti(List<MultiModelHourly> list, DateTime target) {
     if (list.isEmpty) return null;
@@ -361,11 +415,26 @@ class _RouteScreenState extends State<RouteScreen> {
     setState(() {
       _analyzing = true;
       _error = null;
+      _partialFailNote = null;
       _analysis = null;
     });
     try {
-      // 沿途每 10km 采样
-      final samples = AmapService.sampleAlong(opt.polyline, intervalKm: 10);
+      // 沿途每 10km 采样，再按上限抽稀（长途路线会有上百个点）
+      final rawSamples = AmapService.sampleAlong(opt.polyline, intervalKm: 10);
+      final samples = _thinSamples(rawSamples, _maxRouteSamples);
+
+      // 预报天数**按实际需要算**：只覆盖「出发 → 到达」，再留 6 小时余量。
+      // 原来固定传 3 天，而绝大多数行程在 24 小时内 ——
+      // 多出来的天数让每次请求的响应体积凭空涨约 50%，
+      // 是「批量请求超时 → 全线未知」的帮凶之一。
+      final leadHours =
+          _departAt.difference(DateTime.now()).inHours.clamp(0, 24 * 6);
+      final tripHours = (opt.durationMinutes / 60).ceil();
+      final forecastDays = ((leadHours + tripHours + 6) / 24).ceil().clamp(1, 5);
+
+      debugPrint('[路线研判] 采样 ${rawSamples.length} → ${samples.length} 点，'
+          '预报 $forecastDays 天'
+          '（出发距今 ${leadHours}h + 行程 ${tripHours}h + 余量 6h）');
 
       // **多源交叉验证**：Open-Meteo 三模型（ECMWF/GFS/ICON）+ 中央气象台
       final multiAll = await _multi.fetchMany(
@@ -376,8 +445,25 @@ class _RouteScreenState extends State<RouteScreen> {
                   place: '${s.kmFromStart.toStringAsFixed(0)}km',
                 ))
             .toList(),
-        forecastDays: 3,
+        forecastDays: forecastDays,
       );
+
+      // ⚠️ 必须区分「天气未知」和「请求失败」。
+      //
+      // 全空时若照常往下走，`RouteAnalyzer.signature()` 对 null 一律返回
+      // 「未知」，整条路线就被渲染成一串「未知」—— 正是用户实测反馈的
+      // 「经常所有都是未知」。**数据没拿到就该明确报错，不能编一份空结论。**
+      final okPoints = multiAll.where((e) => e.isNotEmpty).length;
+      if (okPoints == 0) {
+        throw Exception(
+          '天气数据拉取失败：$forecastDays 天预报 × ${samples.length} 个采样点全部无响应。'
+          '请检查网络后重试；若持续失败，多半是数据源限流，等几分钟再试。',
+        );
+      }
+      _partialFailNote = okPoints < multiAll.length
+          ? '${multiAll.length - okPoints}/${multiAll.length} 个采样点未取到数据，'
+              '这些路段按空缺处理（结论偏保守）'
+          : null;
 
       // 用融合值走原有研判流程
       final forecasts = multiAll
@@ -470,12 +556,43 @@ class _RouteScreenState extends State<RouteScreen> {
     List<({GeoPoint point, double kmFromStart})> samples,
     List<MultiModelHourly?> multiAtArrival,
   ) async {
+    // ⚠️ 这两处早先是**静默 return** —— 一旦命中，雷达卡片连「正在分析」
+    // 都不显示，用户完全看不到雷达，也查不到原因。实测反馈正是
+    // 「当天的雷达不启动，选到超过两个小时才蹦出来」。
+    //
+    // 根因：上游多模型请求整批失败时 `multiAtArrival` 全是 null，于是
+    // `models == null` 直接 return，**卡片整体不渲染**。而「超过两小时就
+    // 出现」是另一条路径 —— 那时若数据恰好取到了，卡片才被渲染出来，
+    // 看起来就像雷达跟出发时间有关，其实两者无关（真正的开关是数据有没有到手）。
+    //
+    // 现在：**照样渲染卡片并写明未运行的原因**，让「没跑」和「跑了」一样可见。
     final path = _multi.lastRadarPath;
-    if (path == null || samples.isEmpty) return;
+    if (path == null || samples.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _verdict = RadarVerdict(
+          summary: path == null
+              ? '本次未取到中央气象台雷达图路径（央台请求未成功），雷达定调未运行。'
+              : '路线采样点为空，雷达校验点无法确定，雷达定调未运行。',
+        );
+        _verdictLoading = false;
+      });
+      return;
+    }
 
     final mid = samples.length ~/ 2;
     final models = mid < multiAtArrival.length ? multiAtArrival[mid] : null;
-    if (models == null) return;
+    if (models == null) {
+      if (!mounted) return;
+      setState(() {
+        _verdict = RadarVerdict(
+          summary: '路线中点没有多源天气数据（天气请求未成功），'
+              '雷达没有可比对的对象，本次未做雷达定调。',
+        );
+        _verdictLoading = false;
+      });
+      return;
+    }
 
     // 出发时刻距今多少分钟
     //
@@ -613,41 +730,73 @@ class _RouteScreenState extends State<RouteScreen> {
                 ],
               ),
               const SizedBox(height: 9),
-              OutlinedButton.icon(
-                onPressed: () async {
-                  // 日期选择器：套深色主题，否则是系统默认浅色（与 App 风格不符）
-                  final d = await showDatePicker(
-                    context: context,
-                    initialDate: _departAt,
-                    firstDate: DateTime.now().subtract(const Duration(days: 1)),
-                    lastDate: DateTime.now().add(const Duration(days: 7)),
-                    builder: (ctx, child) =>
-                        Theme(data: AppTheme.pickerTheme(ctx), child: child!),
-                  );
-                  if (d == null) return;
-                  if (!context.mounted) return;
-                  final t = await showTimePicker(
-                    context: context,
-                    initialTime: TimeOfDay.fromDateTime(_departAt),
-                    builder: (ctx, child) =>
-                        Theme(data: AppTheme.pickerTheme(ctx), child: child!),
-                  );
-                  if (t == null) return;
-                  setState(() {
-                    _departAt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
-                  });
-                },
-                icon: const Icon(Icons.schedule, size: 18),
-                label: Text(
-                  '出发时间：${_departAt.month}/${_departAt.day} '
-                  '${_departAt.hour.toString().padLeft(2, '0')}:${_departAt.minute.toString().padLeft(2, '0')}',
-                ),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppTheme.text,
-                  side: const BorderSide(color: AppTheme.border),
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
-                ),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        // 日期选择器：套深色主题，否则是系统默认浅色（与 App 风格不符）
+                        final d = await showDatePicker(
+                          context: context,
+                          initialDate: _departAt,
+                          firstDate: DateTime.now().subtract(const Duration(days: 1)),
+                          lastDate: DateTime.now().add(const Duration(days: 7)),
+                          builder: (ctx, child) =>
+                              Theme(data: AppTheme.pickerTheme(ctx), child: child!),
+                        );
+                        if (d == null) return;
+                        if (!context.mounted) return;
+                        final t = await showTimePicker(
+                          context: context,
+                          initialTime: TimeOfDay.fromDateTime(_departAt),
+                          builder: (ctx, child) =>
+                              Theme(data: AppTheme.pickerTheme(ctx), child: child!),
+                        );
+                        if (t == null) return;
+                        setState(() {
+                          _departAt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
+                        });
+                      },
+                      icon: const Icon(Icons.schedule, size: 18),
+                      label: Text(
+                        '出发时间：${_departAt.month}/${_departAt.day} '
+                        '${_departAt.hour.toString().padLeft(2, '0')}:${_departAt.minute.toString().padLeft(2, '0')}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppTheme.text,
+                        side: const BorderSide(color: AppTheme.border),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // 「现在出发」——最常用的一档。原先只能进日期 + 时间两个
+                  // 选择器里把时刻拨到"现在"，既费事又拨不准（拨完就过了）。
+                  OutlinedButton(
+                    onPressed: (_analyzing || _isDepartingNow && _analysis != null)
+                        ? null
+                        : _departNow,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor:
+                          _isDepartingNow ? AppTheme.accent : AppTheme.text,
+                      side: BorderSide(
+                        color: _isDepartingNow ? AppTheme.accent : AppTheme.border,
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.bolt, size: 17),
+                        SizedBox(width: 4),
+                        Text('现在出发'),
+                      ],
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 10),
               FilledButton.icon(
@@ -715,6 +864,27 @@ class _RouteScreenState extends State<RouteScreen> {
                   interactive: true, // 可缩放拖动
                 ),
               ),
+            ),
+          ),
+
+        // 部分采样点没取到数据时的降级提示（非致命，但必须让用户看见 ——
+        // 否则缺数据的路段会被当成"天气未知"而无人察觉）
+        if (_partialFailNote != null)
+          PanelCard(
+            heading: '数据完整性提示',
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.warning_amber_rounded, size: 16, color: AppTheme.accent),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    _partialFailNote!,
+                    style: const TextStyle(
+                        fontSize: 12, color: AppTheme.textDim, height: 1.5),
+                  ),
+                ),
+              ],
             ),
           ),
 
@@ -1050,8 +1220,13 @@ class _RouteScreenState extends State<RouteScreen> {
     final withinNowcast = lead > 0 && lead <= nowcastWindow;
     return PanelCard(
       // 超出外推范围时雷达**不参与定调**，标题也要跟着变，
-      // 否则用户会以为下方内容仍是「雷达裁决出来的结果」
-      heading: v.beyondNowcast ? '雷达实况 · 未参与定调' : '雷达定调 · 真实回波校验',
+      // 否则用户会以为下方内容仍是「雷达裁决出来的结果」。
+      // 另外补一种情况：`radar == null` 且无打分 = 雷达根本没跑起来
+      // （覆盖范围外 / 取图失败 / 上游数据缺失），标题必须如实说明，
+      // 不能让一张只有一行 summary 的卡片顶着「雷达定调」的名头。
+      heading: v.radar == null && v.scores.isEmpty
+          ? '雷达定调 · 本次未运行'
+          : (v.beyondNowcast ? '雷达实况 · 未参与定调' : '雷达定调 · 真实回波校验'),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
