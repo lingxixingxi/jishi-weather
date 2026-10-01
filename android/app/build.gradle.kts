@@ -1,3 +1,4 @@
+import java.util.Base64
 import java.util.Properties
 import java.io.FileInputStream
 
@@ -13,6 +14,45 @@ val keyPropertiesFile = rootProject.file("key.properties")
 if (keyPropertiesFile.exists()) {
     keyProperties.load(FileInputStream(keyPropertiesFile))
 }
+
+// ===== 内测版 / 公测版 的**桌面名称** =====
+//
+// 两条分发路线共用同一个 applicationId，因此**不能同时安装**，
+// 桌面名必须能区分，否则用户根本分不清自己装的是哪一个。
+//
+// 判定顺序：
+//   1. 显式传参 `-PbetaBuild=true`
+//      （flutter build apk ... -PbetaBuild=true）
+//   2. 自动识别：从 Flutter 传下来的 `dart-defines` 属性里找 INJECT_KEYS=true
+//      （Flutter Gradle Plugin 会把 --dart-define 以 base64 塞进这个
+//        project property，旧格式是逗号分隔的多个 base64，新格式是
+//        整包一个 base64 —— 两种都试）
+//   3. 都取不到 → 按公测版处理
+//
+// ⚠️ 默认方向必须是「公测版」：万一识别失败，宁可内测包少一个「内测」
+//    字样，也绝不能把「内测」印在公开发布的包上。
+val isBetaBuild: Boolean = run {
+    if (project.findProperty("betaBuild") == "true") return@run true
+    val raw = (project.findProperty("dart-defines") as String?).orEmpty()
+    if (raw.isBlank()) return@run false
+
+    // ⚠️ 这里必须用文件顶部 import 进来的 Base64 简名：
+    //    Gradle 的 Kotlin DSL 里 `java` 是 java 扩展，写 `java.util.Base64`
+    //    会被解析成 `java`(extension).util → Unresolved reference 'util'
+    fun decode(token: String): String? = runCatching {
+        String(Base64.getDecoder().decode(token.trim()), Charsets.UTF_8)
+    }.getOrNull()
+
+    // 新格式：整个字符串是一个 base64
+    decode(raw)?.contains("INJECT_KEYS=true")?.let { if (it) return@run true }
+    // 旧格式：逗号分隔的多个 base64
+    raw.split(",").any { decode(it) == "INJECT_KEYS=true" }
+}
+
+println(
+    "[build] 通道判定 isBetaBuild=$isBetaBuild -> 桌面名=" +
+        if (isBetaBuild) "迹时天气·内测" else "迹时天气"
+)
 
 android {
     namespace = "com.lingxi.jishiweather"
@@ -47,6 +87,10 @@ android {
 
         // 高德地图 Key：从 key.properties 注入到 AndroidManifest 的 ${AMAP_KEY}
         manifestPlaceholders["AMAP_KEY"] = keyProperties.getProperty("AMAP_KEY") ?: ""
+
+        // 桌面名：内测版 / 公测版（判定见文件顶部 isBetaBuild）
+        manifestPlaceholders["appLabel"] =
+            if (isBetaBuild) "迹时天气·内测" else "迹时天气"
     }
 
     // ===== 发布签名 =====

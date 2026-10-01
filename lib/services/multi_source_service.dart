@@ -1,25 +1,35 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
+
 import '../models/hourly_weather.dart';
 import 'nmc_city_repository.dart';
 import 'nmc_service.dart';
 import 'open_meteo.dart';
+import 'qweather_budget.dart';
 import 'qweather_service.dart';
 
 /// 多源气象数据融合服务
 ///
-/// 把 Open-Meteo 的三个独立数值模型（ECMWF / GFS / ICON）
-/// 与中央气象台（实况 + 逐小时实测 + 预报）合并成同一时刻的多源集合，
-/// 供研判做交叉验证与分歧分析。
+/// 把 **8 个源**合并成同一时刻的多源集合，供研判做交叉验证与分歧分析：
+///
+/// | # | 源 | 说明 |
+/// |---|---|---|
+/// | 1-6 | Open-Meteo 六个数值模型 | CMA(GRAPES) / ECMWF / GFS / ICON / UKMO / GEM |
+/// | 7 | 和风天气 | 可选；未配 Key 或超每日额度时自动跳过 |
+/// | 8 | 中央气象台 | 实况 + 逐小时实测 + 预报 |
 ///
 /// 中央气象台缺失的 4 项（降水概率/阵风/能见度/云量）由
 /// [WeatherEstimator] 用物理经验公式补全，使各源字段对齐后可比。
+///
+/// ⚠️ 模型清单的选型依据见 `_research/openmeteo_models_audit.md`
+/// 与 `services/open_meteo.dart` 的 `defaultModels` —— **别再凭印象改数量**。
 class MultiSourceService {
   final OpenMeteoService _meteo;
   final NmcService _nmc;
   final NmcCityRepository _cityRepo;
 
-  /// 和风天气（可选第 5 源；未配置 API Host 时自动跳过）
+  /// 和风天气（可选第 7 源；未配置 API Host 时自动跳过）
   final QWeatherService _qweather;
 
   /// 最近一次中央气象台返回的雷达拼图路径（供雷达定调用）
@@ -109,16 +119,32 @@ class MultiSourceService {
       forecastDays: forecastDays,
     );
 
-    // 2. 和风天气（所有采样点并行；免费配额 1000 次/天，正常用量足够）
+    // 2. 和风天气 —— **抽稀后**再取
+    //
+    // ⚠️ 和风免费订阅只有 1000 次/天（账号级），而这里是**每个采样点一次请求**：
+    // 40 点的长途路线，一次研判就要 40 次，25 次就把日额度吃光。
+    //
+    // 所以先按 [QWeatherBudget.maxPointsPerRun] 对采样点抽稀。未被抽中的点
+    // 只是**少一个源**，其余 6 个 Open-Meteo 源照常参与融合 —— 融合层按
+    // 「有值的源」求均值与极差，缺源不会污染共识。
     var result = meteoAll;
     if (_qweather.isConfigured && points.isNotEmpty) {
-      final qwAll = await Future.wait(points.map((p) async {
+      final picked = _thinIndexes(points.length, QWeatherBudget.maxPointsPerRun);
+      final qwAll =
+          List<List<QWeatherHourly>>.filled(points.length, const []);
+      await Future.wait(picked.map((i) async {
         try {
-          return await _qweather.hourly(p.lat, p.lon, hours: forecastDays * 24);
+          qwAll[i] = await _qweather.hourly(
+            points[i].lat,
+            points[i].lon,
+            hours: forecastDays * 24,
+          );
         } catch (_) {
-          return const <QWeatherHourly>[];
+          // 单点失败忽略，不影响其他源
         }
       }));
+      debugPrint('[和风] ${points.length} 个采样点中取 ${picked.length} 个'
+          '（免费额度 ${QWeatherBudget.dailyLimit} 次/天）');
       result = List.generate(result.length, (i) {
         final qw = i < qwAll.length ? qwAll[i] : const <QWeatherHourly>[];
         if (qw.isEmpty) return result[i];
@@ -179,6 +205,19 @@ class MultiSourceService {
           .toList());
     }
     return out;
+  }
+
+  /// 等间隔取最多 [maxCount] 个下标（**首尾都保留**）
+  ///
+  /// 用于把「路线采样点」抽稀到和风可承受的请求数 —— 详见 [QWeatherBudget]。
+  /// 首尾保留是因为起点与终点恰好是用户最关心的两个位置。
+  static List<int> _thinIndexes(int total, int maxCount) {
+    if (total <= maxCount) return List<int>.generate(total, (i) => i);
+    final out = <int>[];
+    for (var k = 0; k < maxCount; k++) {
+      out.add((k * (total - 1) / (maxCount - 1)).round());
+    }
+    return out.toSet().toList()..sort();
   }
 
   /// 把中央气象台数据转成 [ModelForecast]

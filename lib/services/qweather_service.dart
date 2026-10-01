@@ -1,9 +1,11 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
-import '../config/secrets.dart';
 import '../models/hourly_weather.dart';
+import 'api_keys.dart';
+import 'qweather_budget.dart';
 
 /// 和风天气逐小时预报
 class QWeatherHourly {
@@ -56,8 +58,8 @@ class QWeatherService {
     String? apiHost,
     String? apiKey,
   })  : _client = client ?? http.Client(),
-        apiHost = apiHost ?? Secrets.qweatherApiHost,
-        apiKey = apiKey ?? Secrets.qweatherApiKey;
+        apiHost = apiHost ?? ApiKeys.qweatherHost,
+        apiKey = apiKey ?? ApiKeys.qweatherKey;
 
   /// 是否已配置（Host 为空时视为未配置，调用方应跳过该源）
   bool get isConfigured => apiHost.isNotEmpty && apiKey.isNotEmpty;
@@ -80,11 +82,27 @@ class QWeatherService {
   }) async {
     if (!isConfigured) return const [];
 
+    // ===== 内置 Key 的请求预算守卫 =====
+    //
+    // 和风免费订阅 1000 次/天（账号级），而本项目是**按采样点**消耗的 ——
+    // 路线页一次研判最多 40 个点就是 40 次请求。详见 [QWeatherBudget]。
+    // 用户自填了 Key 则不限（canSpend 恒为真）。
+    if (!await QWeatherBudget.canSpend()) {
+      debugPrint('[和风] 今日内置 Key 额度已用完'
+          '（${QWeatherBudget.dailyLimit} 次/天）→ 跳过和风源');
+      return const [];
+    }
+    await QWeatherBudget.spend();
+
     // 先试新版路径
     final v1 = await _tryHourlyV1(lat, lon, hours);
     if (v1.isNotEmpty) return v1;
 
     // 回退旧版路径
+    //
+    // ⚠️ 这次回退会**额外消耗一次和风调用量**（同一个坐标发了第二个请求）。
+    // 正常情况走 v1 就够了；只有当 Host 只支持旧版路径时才会双双命中，
+    // 那时实际消耗是额度估算的两倍。
     return _tryHourlyV7(lat, lon, hours);
   }
 

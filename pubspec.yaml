@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.10+17
+version: 0.2.0+18
 
 environment:
   sdk: ^3.13.3
@@ -49,6 +49,8 @@ dependencies:
   url_launcher: ^6.3.2
   workmanager: ^0.10.10
   flutter_local_notifications: ^22.3.1
+  share_plus: ^13.3.0
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
@@ -102,3 +104,15 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+# ===== 依赖覆盖 =====
+#
+# `path_provider_android` 从 2.3.0 起改用 jni/FFI 直连（依赖 jni + objective_c），
+# 构建时要跑 CMake 编译 native 库 —— 本机 Android SDK 里没有 CMake 3.22.1，直接导致：
+#   [CXX1300] CMake '3.22.1' was not found in SDK, PATH, or by cmake.dir property.
+#   Execution failed for task ':jni:configureCMakeRelWithDebInfo[arm64-v8a]'
+#
+# 我们只用 path_provider 取一个可写目录，用不到 JNI 加速，
+# 锁在 2.2.x（纯 Kotlin 实现）即可，省掉一个 native 依赖。
+dependency_overrides:
+  path_provider_android: ">=2.2.0 <2.3.0"

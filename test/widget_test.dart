@@ -23,7 +23,7 @@ void main() {
       );
 
   group('ScreenScaffold', () {
-    testWidgets('渲染标题、副标题、内测徽章与子内容', (tester) async {
+    testWidgets('渲染标题、副标题、版本徽章与子内容', (tester) async {
       await tester.pumpWidget(host(const ScreenScaffold(
         title: '地点查询',
         subtitle: '方圆 10km 区域天气',
@@ -33,7 +33,17 @@ void main() {
 
       expect(find.text('地点查询'), findsOneWidget);
       expect(find.text('方圆 10km 区域天气'), findsOneWidget);
-      expect(find.textContaining('内测'), findsOneWidget);
+      // 徽章文案随构建通道变：公测构建 →「x.y.z 公测版」，
+      // 内测构建（--dart-define=INJECT_KEYS=true）→「x.y.z 内测 · 禁止外传」。
+      // 测试环境不传 dart-define，所以默认走公测分支；两种都算通过，
+      // 免得每次升版本号或换通道都要改测试。
+      expect(
+        find.byWidgetPredicate((w) =>
+            w is Text &&
+            w.data != null &&
+            (w.data!.contains('公测版') || w.data!.contains('内测'))),
+        findsOneWidget,
+      );
       expect(find.text('卡片内容'), findsOneWidget);
     });
 

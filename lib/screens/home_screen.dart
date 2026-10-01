@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../config/app_identity.dart';
+import '../services/api_keys.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
 import 'location_screen.dart';
@@ -181,14 +183,20 @@ class ScreenScaffold extends StatelessWidget {
                                       color:
                                           AppTheme.accent.withValues(alpha: .55)),
                                 ),
-                                child: const Text(
-                                  // ⚠️ 发版时**必须**与 pubspec.yaml 的 version 同步 ——
-                                  // 0.1.9 就出现过「装的是 0.1.9、徽章还写 0.1.8」。
-                                  // `_research/pack_dist.py` 已加一致性校验，不一致会直接报错。
-                                  '0.1.10 内测 · 禁止外传',
+                                child: Text(
+                                  // ⚠️ 版本号读 AppIdentity.appVersion，**不要再硬编码** ——
+                                  // 0.1.9 出过「装的是 0.1.9、徽章还写 0.1.8」的事故。
+                                  // `_research/pack_dist.py` 打包时会校验
+                                  // pubspec / AppIdentity / 脚本三处一致。
+                                  //
+                                  // 两条分发路线共用一个版本号，
+                                  // 靠编译期开关 `INJECT_KEYS` 区分文案。
+                                  ApiKeys.isPublicBuild
+                                      ? '${AppIdentity.appVersion} 公测版'
+                                      : '${AppIdentity.appVersion} 内测 · 禁止外传',
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
+                                  style: const TextStyle(
                                     fontSize: 9,
                                     color: AppTheme.accent,
                                     fontWeight: FontWeight.w700,

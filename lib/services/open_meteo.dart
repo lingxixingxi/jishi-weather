@@ -279,26 +279,86 @@ class OpenMeteoService {
     return out;
   }
 
-  /// 默认参与交叉验证的数值模型（三个独立来源，互不依赖）
+  /// 默认参与交叉验证的数值模型
+  ///
+  /// ## 选型依据
+  ///
+  /// 2026-10-01 对 Open-Meteo 全部 **51 个** model id 做过逐项实测审计
+  /// （产出：`_research/openmeteo_models_audit.md`）。原先只用了三个，
+  /// 是项目建立时随手选的，从未筛选过。现在选的 6 路满足
+  /// **互不重复 + 关键变量齐全 + 覆盖中国大陆**：
+  ///
+  /// | 模型 | 机构 | 分辨率 | 关键变量 |
+  /// |---|---|---|---|
+  /// | `cma_grapes_global` | 中国气象局 GRAPES | 15 km | ET0/短波/云分层/能见度全绿，**无降水概率** |
+  /// | `ecmwf_ifs` | ECMWF IFS HRES | 9 km | 6/6 全绿（比 `ecmwf_ifs025` 高一档，原生带 visibility）|
+  /// | `gfs_seamless` | 美国 NCEP GFS | 13 km | 6/6 全绿 |
+  /// | `icon_seamless` | 德国 DWD ICON | 11 km | 无 visibility |
+  /// | `ukmo_global_deterministic_10km` | 英国气象局 | 10 km | 6/6 全绿 |
+  /// | `cmc_gem_gdps` | 加拿大 GEM | 15 km | 无 visibility，12h 才更新（全组最慢）|
+  ///
+  /// ## ⚠️ 三类「绝对不能加」的坑（均已实测）
+  ///
+  /// 1. **`metno_seamless` / `knmi_seamless` / `dmi_seamless` / `geosphere_seamless`
+  ///    在中国境内就是 ECMWF 本人** —— 名字里的 `(with ECMWF)` 不是修饰而是
+  ///    回退链。实测它们与 `ecmwf_ifs` 的逐时温度数组**逐点完全相同**。
+  ///    加进来等于给 ECMWF 投 5 票，分歧度被系统性压低。
+  /// 2. **同源重复，每组只算一票**：`ncep_gfs_global`≡`gfs_seamless`、
+  ///    `dwd_icon_global`≡`icon_seamless`、`cmc_gem_seamless`≡`cmc_gem_gdps`、
+  ///    `ukmo_seamless`≡`ukmo_global_deterministic_10km`。
+  /// 3. **`bom_access_global` / `kma_gdps` / `kma_seamless`** 名义全球，实测
+  ///    悉尼/首尔/上海/柏林/纽约**全部整段 null**。
+  ///
+  /// 另有 25 个模型（HRRR / NAM / AROME / ICON-D2 / ICON-EU / GEM RDPS 等）
+  /// 完全不覆盖中国。详见审计文档。
+  ///
+  /// ## 成本（实测，上海 · 10 变量）
+  ///
+  /// 3 路 → 6 路：12 KB/179 ms → **24 KB/192 ms**。体积约 1.9 倍、耗时几乎不变。
+  /// 项目曾因「几十个采样点齐发」被限流导致全线未知，但那与单请求体积无关
+  /// （见 [fetchMultiModelMany] 的分批限流）。
   static const List<String> defaultModels = [
-    'ecmwf_ifs025', // 欧洲中期天气预报中心
+    'cma_grapes_global', // 中国气象局 GRAPES（注意：无降水概率）
+    'ecmwf_ifs', // ECMWF IFS HRES 9km
     'gfs_seamless', // 美国 NCEP GFS
-    'icon_seamless', // 德国气象局 ICON
+    'icon_seamless', // 德国 DWD ICON
+    'ukmo_global_deterministic_10km', // 英国气象局 10km
+    'cmc_gem_gdps', // 加拿大 GEM
   ];
 
   /// 模型 → 展示名
   static String modelDisplayName(String model) {
     switch (model) {
+      case 'ecmwf_ifs':
       case 'ecmwf_ifs025':
       case 'ecmwf_ifs04':
       case 'ecmwf_aifs025':
+      case 'ecmwf_aifs025_single':
         return 'ECMWF';
       case 'gfs_seamless':
+      case 'ncep_gfs_seamless':
       case 'gfs_global':
+      case 'ncep_gfs_global':
         return 'GFS';
       case 'icon_seamless':
+      case 'dwd_icon_seamless':
       case 'icon_global':
         return 'ICON';
+      // 与中国气象局「央台实况」（nmc）区分开：这个是 CMA 的数值模式
+      case 'cma_grapes_global':
+        return 'CMA';
+      case 'ukmo_global_deterministic_10km':
+      case 'ukmo_seamless':
+        return 'UKMO';
+      case 'cmc_gem_gdps':
+      case 'cmc_gem_seamless':
+        return 'GEM';
+      case 'jma_seamless':
+      case 'jma_gsm':
+        return 'JMA';
+      case 'meteofrance_arpege_world':
+      case 'meteofrance_seamless':
+        return 'ARPEGE';
       case 'best_match':
         return '综合';
       case 'qweather':
@@ -310,11 +370,23 @@ class OpenMeteoService {
     }
   }
 
-  /// **多模型交叉验证**：一次请求拿到 ECMWF / GFS / ICON 三源预报
+  /// **多模型交叉验证**：一次请求拿到多源预报（默认见 [defaultModels]）
   ///
   /// Open-Meteo 在多模型模式下字段会带模型后缀
-  /// （如 `temperature_2m_ecmwf_ifs025`），据此拆成「每时刻的多源集合」。
-  /// 注意：能见度只有 GFS 提供（ECMWF/ICON 无此变量），缺失时不参与比对。
+  /// （如 `temperature_2m_ecmwf_ifs`），据此拆成「每时刻的多源集合」。
+  ///
+  /// ## 缺变量是常态，不是异常
+  ///
+  /// 各模式提供的变量集不同，**不支持的变量返回的不是「缺字段」而是整段
+  /// null 数组**。当前 6 路里：
+  /// - `visibility` 有 4 路（CMA / ECMWF / GFS / UKMO）
+  /// - `precipitation_probability` 有 5 路（**CMA 没有**，实测 0/144）
+  ///
+  /// 融合层用 `whereType<double>()` 过滤 null 后再求均值/极差，所以缺值
+  /// 不会污染共识 —— 但也**不能假设某个变量一定存在**。
+  ///
+  /// ⚠️ 旧注释曾说「能见度只有 GFS 提供」，那只成立于当年那三个模型的范围，
+  /// 2026-10-01 全量审计后已修正。
   Future<List<MultiModelHourly>> fetchMultiModel({
     required double lat,
     required double lon,

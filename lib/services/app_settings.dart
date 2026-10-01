@@ -12,7 +12,11 @@ class AppSettings {
   static const _kHourlyAlert = 'alert_hourly_enabled';
   static const _kDailyAlert = 'alert_daily_enabled';
   static const _kAlertLocation = 'alert_location'; // 提醒用的定位（省得每次重新定位）
-  static const _kPublicApiKey = 'public_api_key';
+  // 公测版让用户自填的 Key（内测版留空即可，会回退到包内 Secrets）
+  static const _kAmapWebKey = 'api_key_amap_web';
+  static const _kAmapAndroidKey = 'api_key_amap_android';
+  static const _kQweatherKey = 'api_key_qweather';
+  static const _kQweatherHost = 'api_key_qweather_host';
   static const _kLastHourlyCheck = 'alert_last_hourly_check';
   static const _kLastDailyPush = 'alert_last_daily_push';
   static const _kLastSnapshot = 'alert_last_snapshot';
@@ -61,19 +65,46 @@ class AppSettings {
     await p.setString(_kAlertLocation, '$lat|$lon|$name');
   }
 
-  // ==================== API Key（公测预留）====================
+  // ==================== API Key（公测版让用户自填）====================
+  //
+  // 内测版这里留空即可 —— 读取时会回退到编译进包的 Secrets（见 ApiKeys）。
+  // 公测版包里不带 Key，必须用户自己填，否则地理编码 / 路线规划不可用。
 
-  static Future<String> publicApiKey() async {
+  /// 高德 **Web服务** Key（地理编码、驾车路线规划、静态地图）
+  static Future<String> amapWebKey() => _getStr(_kAmapWebKey);
+
+  static Future<void> setAmapWebKey(String v) => _setStr(_kAmapWebKey, v);
+
+  /// 高德 **Android 平台** Key（地图 SDK + 定位 SDK 共用）
+  ///
+  /// 与 Web服务 Key 不同，这个 Key 绑定「包名 + 签名 SHA1」—— 用户要自填，
+  /// 须先去高德控制台创建一个**绑定本 App 包名与签名**的 Key
+  /// （包名与 SHA1 在设置页可直接复制）。留空则用内置的。
+  static Future<String> amapAndroidKey() => _getStr(_kAmapAndroidKey);
+
+  static Future<void> setAmapAndroidKey(String v) =>
+      _setStr(_kAmapAndroidKey, v);
+
+  /// 和风天气 API Key（可选数据源，留空自动跳过）
+  static Future<String> qweatherApiKey() => _getStr(_kQweatherKey);
+  static Future<void> setQweatherApiKey(String v) => _setStr(_kQweatherKey, v);
+
+  /// 和风天气专属 API Host（形如 `abc.re.qweatherapi.com`）
+  static Future<String> qweatherApiHost() => _getStr(_kQweatherHost);
+
+  static Future<void> setQweatherApiHost(String v) => _setStr(_kQweatherHost, v);
+
+  static Future<String> _getStr(String key) async {
     final p = await SharedPreferences.getInstance();
-    return p.getString(_kPublicApiKey) ?? '';
+    return p.getString(key) ?? '';
   }
 
-  static Future<void> setPublicApiKey(String v) async {
+  static Future<void> _setStr(String key, String v) async {
     final p = await SharedPreferences.getInstance();
     if (v.trim().isEmpty) {
-      await p.remove(_kPublicApiKey);
+      await p.remove(key);
     } else {
-      await p.setString(_kPublicApiKey, v.trim());
+      await p.setString(key, v.trim());
     }
   }
 

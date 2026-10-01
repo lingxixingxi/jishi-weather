@@ -4,7 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
-import '../config/secrets.dart';
+import 'api_keys.dart';
 
 /// 地理坐标点（GCJ-02 火星坐标，高德体系内一致，无需转换）
 class GeoPoint {
@@ -175,7 +175,7 @@ class AmapService {
 
     final params = <String, String>{
       'keywords': kw,
-      'key': Secrets.amapWebKey,
+      'key': ApiKeys.amapWeb,
     };
     if (city != null && city.isNotEmpty) params['city'] = city;
     if (location != null && location.isNotEmpty) {
@@ -233,7 +233,7 @@ class AmapService {
     _ensureKey();
     final uri = Uri.parse(_geoUrl).replace(queryParameters: {
       'address': address,
-      'key': Secrets.amapWebKey,
+      'key': ApiKeys.amapWeb,
     });
     final resp = await _client.get(uri).timeout(const Duration(seconds: 15));
     final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
@@ -267,7 +267,7 @@ class AmapService {
 
     final params = <String, String>{
       'keywords': kw,
-      'key': Secrets.amapWebKey,
+      'key': ApiKeys.amapWeb,
       'offset': '$max',
       'page': '1',
       'extensions': 'base',
@@ -376,7 +376,7 @@ class AmapService {
     final uri = Uri.parse(_regeoUrl).replace(queryParameters: {
       'location': '$lon,$lat',
       'extensions': 'base',
-      'key': Secrets.amapWebKey,
+      'key': ApiKeys.amapWeb,
     });
     final resp = await _client.get(uri).timeout(const Duration(seconds: 15));
     final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
@@ -416,7 +416,7 @@ class AmapService {
       'destination': '${to.lon},${to.lat}',
       'extensions': 'all',
       'strategy': strategy,
-      'key': Secrets.amapWebKey,
+      'key': ApiKeys.amapWeb,
     });
     final resp = await _client.get(uri).timeout(const Duration(seconds: 20));
     final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
@@ -489,7 +489,7 @@ class AmapService {
         'keywords': adcode,
         'subdistrict': '0',
         'extensions': 'base',
-        'key': Secrets.amapWebKey,
+        'key': ApiKeys.amapWeb,
       });
       final resp = await _client.get(uri).timeout(const Duration(seconds: 10));
       final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
@@ -571,7 +571,7 @@ class AmapService {
   }
 
   void _ensureKey() {
-    if (Secrets.amapWebKey.isEmpty) {
+    if (ApiKeys.amapWeb.isEmpty) {
       throw Exception('未配置高德 Web服务 Key（见 lib/config/secrets.example.dart）');
     }
   }

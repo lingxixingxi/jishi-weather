@@ -4,7 +4,8 @@ import 'package:amap_flutter_location/amap_flutter_location.dart';
 import 'package:amap_flutter_location/amap_location_option.dart';
 import 'package:flutter/foundation.dart';
 
-import '../config/secrets.dart';
+import 'api_keys.dart';
+import 'location_budget.dart';
 import 'amap_service.dart' show GeoPoint;
 
 /// 高德定位服务
@@ -97,9 +98,37 @@ class AmapLocationService {
     StreamSubscription<Map<String, Object>>? sub;
 
     try {
+      // ===== 内置 Key 的每日配额守卫 =====
+      //
+      // 高德「在线定位」是账号级共享配额，内置 Key 时全体公测用户共用一份。
+      // 没有服务端做不了全局统计，但单机自我约束能挡住最危险的滥用
+      // （连点 / 循环定位 / 异常重试）。用户自填了 Key 则完全不限。
+      if (!await LocationBudget.canSpend()) {
+        debugPrint('[高德定位] 今日内置 Key 配额已用完'
+            '（${LocationBudget.dailyLimit} 次/天）→ 降级');
+        // 过期缓存也比没有强 —— 位置通常还在同一城区
+        final stale = _cached;
+        if (stale != null) {
+          debugPrint('[高德定位] 使用过期缓存位置');
+          return stale;
+        }
+        return null; // 无缓存 → 调用方走 IP 定位兜底
+      }
+
+      // ===== 记账 =====
+      //
+      // ⚠️ 必须在**真正发起定位之前**调用，且**不能**只在成功回调里记 ——
+      // 超时和失败的请求在高德那边同样消耗配额。
+      //
+      // 真机复验发现的坑（2026-10-01）：这里原本漏了 spend()，只有上面的
+      // canSpend() 判断，于是「今日已用」永远是 0 → canSpend() 永远为真 →
+      // 每天 20 次的上限**完全形同虚设**。界面上看着有额度面板，实际不拦。
+      await LocationBudget.spend();
+
       if (!_keyInitialized) {
-        // 高德 Key：Android 平台 Key（与地图 SDK 同一个）
-        AMapFlutterLocation.setApiKey(Secrets.amapAndroidKey, '');
+        // 高德 Key：Android 平台 Key（地图 SDK 与定位 SDK 共用同一个）
+        // 用户自填的优先，否则用内置的（见 ApiKeys）
+        AMapFlutterLocation.setApiKey(ApiKeys.amapAndroid, '');
         _keyInitialized = true;
       }
 

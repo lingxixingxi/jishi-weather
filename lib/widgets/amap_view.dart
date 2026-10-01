@@ -7,7 +7,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:x_amap_base/x_amap_base.dart';
 
-import '../config/secrets.dart';
+import '../services/api_keys.dart';
 
 /// 高德地图视图（封装隐私合规 + 手势 + 常用参数）
 ///
@@ -85,10 +85,19 @@ class _AmapViewState extends State<AmapView> {
 
   AMapController? _controller;
 
-  static const _apiKey = AMapApiKey(
-    androidKey: Secrets.amapAndroidKey,
-    iosKey: '',
-  );
+  /// 高德 Android 平台 Key —— **运行时**取，不能写 `const`
+  ///
+  /// 这个 Key 绑定「包名 + 签名 SHA1」，但它并非只能编译期注入：官方
+  /// 支持运行时 `MapsInitializer.setApiKey()`，flutter_amap 插件已透传
+  /// （`ConvertUtil.java` 里调的 `MapsInitializer.setApiKey`）。
+  ///
+  /// ⚠️ 千万别改回 `static const` —— 那样会在编译期把内置 Key 固化，
+  /// 用户在设置页填的 Key 永远读不到，公测版就成了「只能用发布者的
+  /// 额度」，人多必爆。
+  AMapApiKey get _apiKey => AMapApiKey(
+        androidKey: ApiKeys.amapAndroid,
+        iosKey: '',
+      );
 
   static const _privacy = AMapPrivacyStatement(
     hasContains: true, // 隐私政策已包含高德
