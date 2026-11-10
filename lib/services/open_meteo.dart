@@ -165,6 +165,29 @@ class OpenMeteoService {
     int pastDays = 1, // 含过去 N 天（可回看）
     int forecastDays = 1,
   }) async {
+    // 缓存键：日期 + 中心点（3 位小数≈100 m）+ 跨度档 + 格点数。
+    // 日期进 key 是因为网格含「过去 1 天 + 今天」，跨零点后时间轴就变了。
+    final cacheKey = '${_ymd(DateTime.now())}|'
+        '${centerLat.toStringAsFixed(3)},${centerLon.toStringAsFixed(3)}|'
+        '${spanKm.round()}|$n';
+    final cached = _gridCache[cacheKey];
+    if (cached != null) {
+      final age = DateTime.now().difference(cached.at);
+      if (age < gridCacheTtl) {
+        debugPrint('[网格] 命中缓存（${age.inSeconds}s 前 · ${cached.data.length} 点），跳过网络');
+        return cached.data;
+      }
+    }
+
+    // 失败退避：弱网下同一点位刚失败过就别再试 —— 否则用户每动一下地图
+    // 都要再等一轮超时，白白耗电耗流量还拖慢后台任务队列。
+    final failedAt = _gridFailAt[cacheKey];
+    if (failedAt != null &&
+        DateTime.now().difference(failedAt) < gridFailBackoff) {
+      debugPrint('[网格] ${gridFailBackoff.inSeconds}s 内刚失败过，跳过重试');
+      return const <GridPoint>[];
+    }
+
     final half = spanKm / 2 / 111.0;
     final dLat = spanKm / 111.0 / (n - 1);
     final cosLat = math.cos(centerLat * math.pi / 180.0).abs().clamp(0.2, 1.0);
@@ -220,8 +243,40 @@ class OpenMeteoService {
         pop: const [],
       ));
     }
+
+    // 拿不到任何有效数据 → 记一次失败，[gridFailBackoff] 内不再重试
+    if (out.isEmpty || out.first.times.isEmpty) {
+      _gridFailAt[cacheKey] = DateTime.now();
+      debugPrint('[网格] 无有效数据（${out.length} 点），'
+          '${gridFailBackoff.inSeconds}s 内不再重试');
+      return out;
+    }
+
+    // 写入缓存：同一地点反复查询、以及「换地点再换回来」都不必再打网络。
+    // 顺手做一次轻量清理，避免长时间运行后无限增长。
+    _gridCache[cacheKey] = (data: out, at: DateTime.now());
+    if (_gridCache.length > 24) {
+      final cutoff = DateTime.now().subtract(const Duration(hours: 2));
+      _gridCache.removeWhere((_, v) => v.at.isBefore(cutoff));
+    }
     return out;
   }
+
+  /// 网格缓存 TTL —— 云量/雨量叠加图 10 分钟内基本不变
+  static const Duration gridCacheTtl = Duration(minutes: 10);
+
+  /// 网格结果缓存，key 见 [fetchGrid] 里的 cacheKey
+  ///
+  /// 为什么值得缓存：同样的 9×9 网格请求在 PC 上只要 248 ms，
+  /// 但在弱网 + 境外链路上实测能到 16 s（2026-10-18 手机日志）。
+  /// 换地点、切时刻、来回对比时复用缓存，能省掉绝大部分等待。
+  static final Map<String, ({List<GridPoint> data, DateTime at})> _gridCache = {};
+
+  /// 网格失败退避时长 —— 弱网下同一点位失败后这段时间内不再重试
+  static const Duration gridFailBackoff = Duration(seconds: 60);
+
+  /// 各点位最近一次失败的时刻（key 与 [_gridCache] 相同）
+  static final Map<String, DateTime> _gridFailAt = {};
 
   static String _ymd(DateTime d) => '${d.year}-'
       '${d.month.toString().padLeft(2, '0')}-'
@@ -475,7 +530,11 @@ class OpenMeteoService {
     List<String> models = defaultModels,
     int forecastDays = 2,
     List<String>? variables,
-    Duration perPointTimeout = const Duration(seconds: 25),
+    // ⚠️ 25 s 太长（2026-10-18 收紧）：
+    // 单个点位最坏路径是「三模型 25 s 超时 → 等 0.4 s → 再 25 s → 降级单模型 30 s」= 80 s。
+    // 日志实测已经出现过 22.3 s 的白等。缩到 8 s 后最坏约 28 s，
+    // 而「第一次超时、重试就成功」这种情形照样能救回来（日志里正是这么发生的）。
+    Duration perPointTimeout = const Duration(seconds: 8),
     int maxConcurrent = 6,
   }) async {
     if (points.isEmpty) return const [];
@@ -548,7 +607,7 @@ class OpenMeteoService {
         place: p.place,
         forecastDays: forecastDays,
         variables: variables,
-      ).timeout(const Duration(seconds: 30));
+      ).timeout(const Duration(seconds: 12)); // 降级单模型：响应只有三模型的 1/3，原 30 s 是长超时叠长超时
       return single
           .map((w) => MultiModelHourly(
                 place: p.place,

@@ -220,6 +220,16 @@ class _LocationScreenState extends State<LocationScreen> {
   Future<void> _warmUpLocation() async {
     try {
       var p = await AmapLocationService.locate(timeout: const Duration(seconds: 10));
+      // ⚠️ 超时后别急着 IP 兜底（2026-10-18 修）：
+      // 并发的另一次定位（路线页的 forceRefresh）可能刚好成功并写进了缓存。
+      // 真实坐标只有几十米误差，IP 坐标是城市级、实测偏过 100 km ——
+      // 拿它给联想排序，排出来的「附近」其实是另一个城市。
+      if (p == null) {
+        p = AmapLocationService.cachedRecently(const Duration(minutes: 1));
+        if (p != null) {
+          debugPrint('[地点] 预热超时，但拿到 1 分钟内缓存的真实坐标，跳过 IP 兜底');
+        }
+      }
       p ??= await _amap.ipLocation();
       if (!mounted || p == null) return;
       setState(() => _myLocation = p);
@@ -288,6 +298,9 @@ class _LocationScreenState extends State<LocationScreen> {
   // ===== 叠加图层：网格数据 + 模式 + 时间轴 =====
   List<GridPoint> _grid = const [];
   final int _gridN = 9; // 9×9 网格（64 个热力格），比 5×5 细腻得多
+
+  /// 网格请求序号 —— 防止「先发出、后返回」的旧结果覆盖新地点的网格
+  int _gridReqId = 0;
   _LayerMode _layerMode = _LayerMode.cloud;
   int _timeIndex = 0;
   bool _playing = false;
@@ -957,39 +970,20 @@ class _LocationScreenState extends State<LocationScreen> {
     }
 
     // 网格数据（云量+雨量逐小时，用于叠加图层与时间轴动画）
-    var grid = const <GridPoint>[];
-    try {
-      // 网格跨度跟着地图缩放走（见 [_spanKmForZoom]）：视野大时覆盖更大范围，
-      // 缩小时才看得到周边云量 / 雨量分布。
-      // 实际网格 = 视野档 × 2（多出的一倍作为平移缓冲，见 [_gridSpanKm]）
-      _viewSpanKm = _spanKmForZoom(_currentZoom);
-      _fitSpanKm = _viewSpanKm; // 换地点：适配视野也跟着新网格走
-      _gridCenter = LatLng(center.lat, center.lon);
-      final tGrid = DateTime.now();
-      grid = await _meteo.fetchGrid(
-        centerLat: center.lat,
-        centerLon: center.lon,
-        spanKm: _gridSpanKm,
-        n: _gridN,
-      );
-      debugPrint('[网格] 首次加载 ${grid.length} 点 × '
-          '${grid.isEmpty ? 0 : grid.first.times.length} 时刻，'
-          '耗时 ${DateTime.now().difference(tGrid).inMilliseconds}ms');
-      debugPrint('[网格] 点数=${grid.length} 时刻数=${grid.isEmpty ? 0 : grid.first.length}');
-    } catch (e) {
-      debugPrint('[网格] 失败: $e');
-    }
+    //
+    // ⚠️ **不阻塞首屏**（2026-10-18 改造）：网格只服务地图叠加图层 ——
+    // 温度 / 降水概率 / 方位点 / 逐日预报**都不依赖它**。
+    // 早先这里 `await fetchGrid(...)` 之后才 setState，弱网实测网格单次 16.2 s，
+    // 把首屏从约 8 s 拖到 26 s（用户反馈「加载非常慢」的根因）。
+    // 现在改成后台任务：首屏先用近似时间轴出结果，网格回来再二次 setState 并重绘叠加层。
+    _viewSpanKm = _spanKmForZoom(_currentZoom);
+    _fitSpanKm = _viewSpanKm; // 换地点：适配视野也跟着新网格走
+    _gridCenter = LatLng(center.lat, center.lon);
 
-    // 时间轴默认定位到「当前小时」（数据含过去 24h + 未来 24h）
-    var startIdx = 0;
-    if (grid.isNotEmpty) {
-      final times = grid.first.times;
-      final now = DateTime.now();
-      final target = '${now.year}-${now.month.toString().padLeft(2, '0')}-'
-          '${now.day.toString().padLeft(2, '0')}T${now.hour.toString().padLeft(2, '0')}:00';
-      final idx = times.indexOf(target);
-      startIdx = idx >= 0 ? idx : (24 + now.hour).clamp(0, math.max(0, times.length - 1));
-    }
+    // 时间轴默认定位到「当前小时」（数据含过去 24h + 未来 24h）。
+    // 网格未回时用 `24 + 当前小时` 作为近似值 —— fetchGrid 固定含过去 1 天，
+    // 这个下标是稳的；网格回来后由 [_loadGridInBackground] 精确校正。
+    var startIdx = 24 + now.hour;
 
     String? adcode;
     try {
@@ -1000,7 +994,8 @@ class _LocationScreenState extends State<LocationScreen> {
     }
 
     setState(() {
-      _grid = grid;
+      // 网格此刻还没回来（后台任务负责回填），先清空避免显示上一个地点的旧图层
+      _grid = const <GridPoint>[];
       _timeIndex = startIdx;
       _playing = false;
       _animTimer?.cancel();
@@ -1033,9 +1028,58 @@ class _LocationScreenState extends State<LocationScreen> {
     // 单站雷达实测（异步，不阻塞）—— 高精度版本，回答「这一格有没有雨」
     unawaited(_runStationRadar(center.lat, center.lon));
 
-    // 生成叠加位图（异步，不阻塞 UI）
-    if (_layerMode != _LayerMode.none && grid.isNotEmpty) {
-      _regenerateOverlay();
+    // 生成叠加位图（异步，不阻塞 UI）—— 改由网格回来后的 [_loadGridInBackground] 触发
+    //
+    // 网格：后台加载，不阻塞首屏（见本方法开头的说明）
+    unawaited(_loadGridInBackground(center));
+  }
+
+  /// 后台加载云量 / 雨量网格，回来后回填并重绘叠加层
+  ///
+  /// 与首屏解耦的原因见 [_analyze] 里「网格不阻塞首屏」的说明。
+  ///
+  /// 带**请求序号**防竞态：用户快速切换地点时，先发出的旧请求可能后回来，
+  /// 不能让它覆盖新地点的网格。
+  Future<void> _loadGridInBackground(GeoPoint center) async {
+    final reqId = ++_gridReqId;
+    final spanKm = _gridSpanKm;
+    final t0 = DateTime.now();
+    try {
+      final grid = await _meteo.fetchGrid(
+        centerLat: center.lat,
+        centerLon: center.lon,
+        spanKm: spanKm,
+        n: _gridN,
+      );
+      final ms = DateTime.now().difference(t0).inMilliseconds;
+      debugPrint('[网格] 首次加载 ${grid.length} 点 × '
+          '${grid.isEmpty ? 0 : grid.first.times.length} 时刻，'
+          '耗时 ${ms}ms（span=${spanKm.round()}km n=$_gridN 后台）');
+      if (!mounted) return;
+      if (reqId != _gridReqId) {
+        debugPrint('[网格] 结果已过期（req=$reqId 当前=$_gridReqId），丢弃');
+        return;
+      }
+
+      // 时间轴定位到「当前小时」
+      var idx = 24 + DateTime.now().hour;
+      final n = DateTime.now();
+      final target = '${n.year}-${n.month.toString().padLeft(2, '0')}-'
+          '${n.day.toString().padLeft(2, '0')}T${n.hour.toString().padLeft(2, '0')}:00';
+      if (grid.isNotEmpty) {
+        final found = grid.first.times.indexOf(target);
+        if (found >= 0) idx = found;
+        idx = idx.clamp(0, math.max(0, grid.first.length - 1));
+      }
+      setState(() {
+        _grid = grid;
+        _timeIndex = idx;
+      });
+      if (_layerMode != _LayerMode.none && grid.isNotEmpty) {
+        unawaited(_regenerateOverlay());
+      }
+    } catch (e) {
+      debugPrint('[网格] 首次加载失败: $e');
     }
   }
 

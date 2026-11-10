@@ -616,6 +616,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return ScreenScaffold(
       title: '设置',
       subtitle: '提醒开关 · 提醒地点 · 数据源 Key · 额度',
+      // ⚠️ 必须关掉：设置页自己就套着 ScreenScaffold，不关的话右上角还有个齿轮，
+      // 点一下又 push 一个新的设置页，可以无限叠（用户反馈的 bug）。
+      showSettingsEntry: false,
       children: [
         if (_loading)
           const PanelCard(

@@ -49,6 +49,19 @@ class AmapLocationService {
     _cachedAt = null;
   }
 
+  /// 取 [within] 内成功的最近一次定位结果 —— **不发起任何请求**
+  ///
+  /// 用途：某个调用超时之后，先看看**并发的另一次定位**是不是刚好成功了。
+  /// 真实坐标（几十米误差）比 IP 定位（城市级，实测偏过 100 km）有用得多，
+  /// 拿 IP 坐标去给联想排序只会把排序搞乱。
+  static GeoPoint? cachedRecently(Duration within) {
+    final c = _cached;
+    final at = _cachedAt;
+    if (c == null || at == null) return null;
+    if (DateTime.now().difference(at) < within) return c;
+    return null;
+  }
+
   /// 单次定位，带超时
   ///
   /// [forceRefresh] 为 true 时忽略缓存与进行中的请求，单独发起一次定位 ——
@@ -87,7 +100,12 @@ class AmapLocationService {
     future = _locateInner(timeout: timeout).whenComplete(() {
       if (identical(_inflight, future)) _inflight = null;
     });
-    if (!forceRefresh) _inflight = future;
+    // ⚠️ **forceRefresh 也要登记**（2026-10-18 修）：
+    // 早先只有普通调用写 `_inflight`，forceRefresh 既不检查也不登记 ——
+    // 于是「用户点当前位置」和「页面预热定位」同时发生时，预热看不到在飞请求，
+    // 又自己起了一次。日志证据：同一秒出现两次「开始定位…」，
+    // 其中一次 10 s 后超时并走了 IP 兜底。
+    _inflight = future;
     return future;
   }
 

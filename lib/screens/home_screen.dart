@@ -113,11 +113,20 @@ class ScreenScaffold extends StatelessWidget {
   final String subtitle;
   final List<Widget> children;
 
+  /// 顶栏右上角是否显示「设置」齿轮入口。
+  ///
+  /// ⚠️ **设置页自己也套着这个外壳**，所以必须能关掉：
+  /// 早先没关，设置页右上角照样有齿轮，点一下又 push 一个设置页 ——
+  /// 可以一路叠下去（用户反馈「设置页可以无限刷新」）。
+  /// 关掉之后右侧换成关闭按钮，顺手补上了「设置页没有明确退出路径」的缺口。
+  final bool showSettingsEntry;
+
   const ScreenScaffold({
     super.key,
     required this.title,
     required this.subtitle,
     required this.children,
+    this.showSettingsEntry = true,
   });
 
   @override
@@ -210,7 +219,10 @@ class ScreenScaffold extends StatelessWidget {
                       ),
                       const SizedBox(width: 8),
                       // 设置入口（提醒开关 / 提醒地点 / 公测 API Key）
-                      const _SettingsButton(),
+                      // 设置页自身会关掉它，换成关闭按钮（见 [showSettingsEntry]）
+                      showSettingsEntry
+                          ? const _SettingsButton()
+                          : const _CloseSettingsButton(),
                     ],
                   ),
                   const SizedBox(height: 4),
@@ -262,6 +274,37 @@ class _SettingsButton extends StatelessWidget {
             border: Border.all(color: AppTheme.borderSoft),
           ),
           child: const Icon(Icons.settings_outlined,
+              size: 17, color: AppTheme.accent),
+        ),
+      ),
+    );
+  }
+}
+
+/// 设置页顶栏的「关闭」按钮
+///
+/// 设置页是 Navigator.push 出来的，[ScreenScaffold] 关掉设置入口后用它补位：
+/// 既堵死「设置页里再点设置」的无限堆栈，也给了一个明确的退出路径
+/// （在此之前只能靠系统返回手势）。
+class _CloseSettingsButton extends StatelessWidget {
+  const _CloseSettingsButton();
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: '关闭设置',
+      button: true,
+      child: GestureDetector(
+        onTap: () => Navigator.of(context).maybePop(),
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          padding: const EdgeInsets.all(7),
+          decoration: BoxDecoration(
+            color: AppTheme.bgInset,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: AppTheme.borderSoft),
+          ),
+          child: const Icon(Icons.close_rounded,
               size: 17, color: AppTheme.accent),
         ),
       ),
