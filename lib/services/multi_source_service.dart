@@ -59,12 +59,26 @@ class MultiSourceService {
     bool includeNmc = true,
   }) async {
     // 1. Open-Meteo 三模型（主源，**境外**）
-    final multi = await _meteo.fetchMultiModel(
-      lat: lat,
-      lon: lon,
-      place: place,
-      forecastDays: forecastDays,
-    );
+    //
+    // ⚠️ **必须自己兜异常并收紧超时**（2026-11-14 真机实测补）：
+    // 原本直接 `await fetchMultiModel(...)`，而它内部是 **35 秒硬超时**，
+    // 断网时就在那一行抛 TimeoutException —— 后面的和风降级完全没机会执行。
+    // 真机日志对照：方位点（走 fetchMany，有 8/8/12 三层超时）已成功降级成 2 源，
+    // 中心点（走这里）却是 `TimeoutException after 0:00:35` 之后变成空。
+    // 现在自己加 8 秒上限，失败即转入下面的和风骨架分支。
+    var multi = const <MultiModelHourly>[];
+    try {
+      multi = await _meteo
+          .fetchMultiModel(
+            lat: lat,
+            lon: lon,
+            place: place,
+            forecastDays: forecastDays,
+          )
+          .timeout(const Duration(seconds: 8));
+    } catch (e) {
+      debugPrint('[多源] 主源失败/超时（8s 上限），转入降级: $e');
+    }
 
     // 2. 和风天气（可选第 5 源；未配置 API Host 会自动跳过）
     //
