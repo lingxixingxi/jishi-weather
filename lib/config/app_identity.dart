@@ -15,7 +15,7 @@ class AppIdentity {
   /// pubspec / 这里 / 脚本自己的 VERSION，三处不一致直接报错退出。
   ///
   /// 首页徽章与日志导出头部都读这个常量，不再各处硬编码。
-  static const String appVersion = '0.2.1';
+  static const String appVersion = '0.2.2';
 
   /// Android 包名（`build.gradle.kts` 的 applicationId）
   static const String packageName = 'com.lingxi.jishiweather';

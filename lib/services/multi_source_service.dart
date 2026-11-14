@@ -58,32 +58,45 @@ class MultiSourceService {
     int forecastDays = 3,
     bool includeNmc = true,
   }) async {
-    // 1. Open-Meteo 三模型（主源）
+    // 1. Open-Meteo 三模型（主源，**境外**）
     final multi = await _meteo.fetchMultiModel(
       lat: lat,
       lon: lon,
       place: place,
       forecastDays: forecastDays,
     );
-    if (!includeNmc || multi.isEmpty) return multi;
 
     // 2. 和风天气（可选第 5 源；未配置 API Host 会自动跳过）
-    var result = multi;
+    //
+    // ⚠️ **只请求一次**：主源正常时它作为「附加源」注入，主源为空时它作为「骨架」。
+    var qw = const <QWeatherHourly>[];
     if (_qweather.isConfigured) {
       try {
-        final qw = await _qweather.hourly(lat, lon, hours: forecastDays * 24);
-        if (qw.isNotEmpty) {
-          result = result.map((m) {
-            final h = QWeatherService.nearest(qw, m.time);
-            return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
-          }).toList();
-        }
+        qw = await _qweather.hourly(lat, lon, hours: forecastDays * 24);
       } catch (_) {
         // 和风失败不影响其他源
       }
     }
 
-    // 3. 中央气象台（定位城市 → 拉完整天气）
+    // 3. **主源为空时，用和风搭骨架**（2026-11-14 加）
+    //
+    // Open-Meteo 在境外，链路抖动时会整段超时 —— 实测一次故障里 35 秒内零成功，
+    // 而同一分钟和风、中央气象台、高德全部正常。
+    // 早先这里 `multi.isEmpty` 直接 return，等于「境外一抖，国内全废」，
+    // 用户看到的就是笼统的「全部连不上」。
+    var result = multi;
+    if (result.isEmpty && qw.isNotEmpty) {
+      result = _skeletonFromQWeather(qw, lat: lat, lon: lon, place: place);
+      debugPrint('[多源] 主源为空（Open-Meteo 不可达），改用和风搭骨架：'
+          '${result.length} 个时刻 / 1 源');
+    } else if (result.isNotEmpty && qw.isNotEmpty) {
+      result = result.map((m) {
+        final h = QWeatherService.nearest(qw, m.time);
+        return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
+      }).toList();
+    }
+
+    // 4. 中央气象台（定位城市 → 拉完整天气）
     if (!includeNmc || result.isEmpty) return result;
     try {
       final city = await _cityRepo.locate(lat, lon);
@@ -145,14 +158,33 @@ class MultiSourceService {
       }));
       debugPrint('[和风] ${points.length} 个采样点中取 ${picked.length} 个'
           '（免费额度 ${QWeatherBudget.dailyLimit} 次/天）');
+
+      // 逐点决定（2026-11-14 加）：主源有数据的点 → 和风作附加源；
+      // 主源空着的点 → 用和风搭骨架，别让境外源一断就整条路线全空。
+      var skeletonCount = 0;
       result = List.generate(result.length, (i) {
+        final base = result[i];
         final qw = i < qwAll.length ? qwAll[i] : const <QWeatherHourly>[];
-        if (qw.isEmpty) return result[i];
-        return result[i].map((m) {
+        if (base.isEmpty) {
+          if (qw.isEmpty) return base;
+          skeletonCount++;
+          return _skeletonFromQWeather(
+            qw,
+            lat: points[i].lat,
+            lon: points[i].lon,
+            place: points[i].place,
+          );
+        }
+        if (qw.isEmpty) return base;
+        return base.map((m) {
           final h = QWeatherService.nearest(qw, m.time);
           return h == null ? m : m.withExtraSource(QWeatherService.toModelForecast(h));
         }).toList();
       });
+      if (skeletonCount > 0) {
+        debugPrint('[多源] $skeletonCount/${points.length} 个采样点主源为空'
+            '（Open-Meteo 不可达），已用和风搭骨架');
+      }
     }
 
     if (!includeNmc) return result;
@@ -205,6 +237,30 @@ class MultiSourceService {
           .toList());
     }
     return out;
+  }
+
+  /// 用和风数据搭一条「时间轴骨架」
+  ///
+  /// 场景：Open-Meteo（境外主源）不可达时 `fetchMultiModel` 会返回空列表，
+  /// 而 [MultiModelHourly] 需要「每个时刻一个承载对象」才能注入后续来源
+  /// （和风自身、中央气象台）。早先主源一空就直接返回，等于让国内两个源一起停工。
+  ///
+  /// 骨架里只有和风一个源，界面应当按「源数不足」降低置信度展示。
+  static List<MultiModelHourly> _skeletonFromQWeather(
+    List<QWeatherHourly> qw, {
+    required double lat,
+    required double lon,
+    required String place,
+  }) {
+    return qw
+        .map((h) => MultiModelHourly(
+              place: place,
+              lat: lat,
+              lon: lon,
+              time: h.time,
+              sources: [QWeatherService.toModelForecast(h)],
+            ))
+        .toList();
   }
 
   /// 等间隔取最多 [maxCount] 个下标（**首尾都保留**）
